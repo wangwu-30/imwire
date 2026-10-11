@@ -1,7 +1,7 @@
 import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { defineAdapterContract, type OutboundCall } from "imwire/testing";
+import { defineAdapterContract, type OutboundCall } from "@imwire/core/testing";
 import { FeishuAdapter } from "../src/adapter.js";
 import type { FeishuHttp } from "../src/http.js";
 import type { FeishuRealtime } from "../src/realtime.js";
@@ -28,6 +28,9 @@ function createHarness() {
       seq += 1;
       if (path.includes("/cardkit/v1/cards") && method === "POST") return { card_id: `card-${seq}` };
       return { message_id: `om-${seq}` };
+    },
+    async requestBytes() {
+      return new Uint8Array([0]);
     },
   };
 

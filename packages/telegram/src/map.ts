@@ -1,4 +1,4 @@
-import type { ChatRef, Inbound, MediaRef, MsgRef, Platform, UserRef } from "imwire";
+import type { ChatRef, Inbound, MediaRef, MsgRef, Platform, UserRef } from "@imwire/core";
 import { asArray, asNumber, asRecord, asString } from "./util.js";
 
 const PLATFORM: Platform = "telegram";
@@ -43,7 +43,8 @@ function mapMessage(
 ): Inbound | undefined {
   const msg = asRecord(rawMsg);
   if (!msg) return undefined;
-  const chat = mapChat(msg.chat, ctx, asString(msg.message_thread_id));
+  const topic = msg.is_topic_message === true ? asString(msg.message_thread_id) : undefined;
+  const chat = mapChat(msg.chat, ctx, topic);
   if (!chat) return undefined;
   const from = mapUser(msg.from, ctx) ?? {
     platform: PLATFORM,
@@ -102,7 +103,8 @@ function mapCallback(
   if (!cb) return undefined;
   const from = mapUser(cb.from, ctx);
   const message = asRecord(cb.message);
-  const chat = mapChat(message?.chat, ctx);
+  const topic = message?.is_topic_message === true ? asString(message.message_thread_id) : undefined;
+  const chat = mapChat(message?.chat, ctx, topic);
   const messageId = asString(message?.message_id);
   if (!from || !chat || !messageId) return undefined;
   const data = asString(cb.data) ?? "";
@@ -160,13 +162,12 @@ function mapChat(
   if (!chatId) return undefined;
   const type = asString(chat.type);
   const kind = type === "private" ? "dm" : "group";
-  const tid = threadId ?? asString(chat.message_thread_id);
   return {
     platform: PLATFORM,
     accountId: ctx.accountId,
     chatId,
     kind,
-    threadId: tid,
+    threadId,
   };
 }
 

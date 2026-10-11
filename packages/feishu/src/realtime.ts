@@ -17,11 +17,19 @@ export interface SdkRealtimeOptions {
 type WsLike = {
   start: (opts: { eventDispatcher: unknown }) => Promise<void> | void;
   close?: () => void;
+  getConnectionStatus?: () => string | number;
 };
 
 /**
  * Official `@larksuiteoapi/node-sdk` long connection. Loaded lazily so mapping
  * tests never touch the network or the SDK constructor.
+ *
+ * `WSClient.start()` resolves immediately and keeps its own reconnect loop.
+ * This wrapper therefore:
+ * - creates **one** client
+ * - does not treat `start()` resolving as a disconnect
+ * - waits until abort or a terminal start() rejection
+ * - acks card callbacks without awaiting user handlers (3 s deadline)
  */
 export async function createSdkRealtime(opts: SdkRealtimeOptions): Promise<FeishuRealtime> {
   const mod = (await import("@larksuiteoapi/node-sdk")) as unknown as {
@@ -35,35 +43,53 @@ export async function createSdkRealtime(opts: SdkRealtimeOptions): Promise<Feish
   const Lark = (mod.default ?? mod) as typeof mod;
   const domain = opts.domain === "lark" ? Lark.Domain?.Lark : Lark.Domain?.Feishu;
 
-  let alive = false;
   let client: WsLike | undefined;
+  let closed = true;
+
+  const closeClient = (): void => {
+    closed = true;
+    const current = client;
+    client = undefined;
+    try {
+      current?.close?.();
+    } catch {
+      // ignore
+    }
+  };
+
+  const statusAlive = (): boolean => {
+    if (closed || !client) return false;
+    const status = client.getConnectionStatus?.();
+    if (status === undefined) return true;
+    const s = String(status).toLowerCase();
+    return s !== "closed" && s !== "failed" && s !== "close" && s !== "0";
+  };
 
   return {
-    isAlive: () => alive,
+    isAlive: statusAlive,
     stop() {
-      alive = false;
-      try {
-        client?.close?.();
-      } catch {
-        // ignore
-      }
+      closeClient();
     },
     async start(handlers, signal) {
+      const dispatch = (data: unknown, type: string): void => {
+        void Promise.resolve(handlers.onEvent(data, type)).catch(() => undefined);
+      };
+
       const dispatcher = new Lark.EventDispatcher({}).register({
         "im.message.receive_v1": async (data: unknown) => {
-          await handlers.onEvent(data, "im.message.receive_v1");
+          dispatch(data, "im.message.receive_v1");
         },
         "card.action.trigger": async (data: unknown) => {
-          await handlers.onEvent(data, "card.action.trigger");
+          dispatch(data, "card.action.trigger");
           return {
             toast: { type: "info", content: "OK" },
           };
         },
         "im.message.reaction.created_v1": async (data: unknown) => {
-          await handlers.onEvent(data, "im.message.reaction.created_v1");
+          dispatch(data, "im.message.reaction.created_v1");
         },
         "im.message.reaction.deleted_v1": async (data: unknown) => {
-          await handlers.onEvent(data, "im.message.reaction.deleted_v1");
+          dispatch(data, "im.message.reaction.deleted_v1");
         },
       });
 
@@ -72,27 +98,37 @@ export async function createSdkRealtime(opts: SdkRealtimeOptions): Promise<Feish
         appSecret: opts.appSecret,
       };
       if (domain !== undefined) wsOpts.domain = domain;
-      client = new Lark.WSClient(wsOpts);
-      alive = true;
 
-      const onAbort = (): void => {
-        alive = false;
-        try {
-          client?.close?.();
-        } catch {
-          // ignore
+      closeClient();
+      closed = false;
+      client = new Lark.WSClient(wsOpts);
+
+      const aborted = new Promise<void>((resolve) => {
+        const onAbort = (): void => {
+          closeClient();
+          resolve();
+        };
+        if (signal.aborted) {
+          onAbort();
+          return;
         }
-      };
-      if (signal.aborted) {
-        onAbort();
-        return;
-      }
-      signal.addEventListener("abort", onAbort, { once: true });
+        signal.addEventListener("abort", onAbort, { once: true });
+      });
 
       try {
-        await Promise.resolve(client.start({ eventDispatcher: dispatcher }));
+        const started = Promise.resolve(client.start({ eventDispatcher: dispatcher }));
+        await Promise.race([
+          aborted,
+          started.then(
+            () => aborted,
+            (err: unknown) => {
+              closeClient();
+              throw err;
+            },
+          ),
+        ]);
       } finally {
-        alive = false;
+        closeClient();
       }
     },
   };

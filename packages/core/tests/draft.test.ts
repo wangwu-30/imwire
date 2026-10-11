@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { createStreamingDraft, type DraftSink, type StreamContext } from "../src/draft.js";
 import type { ChatRef, MsgRef, OutMessage } from "../src/types.js";
 
@@ -151,5 +151,61 @@ describe("createStreamingDraft", () => {
       sent.at(-1)?.blocks.find((b) => b.kind === "markdown")?.text;
     expect(lastText).toContain("partial");
     expect(lastText).toContain("moved to Telegram");
+  });
+
+  it("coalesces a 5s stream against a 1s sink to about 6 edits", async () => {
+    vi.useFakeTimers();
+    try {
+      let edits = 0;
+      const sink: DraftSink = {
+        async send() {
+          edits += 1;
+          return [{ chat, messageId: "1" }];
+        },
+        async edit() {
+          edits += 1;
+          await new Promise((resolve) => setTimeout(resolve, 1000));
+        },
+      };
+      const draft = createStreamingDraft({
+        mode: "edit",
+        maxTextLength: 10_000,
+        throttleMs: 200,
+        chat,
+        sink,
+      });
+      const run = (async () => {
+        for (let i = 0; i < 50; i += 1) {
+          draft.append("x");
+          await new Promise((resolve) => setTimeout(resolve, 100));
+        }
+        const t0 = Date.now();
+        await draft.finalize();
+        return Date.now() - t0;
+      })();
+      await vi.advanceTimersByTimeAsync(20_000);
+      const tailMs = await run;
+      expect(edits).toBeGreaterThanOrEqual(4);
+      expect(edits).toBeLessThanOrEqual(8);
+      expect(tailMs).toBeLessThan(3000);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("skips an unchanged edit fingerprint", async () => {
+    const { sink, sent, edited } = collectSink();
+    const draft = createStreamingDraft({
+      mode: "edit",
+      maxTextLength: 100,
+      throttleMs: 0,
+      chat,
+      sink,
+    });
+    draft.append("same");
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    await draft.finalize({ blocks: [{ kind: "markdown", text: "same" }] });
+    expect(sent).toHaveLength(1);
+    expect(edited.length).toBeLessThanOrEqual(1);
   });
 });

@@ -1,7 +1,7 @@
 import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { defineAdapterContract, type OutboundCall } from "imwire/testing";
+import { defineAdapterContract, type OutboundCall } from "@imwire/core/testing";
 import { TelegramAdapter } from "../src/adapter.js";
 import type { TelegramFetch } from "../src/api.js";
 

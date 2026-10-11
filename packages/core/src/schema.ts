@@ -8,8 +8,6 @@ export const inboundSchema = {
     { $ref: "#/$defs/reaction" },
     { $ref: "#/$defs/action" },
     { $ref: "#/$defs/command" },
-    { $ref: "#/$defs/typing" },
-    { $ref: "#/$defs/draft" },
   ],
   $defs: {
     platform: { type: "string", minLength: 1 },
@@ -149,35 +147,6 @@ export const inboundSchema = {
         },
       ],
     },
-    typing: {
-      allOf: [
-        { $ref: "#/$defs/inboundBase" },
-        {
-          type: "object",
-          required: ["type", "chat", "from"],
-          properties: {
-            type: { const: "typing" },
-            chat: { $ref: "#/$defs/chatRef" },
-            from: { $ref: "#/$defs/userRef" },
-          },
-        },
-      ],
-    },
-    draft: {
-      allOf: [
-        { $ref: "#/$defs/inboundBase" },
-        {
-          type: "object",
-          required: ["type", "chat", "text"],
-          properties: {
-            type: { const: "draft" },
-            chat: { $ref: "#/$defs/chatRef" },
-            text: { type: "string" },
-            status: { type: "string" },
-          },
-        },
-      ],
-    },
   },
 } as const;
 
@@ -215,6 +184,7 @@ export const outboundSchema = {
                     id: { type: "string" },
                     label: { type: "string" },
                     style: { enum: ["primary", "danger", "default"] },
+                    value: { type: "string" },
                   },
                 },
               },

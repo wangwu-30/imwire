@@ -10,7 +10,8 @@
   "exports": {
     ".": {
       "types": "./dist/index.d.ts",
-      "import": "./dist/index.js"
+      "import": "./dist/index.js",
+      "default": "./dist/index.js"
     }
   },
   "files": ["dist", "src"],
@@ -19,7 +20,7 @@
     "typecheck": "tsc -b --pretty false"
   },
   "dependencies": {
-    "@larksuiteoapi/node-sdk": "^1.55.0",
-    "imwire": "workspace:*"
+    "@imwire/core": "workspace:*",
+    "@larksuiteoapi/node-sdk": "^1.55.0"
   }
 }

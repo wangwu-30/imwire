@@ -50,9 +50,15 @@ export async function runReconnectSupervisor(
         logger.debug("connect attempt", { attempt });
         await conn.connect(signal);
         if (signal.aborted) return;
+        // connect() returning while still alive means the transport is
+        // SDK-managed (e.g. Feishu WSClient.start resolves immediately).
+        // Wait for a real death instead of opening another client.
         if (conn.isAlive()) {
           attempt = 0;
-          continue;
+          while (conn.isAlive() && !signal.aborted) {
+            await abortableSleep(clock, 250, signal);
+          }
+          if (signal.aborted) return;
         }
       } catch (err) {
         if (signal.aborted) return;

@@ -13,7 +13,7 @@ import type {
 } from "../types.js";
 
 export interface OutboundCall {
-  op: "send" | "edit" | "typing" | "react" | "download" | "streamStart" | "streamUpdate" | "streamFinish" | "streamAbort";
+  op: "send" | "edit" | "delete" | "typing" | "react" | "download" | "streamStart" | "streamUpdate" | "streamFinish" | "streamAbort";
   args: unknown;
 }
 
@@ -59,8 +59,14 @@ export class FakeAdapter implements Adapter {
     });
   }
 
-  async ingest(event: Inbound): Promise<boolean> {
-    return this.runtime.dispatch(event);
+  async ingest(event: Inbound, opts?: { wait?: boolean }): Promise<boolean> {
+    const accepted = await this.runtime.enqueue(event);
+    if (opts?.wait !== false) await this.runtime.flush();
+    return accepted;
+  }
+
+  async flush(): Promise<void> {
+    await this.runtime.flush();
   }
 
   async start(signal: AbortSignal): Promise<void> {
@@ -161,6 +167,10 @@ export class FakeAdapter implements Adapter {
       replyTo: opts?.replyTo,
       sink,
     });
+  }
+
+  async delete(ref: MsgRef): Promise<void> {
+    this.calls.push({ op: "delete", args: { ref } });
   }
 
   async typing(chat: ChatRef): Promise<void> {

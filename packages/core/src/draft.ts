@@ -60,6 +60,8 @@ export function createStreamingDraft(opts: StreamingDraftOptions): DraftHandle {
   let ctx: StreamContext = { refs: [] };
   let started = false;
   let startPromise: Promise<void> | undefined;
+  let lastStream = "";
+  const lastChunk = new Map<number, string>();
 
   const ensureStarted = async (): Promise<void> => {
     if (started) return;
@@ -100,8 +102,10 @@ export function createStreamingDraft(opts: StreamingDraftOptions): DraftHandle {
     await ensureStarted();
     const rendered = renderDraftBody(text, status);
     if (mode === "card" && opts.sink.streamUpdate && ctx.token !== undefined) {
+      if (rendered === lastStream) return;
       try {
         await opts.sink.streamUpdate(ctx, text, status);
+        lastStream = rendered;
         return;
       } catch {
         mode = opts.sink.edit ? "edit" : "buffer";
@@ -126,15 +130,19 @@ export function createStreamingDraft(opts: StreamingDraftOptions): DraftHandle {
         media: i === 0 ? extra?.media : undefined,
       };
       const existing = ctx.refs[i];
+      const fingerprint = JSON.stringify(msg.blocks);
+      if (existing && lastChunk.get(i) === fingerprint) continue;
       if (existing && opts.sink.edit) {
         try {
           await opts.sink.edit(existing, msg);
+          lastChunk.set(i, fingerprint);
           continue;
         } catch {
           // fall through to send a new chunk
         }
       }
       const sent = await opts.sink.send(opts.chat, msg);
+      lastChunk.set(i, fingerprint);
       if (existing) ctx.refs[i] = sent[0] ?? existing;
       else ctx.refs.push(...sent);
     }

@@ -26,6 +26,9 @@ export const contractCapabilitiesShape: Array<keyof Capabilities> = [
   "streaming",
   "streamingCard",
   "edit",
+  "editScope",
+  "editTextMessages",
+  "proactiveSend",
   "delete",
   "buttons",
   "reactions",
@@ -136,6 +139,28 @@ export function defineAdapterContract(name: string, factory: AdapterContractFact
     const started = h.adapter.start(ac.signal);
     ac.abort();
     await started;
+  });
+
+  test(`${name}: a handler awaiting a button click still receives the click`, async () => {
+    const h = await factory();
+    if (!h.fixtures.action) return;
+    let approved = false;
+    let resolveAction: (() => void) | undefined;
+    const gate = new Promise<void>((resolve) => {
+      resolveAction = resolve;
+    });
+    h.adapter.on(async (e) => {
+      if (e.type === "message" || e.type === "command") await gate;
+      if (e.type === "action") {
+        approved = true;
+        resolveAction?.();
+      }
+    });
+    const first = h.emit(h.fixtures.message);
+    await new Promise((r) => setTimeout(r, 20));
+    await h.emit(h.fixtures.action);
+    await first;
+    expect(approved).toBe(true);
   });
 
   test(`${name}: action fixture maps to a button/approval callback`, async () => {

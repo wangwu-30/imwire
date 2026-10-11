@@ -1,4 +1,4 @@
-import type { ChatRef, Inbound, MediaRef, Platform, UserRef } from "imwire";
+import type { ChatRef, Inbound, MediaRef, Platform, UserRef } from "@imwire/core";
 import { asArray, asNumber, asRecord, asString } from "./util.js";
 
 const PLATFORM: Platform = "feishu";
@@ -67,13 +67,15 @@ function mapMessage(
   const chat = mapChat(message, ctx);
   if (!chat) return undefined;
   const from = mapSender(sender, ctx);
-  const text = extractText(message);
+  const rawText = extractRawText(message);
   const messageId = asString(message.message_id) ?? eventId;
-  const command = parseCommand(text);
+  // Docs: dedup receive_v1 by message_id, not event_id.
+  const id = messageId;
+  const command = parseCommand(rawText);
   if (command) {
     return {
       type: "command",
-      id: eventId,
+      id,
       ts,
       chat,
       from,
@@ -86,12 +88,12 @@ function mapMessage(
   const parentId = asString(message.parent_id);
   return {
     type: "message",
-    id: eventId,
+    id,
     ts: asNumber(message.create_time) ?? ts,
     chat,
     from,
     messageId,
-    text,
+    text: expandMentions(rawText, message),
     mentionsBot: mentionsBot(message, chat, ctx),
     replyTo: parentId ? { chat, messageId: parentId } : undefined,
     media: mapMedia(message),
@@ -112,17 +114,17 @@ function mapAction(
   const chatId = asString(context?.open_chat_id);
   const messageId = asString(context?.open_message_id);
   if (!chatId || !messageId) return undefined;
+  const chatType = asString(context?.chat_type) ?? asString(event.chat_type);
   const chat: ChatRef = {
     platform: PLATFORM,
     accountId: ctx.accountId,
     chatId,
-    kind: "group",
+    kind: chatType === "p2p" || chatType === "private" || chatType === "dm" ? "dm" : "group",
   };
   const from: UserRef = {
     platform: PLATFORM,
     accountId: ctx.accountId,
     userId: asString(operator?.open_id) ?? asString(operator?.user_id) ?? "unknown",
-    displayName: asString(operator?.user_id),
   };
   const { actionId, value } = actionIds(action);
   return {
@@ -184,11 +186,10 @@ function mapSender(sender: Record<string, unknown>, ctx: FeishuMapContext): User
     platform: PLATFORM,
     accountId: ctx.accountId,
     userId: asString(ids.open_id) ?? asString(ids.user_id) ?? asString(ids.union_id) ?? "unknown",
-    displayName: asString(sender.sender_type),
   };
 }
 
-function extractText(message: Record<string, unknown>): string {
+function extractRawText(message: Record<string, unknown>): string {
   const contentRaw = message.content;
   const parsed = typeof contentRaw === "string" ? safeJson(contentRaw) : asRecord(contentRaw);
   if (!parsed) return typeof contentRaw === "string" ? contentRaw : "";
@@ -198,6 +199,19 @@ function extractText(message: Record<string, unknown>): string {
   const content = asString(parsed.content);
   if (title || content) return [title, content].filter(Boolean).join("\n");
   return "";
+}
+
+function expandMentions(text: string, message: Record<string, unknown>): string {
+  const mentions = asArray(message.mentions) ?? [];
+  let out = text;
+  for (const m of mentions) {
+    const rec = asRecord(m);
+    if (!rec) continue;
+    const key = asString(rec.key);
+    const name = asString(rec.name);
+    if (key && name) out = out.split(key).join(`@${name}`);
+  }
+  return out.replace(/@_user_\d+/g, "").replace(/[ \t]{2,}/g, " ");
 }
 
 function mapMedia(message: Record<string, unknown>): MediaRef[] | undefined {
@@ -232,13 +246,13 @@ function mentionsBot(
   ctx: FeishuMapContext,
 ): boolean {
   if (chat.kind === "dm") return true;
+  if (!ctx.botOpenId) return false;
   const mentions = asArray(message.mentions) ?? [];
   for (const m of mentions) {
     const rec = asRecord(m);
     if (!rec) continue;
-    if (asString(rec.mentioned_type) === "bot") return true;
     const id = asRecord(rec.id);
-    if (ctx.botOpenId && asString(id?.open_id) === ctx.botOpenId) return true;
+    if (asString(id?.open_id) === ctx.botOpenId) return true;
   }
   return false;
 }
@@ -246,7 +260,11 @@ function mentionsBot(
 function actionIds(action: Record<string, unknown> | undefined): { actionId: string; value?: string } {
   if (!action) return { actionId: "unknown" };
   const value = action.value;
-  if (typeof value === "string") return { actionId: value };
+  if (typeof value === "string") {
+    const idx = value.indexOf(":");
+    if (idx === -1) return { actionId: value };
+    return { actionId: value.slice(0, idx), value: value.slice(idx + 1) };
+  }
   const rec = asRecord(value);
   if (rec) {
     const id = asString(rec.actionId) ?? asString(rec.action) ?? asString(rec.key) ?? asString(rec.id);

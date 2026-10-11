@@ -38,6 +38,45 @@ describe("mapTelegramUpdate", () => {
     expect(event.target.messageId).toBe("99");
   });
 
+  it("splits callback_data into actionId and value", () => {
+    const [event] = mapTelegramUpdate(
+      {
+        update_id: 9,
+        callback_query: {
+          id: "cbq",
+          from: { id: 1, first_name: "A" },
+          message: { message_id: 2, chat: { id: 1, type: "private" } },
+          data: "approve:call_42",
+        },
+      },
+      ctx,
+    );
+    expect(event?.type).toBe("action");
+    if (event?.type === "action") {
+      expect(event.actionId).toBe("approve");
+      expect(event.value).toBe("call_42");
+    }
+  });
+
+  it("ignores message_thread_id unless is_topic_message", () => {
+    const [event] = mapTelegramUpdate(
+      {
+        update_id: 8,
+        message: {
+          message_id: 3,
+          from: { id: 1, first_name: "A" },
+          chat: { id: -9, type: "supergroup" },
+          date: 1,
+          message_thread_id: 99,
+          text: "reply in a normal group",
+        },
+      },
+      ctx,
+    );
+    expect(event?.type).toBe("message");
+    if (event?.type === "message") expect(event.chat.threadId).toBeUndefined();
+  });
+
   it("maps photo, thread, reply, and mention", () => {
     const [event] = mapTelegramUpdate(load("photo.json"), ctx);
     expect(event?.type).toBe("message");

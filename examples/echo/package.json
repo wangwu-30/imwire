@@ -5,12 +5,12 @@
   "type": "module",
   "license": "MIT",
   "scripts": {
-    "start": "node dist/index.js",
+    "start": "node --env-file=../../.env dist/index.js",
     "build": "tsc -b"
   },
   "dependencies": {
+    "@imwire/core": "workspace:*",
     "@imwire/feishu": "workspace:*",
-    "@imwire/telegram": "workspace:*",
-    "imwire": "workspace:*"
+    "@imwire/telegram": "workspace:*"
   }
 }

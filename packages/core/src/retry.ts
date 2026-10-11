@@ -7,6 +7,7 @@ export interface RetryOptions {
   factor?: number;
   jitter?: number;
   retryOn?: (err: unknown) => boolean;
+  retryAfterMs?: (err: unknown) => number | undefined;
   clock?: Clock;
   random?: () => number;
 }
@@ -66,14 +67,40 @@ export async function withRetry<T>(
       if (attempt >= maxAttempts || !retryOn(err)) {
         throw attempt >= maxAttempts && retryOn(err) ? new RetryError(err, attempt) : err;
       }
+      const hinted = (opts.retryAfterMs ?? retryAfterMs)(err);
       const exp = minMs * factor ** (attempt - 1);
       const capped = Math.min(maxMs, exp);
       const spread = capped * jitter;
-      const delay = Math.max(0, capped - spread + random() * spread * 2);
-      await clock.sleep(delay);
+      const backoff = Math.max(0, capped - spread + random() * spread * 2);
+      await clock.sleep(Math.max(backoff, hinted ?? 0));
     }
   }
   throw new RetryError(lastErr, maxAttempts);
+}
+
+export function retryAfterMs(err: unknown): number | undefined {
+  if (!err || typeof err !== "object") return undefined;
+  const rec = err as {
+    retryAfterMs?: unknown;
+    retryAfter?: unknown;
+    retry_after?: unknown;
+    headers?: unknown;
+  };
+  const direct = numberish(rec.retryAfterMs);
+  if (direct !== undefined) return Math.max(0, direct);
+  const seconds = numberish(rec.retryAfter) ?? numberish(rec.retry_after);
+  if (seconds !== undefined) return Math.max(0, seconds * 1000);
+  const headers = rec.headers;
+  if (headers && typeof headers === "object") {
+    const raw =
+      typeof (headers as { get?: (n: string) => unknown }).get === "function"
+        ? (headers as { get: (n: string) => unknown }).get("retry-after")
+        : (headers as Record<string, unknown>)["retry-after"] ??
+          (headers as Record<string, unknown>)["Retry-After"];
+    const n = numberish(typeof raw === "string" ? Number(raw) : raw);
+    if (n !== undefined) return Math.max(0, n * 1000);
+  }
+  return undefined;
 }
 
 function numberish(value: unknown): number | undefined {

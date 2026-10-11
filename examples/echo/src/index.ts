@@ -1,6 +1,6 @@
 import { FeishuAdapter } from "@imwire/feishu";
 import { TelegramAdapter } from "@imwire/telegram";
-import type { Adapter, Inbound } from "imwire";
+import type { Adapter, Inbound } from "@imwire/core";
 
 function env(name: string): string | undefined {
   const value = process.env[name];

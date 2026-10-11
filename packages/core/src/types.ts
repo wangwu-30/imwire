@@ -49,6 +49,7 @@ export interface Button {
   id: string;
   label: string;
   style?: ButtonStyle;
+  value?: string;
 }
 
 export type Block =
@@ -112,27 +113,7 @@ export interface CommandEvent extends InboundBase {
   args: string;
 }
 
-export interface TypingEvent extends InboundBase {
-  type: "typing";
-  chat: ChatRef;
-  from: UserRef;
-}
-
-export interface DraftEvent extends InboundBase {
-  type: "draft";
-  chat: ChatRef;
-  text: string;
-  status?: string;
-}
-
-export type Inbound =
-  | MessageEvent
-  | EditEvent
-  | ReactionEvent
-  | ActionEvent
-  | CommandEvent
-  | TypingEvent
-  | DraftEvent;
+export type Inbound = MessageEvent | EditEvent | ReactionEvent | ActionEvent | CommandEvent;
 
 export interface DraftHandle {
   append(delta: string): void;
@@ -142,11 +123,18 @@ export interface DraftHandle {
 }
 
 export type StreamingMode = "card" | "edit" | "buffer";
+export type EditScope = "any" | "cards" | "none";
 
 export interface Capabilities {
   streaming: StreamingMode;
   streamingCard: boolean;
   edit: boolean;
+  /** What `edit()` can actually change. Feishu PATCH only accepts interactive cards. */
+  editScope: EditScope;
+  /** False when the platform cannot edit a plain text message (Feishu). */
+  editTextMessages: boolean;
+  /** False when the bot can only reply in-window (some WeCom setups). */
+  proactiveSend: boolean;
   delete: boolean;
   buttons: boolean;
   reactions: boolean;
@@ -169,6 +157,7 @@ export interface Adapter {
   edit(ref: MsgRef, msg: OutMessage): Promise<void>;
   draft(chat: ChatRef, opts?: { replyTo?: MsgRef }): Promise<DraftHandle>;
   typing(chat: ChatRef): Promise<void>;
+  delete(ref: MsgRef): Promise<void>;
   react?(ref: MsgRef, emoji: string): Promise<void>;
   download(media: MediaRef): Promise<ReadableStream<Uint8Array>>;
 }
@@ -201,6 +190,11 @@ export function systemClock(): Clock {
 
 export function chatKey(chat: ChatRef): string {
   return `${chat.platform}:${chat.accountId}:${chat.chatId}`;
+}
+
+export function inboundChat(event: Inbound): ChatRef {
+  if ("chat" in event) return event.chat;
+  return event.target.chat;
 }
 
 export function markdownText(msg: OutMessage): string {

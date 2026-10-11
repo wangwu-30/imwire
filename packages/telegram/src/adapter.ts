@@ -16,9 +16,11 @@ import {
   type MediaRef,
   type MsgRef,
   type OutMessage,
-} from "imwire";
+} from "@imwire/core";
 import { TelegramApi, type TelegramFetch, type TelegramMessage, type TelegramUser } from "./api.js";
+import { inlineKeyboard } from "./buttons.js";
 import { telegramCapabilities } from "./capabilities.js";
+import { decodeCallbackData } from "./buttons.js";
 import { mapTelegramUpdate } from "./map.js";
 import { asNumber, asRecord, asString } from "./util.js";
 
@@ -48,6 +50,8 @@ export class TelegramAdapter implements Adapter, Connectable {
   private botUsername?: string;
   private offset = 0;
   private alive = false;
+  private readonly callbackTable = new Map<string, { id: string; value?: string }>();
+  private webhookCleared = false;
 
   constructor(opts: TelegramAdapterOptions) {
     this.accountId = opts.accountId ?? "telegram";
@@ -81,20 +85,29 @@ export class TelegramAdapter implements Adapter, Connectable {
     try {
       await this.ensureBot(signal);
       while (!signal.aborted) {
-        const updates = await this.api.call<unknown[]>(
-          "getUpdates",
-          {
-            offset: this.offset,
-            timeout: this.pollTimeoutSec,
-            allowed_updates: ALLOWED_UPDATES,
-          },
-          signal,
-        );
-        for (const update of updates) {
-          const rec = asRecord(update);
-          const id = asNumber(rec?.update_id);
-          if (id !== undefined) this.offset = id + 1;
-          await this.ingest(update);
+        try {
+          const updates = await this.api.call<unknown[]>(
+            "getUpdates",
+            {
+              offset: this.offset,
+              timeout: this.pollTimeoutSec,
+              allowed_updates: ALLOWED_UPDATES,
+            },
+            mergeAbort(signal, (this.pollTimeoutSec + 10) * 1000),
+          );
+          for (const update of updates) {
+            const rec = asRecord(update);
+            const id = asNumber(rec?.update_id);
+            if (id !== undefined) this.offset = id + 1;
+            await this.ingest(update, { wait: false });
+          }
+        } catch (err) {
+          if (isConflict(err) && !this.webhookCleared) {
+            this.webhookCleared = true;
+            await this.api.call("deleteWebhook", { drop_pending_updates: false }).catch(() => undefined);
+            continue;
+          }
+          throw err;
         }
       }
     } catch (err) {
@@ -109,7 +122,7 @@ export class TelegramAdapter implements Adapter, Connectable {
     this.alive = false;
   }
 
-  async ingest(raw: unknown): Promise<void> {
+  async ingest(raw: unknown, opts?: { wait?: boolean }): Promise<void> {
     const events = mapTelegramUpdate(raw, {
       accountId: this.accountId,
       botUserId: this.botUserId,
@@ -117,14 +130,25 @@ export class TelegramAdapter implements Adapter, Connectable {
     });
     for (const event of events) {
       if (event.type === "action") {
+        const decoded = decodeCallbackData(event.actionId + (event.value ? `:${event.value}` : ""), this.callbackTable);
+        // map already split on `:`; prefer table lookup on the raw callback_data
+        const rawData = asString(asRecord(asRecord(raw)?.callback_query)?.data);
+        const resolved = rawData ? decodeCallbackData(rawData, this.callbackTable) : decoded;
+        event.actionId = resolved.actionId;
+        event.value = resolved.value;
         const cb = asRecord(asRecord(raw)?.callback_query);
         const cbId = asString(cb?.id);
         if (cbId) {
           await this.api.call("answerCallbackQuery", { callback_query_id: cbId }).catch(() => undefined);
         }
       }
-      await this.runtime.dispatch(event);
+      await this.runtime.enqueue(event);
     }
+    if (opts?.wait !== false) await this.runtime.flush();
+  }
+
+  async flush(): Promise<void> {
+    await this.runtime.flush();
   }
 
   async send(chat: ChatRef, msg: OutMessage): Promise<MsgRef[]> {
@@ -144,7 +168,7 @@ export class TelegramAdapter implements Adapter, Connectable {
             i === 0 && msg.replyTo
               ? { message_id: Number(msg.replyTo.messageId) || msg.replyTo.messageId }
               : undefined,
-          reply_markup: isLast && buttons.length > 0 ? inlineKeyboard(buttons) : undefined,
+          reply_markup: isLast && buttons.length > 0 ? inlineKeyboard(buttons, this.callbackTable) : undefined,
         }),
       );
       refs.push(toRef(chat, sent));
@@ -162,7 +186,7 @@ export class TelegramAdapter implements Adapter, Connectable {
           chat_id: Number(ref.chat.chatId) || ref.chat.chatId,
           message_id: Number(ref.messageId) || ref.messageId,
           text: text.slice(0, this.capabilities.maxTextLength),
-          reply_markup: buttons.length > 0 ? inlineKeyboard(buttons) : undefined,
+          reply_markup: buttons.length > 0 ? inlineKeyboard(buttons, this.callbackTable) : undefined,
         }),
       );
     } catch (err) {
@@ -184,6 +208,16 @@ export class TelegramAdapter implements Adapter, Connectable {
         edit: (r, m) => this.edit(r, m),
       },
     });
+  }
+
+  async delete(ref: MsgRef): Promise<void> {
+    assertChatPlatform(this, ref.chat);
+    await this.runtime.outbound(ref.chat, () =>
+      this.api.call("deleteMessage", {
+        chat_id: Number(ref.chat.chatId) || ref.chat.chatId,
+        message_id: Number(ref.messageId) || ref.messageId,
+      }),
+    );
   }
 
   async typing(chat: ChatRef): Promise<void> {
@@ -226,15 +260,21 @@ export class TelegramAdapter implements Adapter, Connectable {
   }
 }
 
-function inlineKeyboard(buttons: { id: string; label: string; style?: string }[]) {
-  return {
-    inline_keyboard: [
-      buttons.map((b) => ({
-        text: b.style === "danger" ? `✕ ${b.label}` : b.style === "primary" ? `● ${b.label}` : b.label,
-        callback_data: b.id.slice(0, 64),
-      })),
-    ],
-  };
+function mergeAbort(signal: AbortSignal, timeoutMs: number): AbortSignal {
+  const timeout = AbortSignal.timeout(timeoutMs);
+  if (typeof AbortSignal.any === "function") return AbortSignal.any([signal, timeout]);
+  const ac = new AbortController();
+  const abort = (): void => ac.abort();
+  if (signal.aborted || timeout.aborted) abort();
+  else {
+    signal.addEventListener("abort", abort, { once: true });
+    timeout.addEventListener("abort", abort, { once: true });
+  }
+  return ac.signal;
+}
+
+function isConflict(err: unknown): boolean {
+  return typeof err === "object" && err !== null && (err as { status?: number }).status === 409;
 }
 
 function toRef(chat: ChatRef, sent: TelegramMessage): MsgRef {

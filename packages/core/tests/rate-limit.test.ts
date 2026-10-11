@@ -63,4 +63,22 @@ describe("createCoalescingThrottle", () => {
     await throttle.flush();
     expect(runs).toEqual(["b"]);
   });
+
+  it("keeps at most one in-flight job and one latest pending job", async () => {
+    const started: string[] = [];
+    const finished: string[] = [];
+    const throttle = createCoalescingThrottle({ intervalMs: 0 });
+    const slow = (name: string) => async () => {
+      started.push(name);
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      finished.push(name);
+    };
+    throttle.schedule(slow("a"));
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    throttle.schedule(slow("b"));
+    throttle.schedule(slow("c"));
+    await throttle.flush();
+    expect(started).toEqual(["a", "c"]);
+    expect(finished).toEqual(["a", "c"]);
+  });
 });

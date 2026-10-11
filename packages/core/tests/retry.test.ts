@@ -39,6 +39,38 @@ describe("withRetry", () => {
     expect(clock.sleeps).toEqual([100, 200]);
   });
 
+  it("sleeps at least retryAfter / Retry-After on 429", async () => {
+    const clock = fakeClock();
+    let n = 0;
+    await withRetry(
+      async () => {
+        n += 1;
+        if (n < 2) {
+          throw Object.assign(new Error("slow down"), { status: 429, retryAfter: 3 });
+        }
+        return "ok";
+      },
+      { maxAttempts: 3, minMs: 100, maxMs: 200, factor: 2, jitter: 0, clock, random: () => 0 },
+    );
+    expect(clock.sleeps[0]).toBeGreaterThanOrEqual(3000);
+    const clock2 = fakeClock();
+    n = 0;
+    await withRetry(
+      async () => {
+        n += 1;
+        if (n < 2) {
+          throw Object.assign(new Error("header"), {
+            status: 429,
+            headers: { "Retry-After": "2" },
+          });
+        }
+        return "ok";
+      },
+      { maxAttempts: 3, minMs: 50, maxMs: 50, jitter: 0, clock: clock2, random: () => 0 },
+    );
+    expect(clock2.sleeps[0]).toBeGreaterThanOrEqual(2000);
+  });
+
   it("does not retry a non-retryable error", async () => {
     const err = new Error("bad") as Error & { status: number };
     err.status = 400;

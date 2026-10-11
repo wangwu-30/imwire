@@ -8,9 +8,9 @@ export type {
   ChatRef,
   Clock,
   CommandEvent,
-  DraftEvent,
   DraftHandle,
   EditEvent,
+  EditScope,
   Inbound,
   InboundBase,
   InboundHandler,
@@ -24,12 +24,12 @@ export type {
   Platform,
   ReactionEvent,
   StreamingMode,
-  TypingEvent,
   UserRef,
 } from "./types.js";
 export {
   chatKey,
   collectButtons,
+  inboundChat,
   markdownText,
   noopLogger,
   renderDraftBody,
@@ -43,7 +43,7 @@ export {
   type CoalescingThrottle,
   type TokenBucketOptions,
 } from "./rate-limit.js";
-export { RetryError, isRetryableError, withRetry, type RetryOptions } from "./retry.js";
+export { RetryError, isRetryableError, retryAfterMs, withRetry, type RetryOptions } from "./retry.js";
 export {
   runReconnectSupervisor,
   type Connectable,

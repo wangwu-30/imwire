@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { runReconnectSupervisor } from "../src/reconnect.js";
 
 describe("runReconnectSupervisor", () => {
@@ -35,5 +35,32 @@ describe("runReconnectSupervisor", () => {
       ac.signal,
     );
     expect(connected).toBe(0);
+  });
+
+  it("does not open a new client when start() returns while still alive", async () => {
+    vi.useFakeTimers();
+    try {
+      let clients = 0;
+      const ac = new AbortController();
+      const done = runReconnectSupervisor(
+        {
+          connect: async () => {
+            clients += 1;
+          },
+          isAlive: () => !ac.signal.aborted,
+          disconnect() {
+            // closed on abort
+          },
+        },
+        ac.signal,
+        { minMs: 500, maxMs: 30_000, jitter: 0, random: () => 0 },
+      );
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(clients).toBe(1);
+      ac.abort();
+      await done;
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

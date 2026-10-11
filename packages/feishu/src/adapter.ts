@@ -2,10 +2,12 @@ import {
   AdapterRuntime,
   assertChatPlatform,
   chunkText,
+  collectButtons,
   createStreamingDraft,
   markdownText,
   statusText,
   type Adapter,
+  type Button,
   type Capabilities,
   type ChatRef,
   type Connectable,
@@ -16,15 +18,16 @@ import {
   type MsgRef,
   type OutMessage,
   type StreamContext,
-} from "imwire";
-import { feishuCapabilities } from "./capabilities.js";
+} from "@imwire/core";
+import { FEISHU_CARD_BYTE_CAP, feishuCapabilities } from "./capabilities.js";
 import {
   STREAM_ELEMENT_ID,
   buildCardJson,
+  buttonElement,
   cardFromOutMessage,
   cardkitRefContent,
+  clipToBytes,
   interactiveContent,
-  textContent,
 } from "./cards.js";
 import { createFeishuHttp, type FeishuHttp } from "./http.js";
 import { mapFeishuEvent } from "./map.js";
@@ -50,6 +53,16 @@ interface CreatedCard {
   card_id?: string;
 }
 
+interface CardToken {
+  cardId?: string;
+  messageId?: string;
+  patch?: boolean;
+  seq: number;
+}
+
+/** Leave room for card JSON wrapper / buttons under the 30 KB card cap. */
+const STREAM_TEXT_BYTE_BUDGET = FEISHU_CARD_BYTE_CAP - 4096;
+
 export class FeishuAdapter implements Adapter, Connectable {
   readonly platform = "feishu" as const;
   readonly capabilities: Capabilities = feishuCapabilities;
@@ -59,7 +72,7 @@ export class FeishuAdapter implements Adapter, Connectable {
   private readonly draftThrottleMs: number;
   private readonly createRealtime: () => Promise<FeishuRealtime>;
   private realtime?: FeishuRealtime;
-  private seq = 0;
+  private botOpenId?: string;
 
   constructor(opts: FeishuAdapterOptions) {
     this.accountId = opts.accountId ?? opts.appId;
@@ -95,10 +108,12 @@ export class FeishuAdapter implements Adapter, Connectable {
   }
 
   async connect(signal: AbortSignal): Promise<void> {
+    this.realtime?.stop();
+    await this.refreshBotIdentity(signal);
     this.realtime = await this.createRealtime();
     await this.realtime.start(
       {
-        onEvent: (raw, type) => this.ingest(raw, type),
+        onEvent: (raw, type) => this.ingest(raw, type, { wait: false }),
       },
       signal,
     );
@@ -108,28 +123,37 @@ export class FeishuAdapter implements Adapter, Connectable {
     this.realtime?.stop();
   }
 
-  async ingest(raw: unknown, eventType?: string): Promise<void> {
-    const events = mapFeishuEvent(raw, { accountId: this.accountId }, eventType);
+  async ingest(raw: unknown, eventType?: string, opts?: { wait?: boolean }): Promise<void> {
+    const events = mapFeishuEvent(raw, { accountId: this.accountId, botOpenId: this.botOpenId }, eventType);
     for (const event of events) {
-      await this.runtime.dispatch(event);
+      await this.runtime.enqueue(event);
     }
+    if (opts?.wait !== false) await this.runtime.flush();
   }
 
+  async flush(): Promise<void> {
+    await this.runtime.flush();
+  }
+
+  /**
+   * Always send interactive cards. Feishu `PATCH /im/v1/messages` only accepts
+   * cards (`editTextMessages=false`); cards also render markdown.
+   */
   async send(chat: ChatRef, msg: OutMessage): Promise<MsgRef[]> {
     assertChatPlatform(this, chat);
-    const buttons = msg.blocks.some((b) => b.kind === "buttons");
-    if (buttons || msg.blocks.some((b) => b.kind === "status")) {
-      const created = await this.runtime.outbound(chat, () =>
-        this.createMessage(chat, "interactive", interactiveContent(cardFromOutMessage(msg)), msg.replyTo),
-      );
-      return [toRef(chat, created)];
-    }
+    const buttons = collectButtons(msg);
     const text = [markdownText(msg), statusText(msg)].filter(Boolean).join("\n\n") || "…";
     const chunks = chunkText(text, this.capabilities.maxTextLength);
     const refs: MsgRef[] = [];
     for (let i = 0; i < chunks.length; i += 1) {
+      const isLast = i === chunks.length - 1;
+      const card = buildCardJson({
+        text: chunks[i] ?? "",
+        buttons: isLast && buttons.length > 0 ? buttons : undefined,
+        streaming: false,
+      });
       const created = await this.runtime.outbound(chat, () =>
-        this.createMessage(chat, "text", textContent(chunks[i] ?? ""), i === 0 ? msg.replyTo : undefined),
+        this.createMessage(chat, "interactive", interactiveContent(card), i === 0 ? msg.replyTo : undefined),
       );
       refs.push(toRef(chat, created));
     }
@@ -177,24 +201,43 @@ export class FeishuAdapter implements Adapter, Connectable {
     return;
   }
 
+  async delete(ref: MsgRef): Promise<void> {
+    assertChatPlatform(this, ref.chat);
+    await this.runtime.outbound(ref.chat, () =>
+      this.http.request({
+        method: "DELETE",
+        path: `/open-apis/im/v1/messages/${encodeURIComponent(ref.messageId)}`,
+      }),
+    );
+  }
+
   async download(media: MediaRef): Promise<ReadableStream<Uint8Array>> {
     const type = media.kind === "image" ? "image" : "file";
     const [messageId, fileKey] = splitMediaId(media.id);
-    const data = await this.http.request<{ file?: Uint8Array } | ArrayBuffer>({
+    const bytes = await this.http.requestBytes({
       method: "GET",
       path: `/open-apis/im/v1/messages/${encodeURIComponent(messageId)}/resources/${encodeURIComponent(fileKey)}`,
       query: { type },
     });
-    const bytes =
-      data instanceof ArrayBuffer
-        ? new Uint8Array(data)
-        : new TextEncoder().encode(JSON.stringify(data));
     return new ReadableStream({
       start(controller) {
         controller.enqueue(bytes);
         controller.close();
       },
     });
+  }
+
+  private async refreshBotIdentity(signal?: AbortSignal): Promise<void> {
+    try {
+      const info = await this.http.request<{ bot?: { open_id?: string }; open_id?: string }>({
+        method: "GET",
+        path: "/open-apis/bot/v3/info",
+        signal,
+      });
+      this.botOpenId = asString(info.bot?.open_id) ?? asString(info.open_id);
+    } catch {
+      // mention detection degrades to DM-only until the next connect
+    }
   }
 
   private async createMessage(
@@ -233,8 +276,8 @@ export class FeishuAdapter implements Adapter, Connectable {
       const created = await this.createMessage(chat, "interactive", cardkitRefContent(cardId), replyTo);
       const messageId = asString(created.message_id);
       if (!messageId) return undefined;
-      this.seq = 0;
-      return { refs: [{ chat, messageId }], token: { cardId, messageId } };
+      const token: CardToken = { cardId, messageId, seq: 0 };
+      return { refs: [{ chat, messageId }], token };
     } catch {
       const created = await this.createMessage(
         chat,
@@ -244,19 +287,20 @@ export class FeishuAdapter implements Adapter, Connectable {
       );
       const messageId = asString(created.message_id);
       if (!messageId) return undefined;
-      return { refs: [{ chat, messageId }], token: { messageId, patch: true } };
+      const token: CardToken = { messageId, patch: true, seq: 0 };
+      return { refs: [{ chat, messageId }], token };
     }
   }
 
   private async updateCard(ctx: StreamContext, text: string, status?: string): Promise<void> {
     const token = asCardToken(ctx.token);
     if (!token) throw new Error("missing card token");
+    const clipped = clipToBytes(text, STREAM_TEXT_BYTE_BUDGET);
     if (token.cardId && !token.patch) {
-      this.seq += 1;
       await this.http.request({
         method: "PUT",
         path: `/open-apis/cardkit/v1/cards/${encodeURIComponent(token.cardId)}/elements/${STREAM_ELEMENT_ID}/content`,
-        body: { content: renderPlain(text, status), sequence: this.seq },
+        body: { content: renderPlain(clipped, status), sequence: nextSeq(token) },
       });
       return;
     }
@@ -264,31 +308,33 @@ export class FeishuAdapter implements Adapter, Connectable {
       await this.http.request({
         method: "PATCH",
         path: `/open-apis/im/v1/messages/${encodeURIComponent(token.messageId)}`,
-        body: { content: interactiveContent(buildCardJson({ text, status, streaming: false })) },
+        body: { content: interactiveContent(buildCardJson({ text: clipped, status, streaming: false })) },
       });
       return;
     }
     throw new Error("cannot update card");
   }
 
+  /**
+   * CardKit rejects content PUTs after streaming_mode is turned off (300309).
+   * Order: final content → buttons → settings streaming_mode=false.
+   */
   private async finishCard(ctx: StreamContext, msg: OutMessage): Promise<MsgRef[]> {
     const token = asCardToken(ctx.token);
     if (token?.cardId && !token.patch) {
       try {
-        await this.patchCardSettings(ctx, false);
-        this.seq += 1;
+        const text = clipToBytes(markdownText(msg) || "…", STREAM_TEXT_BYTE_BUDGET);
         await this.http.request({
           method: "PUT",
           path: `/open-apis/cardkit/v1/cards/${encodeURIComponent(token.cardId)}/elements/${STREAM_ELEMENT_ID}/content`,
-          body: { content: markdownText(msg) || "…", sequence: this.seq },
+          body: { content: text, sequence: nextSeq(token) },
         });
+        const buttons = collectButtons(msg);
+        if (buttons.length > 0) await this.appendButtons(token, buttons);
+        await this.patchCardSettings(ctx, false);
       } catch {
         const fallback = ctx.refs[0];
         if (fallback) await this.edit(fallback, msg);
-      }
-      const existing = ctx.refs[0];
-      if (msg.blocks.some((b) => b.kind === "buttons") && existing) {
-        await this.edit(existing, msg);
       }
       return ctx.refs;
     }
@@ -296,16 +342,29 @@ export class FeishuAdapter implements Adapter, Connectable {
     return ctx.refs;
   }
 
+  private async appendButtons(token: CardToken, buttons: Button[]): Promise<void> {
+    if (!token.cardId) return;
+    const elements = buttons.map((b) => buttonElement(b));
+    await this.http.request({
+      method: "POST",
+      path: `/open-apis/cardkit/v1/cards/${encodeURIComponent(token.cardId)}/elements`,
+      body: {
+        type: "append",
+        elements: JSON.stringify(elements),
+        sequence: nextSeq(token),
+      },
+    });
+  }
+
   private async patchCardSettings(ctx: StreamContext, streaming: boolean): Promise<void> {
     const token = asCardToken(ctx.token);
     if (!token?.cardId) return;
-    this.seq += 1;
     await this.http.request({
       method: "PATCH",
       path: `/open-apis/cardkit/v1/cards/${encodeURIComponent(token.cardId)}/settings`,
       body: {
         settings: JSON.stringify({ config: { streaming_mode: streaming, update_multi: true } }),
-        sequence: this.seq,
+        sequence: nextSeq(token),
       },
     });
   }
@@ -321,10 +380,16 @@ function toRef(chat: ChatRef, created: CreatedMessage): MsgRef {
   return { chat, messageId: asString(created.message_id) ?? "unknown" };
 }
 
-function asCardToken(token: unknown): { cardId?: string; messageId?: string; patch?: boolean } | undefined {
+function asCardToken(token: unknown): CardToken | undefined {
   if (!token || typeof token !== "object") return undefined;
-  const rec = token as { cardId?: string; messageId?: string; patch?: boolean };
+  const rec = token as CardToken;
+  if (typeof rec.seq !== "number") rec.seq = 0;
   return rec;
+}
+
+function nextSeq(token: CardToken): number {
+  token.seq += 1;
+  return token.seq;
 }
 
 function renderPlain(text: string, status?: string): string {

@@ -12,9 +12,14 @@ export default defineConfig({
   resolve: {
     alias: [
       {
+        find: /^@imwire\/core\/testing$/,
+        replacement: `${root}packages/core/src/testing/index.ts`,
+      },
+      {
         find: /^imwire\/testing$/,
         replacement: `${root}packages/core/src/testing/index.ts`,
       },
+      { find: /^@imwire\/core$/, replacement: `${root}packages/core/src/index.ts` },
       { find: /^imwire$/, replacement: `${root}packages/core/src/index.ts` },
       {
         find: /^@imwire\/telegram$/,

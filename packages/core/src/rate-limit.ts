@@ -9,6 +9,7 @@ export interface TokenBucketOptions {
 interface Bucket {
   tokens: number;
   updatedAt: number;
+  blockedUntil?: number;
 }
 
 export class TokenBucketLimiter {
@@ -34,6 +35,11 @@ export class TokenBucketLimiter {
       this.refill(key);
       const bucket = this.buckets.get(key);
       if (!bucket) continue;
+      const now = this.clock.now();
+      if (bucket.blockedUntil !== undefined && now < bucket.blockedUntil) {
+        await this.clock.sleep(Math.max(1, bucket.blockedUntil - now));
+        continue;
+      }
       if (bucket.tokens >= n) {
         bucket.tokens -= n;
         return;
@@ -47,6 +53,19 @@ export class TokenBucketLimiter {
   peek(key: string): number {
     this.refill(key);
     return this.buckets.get(key)?.tokens ?? this.burst;
+  }
+
+  /** Hold this bucket empty for at least `ms` (used after 429 retry_after). */
+  cooldown(key: string, ms: number): void {
+    this.refill(key);
+    const bucket = this.buckets.get(key);
+    const until = this.clock.now() + Math.max(0, ms);
+    if (bucket) {
+      bucket.tokens = 0;
+      bucket.blockedUntil = until;
+    } else {
+      this.buckets.set(key, { tokens: 0, updatedAt: this.clock.now(), blockedUntil: until });
+    }
   }
 
   private refill(key: string): void {
@@ -75,36 +94,48 @@ export function createCoalescingThrottle(opts: {
   const clock = opts.clock ?? systemClock();
   let timer: ReturnType<typeof setTimeout> | undefined;
   let lastRun = 0;
-  let inflight: Promise<void> = Promise.resolve();
+  let running: Promise<void> | undefined;
   let queued: (() => Promise<void>) | undefined;
 
-  const fire = (): void => {
-    timer = undefined;
+  const kick = (): void => {
+    if (running || !queued) return;
     const job = queued;
     queued = undefined;
-    if (!job) return;
     lastRun = clock.now();
-    inflight = inflight
-      .catch(() => undefined)
+    running = Promise.resolve()
       .then(job)
-      .catch(() => undefined);
+      .catch(() => undefined)
+      .finally(() => {
+        running = undefined;
+        if (!queued) return;
+        const wait = Math.max(0, opts.intervalMs - (clock.now() - lastRun));
+        timer = setTimeout(() => {
+          timer = undefined;
+          kick();
+        }, wait);
+      });
   };
 
   return {
-    pending: () => queued !== undefined || timer !== undefined,
+    pending: () => queued !== undefined || timer !== undefined || running !== undefined,
     schedule(run) {
       queued = run;
+      if (running) return;
       if (timer !== undefined) return;
       const wait = Math.max(0, opts.intervalMs - (clock.now() - lastRun));
-      timer = setTimeout(fire, wait);
+      timer = setTimeout(() => {
+        timer = undefined;
+        kick();
+      }, wait);
     },
     async flush() {
       if (timer !== undefined) {
         clearTimeout(timer);
         timer = undefined;
       }
-      fire();
-      await inflight;
+      if (running) await running;
+      kick();
+      if (running) await running;
     },
   };
 }
