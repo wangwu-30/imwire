@@ -97,6 +97,37 @@ importers:
         specifier: ^8.18.1
         version: 8.18.2
 
+  packages/e2e:
+    dependencies:
+      '@imwire/core':
+        specifier: workspace:*
+        version: link:../core
+      '@imwire/dingtalk':
+        specifier: workspace:*
+        version: link:../dingtalk
+      '@imwire/feishu':
+        specifier: workspace:*
+        version: link:../feishu
+      '@imwire/session':
+        specifier: workspace:*
+        version: link:../session
+      '@imwire/slack':
+        specifier: workspace:*
+        version: link:../slack
+      '@imwire/telegram':
+        specifier: workspace:*
+        version: link:../telegram
+      '@imwire/wecom':
+        specifier: workspace:*
+        version: link:../wecom
+      ws:
+        specifier: ^8.18.3
+        version: 8.22.0
+    devDependencies:
+      '@types/ws':
+        specifier: ^8.18.1
+        version: 8.18.2
+
   packages/feishu:
     dependencies:
       '@imwire/core':

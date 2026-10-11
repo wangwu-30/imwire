@@ -28,6 +28,7 @@ jobs:
       - name: Lint
         run: pnpm lint
       - name: Test
+        # unit + contract + packages/e2e (local HTTP/WS platform mocks)
         run: pnpm test
       - uses: actions/setup-python@v5
         with:

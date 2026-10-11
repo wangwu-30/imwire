@@ -29,7 +29,7 @@ import {
   clipToBytes,
   interactiveContent,
 } from "./cards.js";
-import { createFeishuHttp, type FeishuHttp } from "./http.js";
+import { createFeishuHttp, type FeishuFetch, type FeishuHttp } from "./http.js";
 import { mapFeishuEvent } from "./map.js";
 import { createSdkRealtime, type FeishuRealtime } from "./realtime.js";
 import { asString } from "./util.js";
@@ -39,6 +39,9 @@ export interface FeishuAdapterOptions {
   appSecret: string;
   accountId?: string;
   domain?: "feishu" | "lark";
+  /** Override Open API host. Passed through to `createFeishuHttp`. */
+  apiBase?: string;
+  fetch?: FeishuFetch;
   http?: FeishuHttp;
   realtime?: FeishuRealtime;
   draftThrottleMs?: number;
@@ -77,7 +80,13 @@ export class FeishuAdapter implements Adapter, Connectable {
 
   constructor(opts: FeishuAdapterOptions) {
     this.accountId = opts.accountId ?? opts.appId;
-    this.http = opts.http ?? createFeishuHttp(opts);
+    this.http = opts.http ?? createFeishuHttp({
+      appId: opts.appId,
+      appSecret: opts.appSecret,
+      domain: opts.domain,
+      apiBase: opts.apiBase,
+      fetch: opts.fetch,
+    });
     this.draftThrottleMs = opts.draftThrottleMs ?? 200;
     this.createRealtime = async () =>
       opts.realtime ??
