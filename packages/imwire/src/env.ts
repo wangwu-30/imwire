@@ -77,7 +77,16 @@ export function loadAdaptersFromEnv(opts: LoadAdapterOptions): Adapter[] {
       const wecomBot = env("WECOM_BOT_ID") ?? env("WECOM_AIBOT_ID");
       const wecomSecret = env("WECOM_SECRET") ?? env("WECOM_AIBOT_SECRET");
       if (!wecomBot || !wecomSecret) throw new Error("wecom enabled but WECOM_BOT_ID / WECOM_SECRET missing");
-      adapters.push(new WecomAdapter({ botId: wecomBot, secret: wecomSecret, accountId: env("WECOM_ACCOUNT_ID"), logger }));
+      adapters.push(
+        new WecomAdapter({
+          botId: wecomBot,
+          secret: wecomSecret,
+          accountId: env("WECOM_ACCOUNT_ID"),
+          replyStorePath: env("WECOM_REPLY_STORE"),
+          replyMaxBytes: parsePositiveInt(env("WECOM_REPLY_MAX_BYTES")),
+          logger,
+        }),
+      );
     }
     if (name === "slack") {
       const slackBot = env("SLACK_BOT_TOKEN");
@@ -95,4 +104,11 @@ export function loadAdaptersFromEnv(opts: LoadAdapterOptions): Adapter[] {
   }
 
   return adapters;
+}
+
+function parsePositiveInt(raw: string | undefined): number | undefined {
+  if (!raw) return undefined;
+  const n = Number(raw);
+  if (!Number.isFinite(n) || n <= 0) return undefined;
+  return Math.floor(n);
 }

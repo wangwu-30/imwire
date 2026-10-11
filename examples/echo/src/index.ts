@@ -134,6 +134,7 @@ async function main(): Promise<void> {
       botId: wecomBot,
       secret: wecomSecret,
       accountId: env("WECOM_ACCOUNT_ID"),
+      replyStorePath: env("WECOM_REPLY_STORE"),
     });
     attach(wecom);
     adapters.push(wecom);

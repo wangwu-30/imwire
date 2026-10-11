@@ -67,7 +67,7 @@ Config is env vars only. Never commit tokens.
 | `@imwire/telegram` | Bot API long polling (`getUpdates`), edits, inline keyboards, typing, stream-via-`editMessageText` |
 | `@imwire/feishu` | Official `@larksuiteoapi/node-sdk` WebSocket long connection, Card JSON 2.0, CardKit streaming with patch fallback |
 | `@imwire/dingtalk` | Stream mode (raw WS, same topics as `dingtalk-stream`): robot `/v1.0/im/bot/messages/get`, AI card `PUT /v1.0/card/streaming`, card callbacks, `editScope: cards` |
-| `@imwire/wecom` | 智能机器人 long-connection (`wss://openws.work.weixin.qq.com`). Stream replies via `aibot_respond_msg` + inbound `req_id`. `proactiveSend: false` (never `aibot_send_msg`) |
+| `@imwire/wecom` | 智能机器人 long-connection (`wss://openws.work.weixin.qq.com`). Stream replies via `aibot_respond_msg` + inbound `req_id`. `proactiveSend: false` (never `aibot_send_msg`). Reply `req_id` kept 24h in a 1 MiB LRU (`WECOM_REPLY_STORE` optional persist) |
 | `@imwire/slack` | Socket Mode (raw WS via `apps.connections.open`), Block Kit buttons, `chat.update` streaming, threads (`thread_ts`) |
 | `imwire` | `imwire serve` CLI — JSON-RPC 2.0 over stdio and optional authenticated WebSocket (`IMWIRE_ADAPTERS` / `--adapter` required; leftover tokens are ignored). Spec: [`docs/protocol.md`](docs/protocol.md) |
 | `imwire` (PyPI) | Thin async client (`python/`) for serve over stdio / WS, typed dataclasses. Example: `python/examples/echo.py` |
@@ -87,7 +87,7 @@ Config is env vars only. Never commit tokens.
 | `streamingCard` | no | yes | yes | yes | no (`chat.startStream` exists in Slack docs; **unverified**, not used) |
 | `buttons` | inline keyboard | Card JSON 2.0 button + `behaviors.callback` | AI card / Stream `/v1.0/card/instances/callback` | template_card `button_interaction` / `aibot_event_callback` | Block Kit `block_actions` |
 | `edit` / `editScope` | yes / `any` | yes / `cards` — `PATCH /im/v1/messages` only accepts interactive cards, so `send()` always uses cards. (`editTextMessages` was folded into `editScope`.) | yes / `cards` (streaming + card instance) | yes / `cards` (`aibot_respond_update_msg`) | yes / `any` (`chat.update`) |
-| `proactiveSend` | yes | yes | yes (sessionWebhook + robot oTo/group send) | **false** — reply-only via inbound `req_id` + `aibot_respond_msg` (docs also have `aibot_send_msg`; we do not call it) | yes |
+| `proactiveSend` | yes | yes | yes (sessionWebhook + robot oTo/group send) | **false** — reply-only via inbound `req_id` + `aibot_respond_msg` (docs also have `aibot_send_msg`; we do not call it). 24h `req_id` LRU (1 MiB, optional `WECOM_REPLY_STORE`) | yes |
 | `delete` | yes | yes | no | no | yes (`chat.delete`) |
 | `threads` | forum topics (`is_topic_message`) | `thread_id` / reply | no | no | yes (`thread_ts`) |
 | `typing` | `sendChatAction` | no | no | no | no |
@@ -125,7 +125,7 @@ imwire 是给 agent 用的独立 IM SDK：一套 Adapter 接口接飞书 / 钉�
 
 核心包名是 `@imwire/core`。`imwire` 是 CLI（`imwire serve`，JSON-RPC，见 `docs/protocol.md`）；PyPI 上也有同名的薄客户端。包是 ESM-only。
 
-钉钉 / 企微 / Slack 的适配器按官方文档做了夹具测试，**没有**在真实组织上跑过。企微按「只能回不能主动发」映射：`proactiveSend=false`，出站一律带回调里的 `req_id` 走 `aibot_respond_msg`。
+钉钉 / 企微 / Slack 的适配器按官方文档做了夹具测试，**没有**在真实组织上跑过。企微按「只能回不能主动发」映射：`proactiveSend=false`，出站一律带回调里的 `req_id` 走 `aibot_respond_msg`。`req_id` 按文档保留 24 小时，内存 LRU 默认 1 MiB（可用 `WECOM_REPLY_STORE` 落盘）；预算满时会先丢过期项，再按 LRU 淘汰仍在窗口内的项。钉钉 AI 卡片流式上限 1 KB，超长文本的 Approve / Deny 打在最后一张卡片上。
 
 ```bash
 pnpm install && pnpm build
