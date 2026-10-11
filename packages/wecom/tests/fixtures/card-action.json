@@ -1,0 +1,26 @@
+{
+  "cmd": "aibot_event_callback",
+  "headers": {
+    "req_id": "req-card-1"
+  },
+  "body": {
+    "msgid": "MSGID_CARD",
+    "create_time": 1700000000,
+    "aibotid": "aibot_test",
+    "chatid": "CHATID_DM",
+    "chattype": "single",
+    "from": {
+      "userid": "USERID_ADA"
+    },
+    "msgtype": "event",
+    "event": {
+      "eventtype": "template_card_event",
+      "template_card_event": {
+        "card_type": "button_interaction",
+        "event_key": "approve",
+        "task_id": "TASK_APPROVE",
+        "value": "ok"
+      }
+    }
+  }
+}

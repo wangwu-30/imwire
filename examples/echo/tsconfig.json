@@ -9,6 +9,9 @@
   "references": [
     { "path": "../../packages/core" },
     { "path": "../../packages/telegram" },
-    { "path": "../../packages/feishu" }
+    { "path": "../../packages/feishu" },
+    { "path": "../../packages/dingtalk" },
+    { "path": "../../packages/wecom" },
+    { "path": "../../packages/slack" }
   ]
 }

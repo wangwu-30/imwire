@@ -12,6 +12,16 @@ export interface SdkRealtimeOptions {
   appId: string;
   appSecret: string;
   domain?: "feishu" | "lark";
+  /** Must write to stderr — stdout is reserved for JSON-RPC when served. */
+  logger?: {
+    debug?: (...args: unknown[]) => void;
+    info?: (...args: unknown[]) => void;
+    warn?: (...args: unknown[]) => void;
+    error?: (...args: unknown[]) => void;
+    trace?: (...args: unknown[]) => void;
+  };
+  /** SDK numeric `LoggerLevel` (string values silence every WSClient log). */
+  loggerLevel?: number;
 }
 
 type WsLike = {
@@ -57,7 +67,10 @@ export function isWsConnectionAlive(status: unknown, closed: boolean): boolean {
 export async function createSdkRealtime(opts: SdkRealtimeOptions): Promise<FeishuRealtime> {
   const mod = (await import("@larksuiteoapi/node-sdk")) as unknown as {
     default?: unknown;
-    EventDispatcher: new (opts: Record<string, never>) => {
+    EventDispatcher: new (opts: {
+      logger?: unknown;
+      loggerLevel?: unknown;
+    }) => {
       register: (handlers: Record<string, (data: unknown) => Promise<unknown>>) => unknown;
     };
     WSClient: new (opts: {
@@ -65,10 +78,14 @@ export async function createSdkRealtime(opts: SdkRealtimeOptions): Promise<Feish
       appSecret: string;
       domain?: unknown;
       onError?: (err: Error) => void;
+      logger?: unknown;
+      loggerLevel?: unknown;
     }) => WsLike;
     Domain?: { Lark?: unknown; Feishu?: unknown };
+    LoggerLevel?: { fatal: number; error: number; warn: number; info: number };
   };
   const Lark = (mod.default ?? mod) as typeof mod;
+  const LoggerLevel = Lark.LoggerLevel ?? (mod as typeof mod).LoggerLevel;
   const domain = opts.domain === "lark" ? Lark.Domain?.Lark : Lark.Domain?.Feishu;
 
   let client: WsLike | undefined;
@@ -100,7 +117,10 @@ export async function createSdkRealtime(opts: SdkRealtimeOptions): Promise<Feish
         void Promise.resolve(handlers.onEvent(data, type)).catch(() => undefined);
       };
 
-      const dispatcher = new Lark.EventDispatcher({}).register({
+      const sdkLogger = opts.logger ?? stderrSdkLogger();
+      const loggerLevel = opts.loggerLevel ?? LoggerLevel?.warn ?? 2;
+
+      const dispatcher = new Lark.EventDispatcher({ logger: sdkLogger, loggerLevel }).register({
         "im.message.receive_v1": async (data: unknown) => {
           dispatch(data, "im.message.receive_v1");
         },
@@ -123,9 +143,13 @@ export async function createSdkRealtime(opts: SdkRealtimeOptions): Promise<Feish
         appSecret: string;
         domain?: unknown;
         onError?: (err: Error) => void;
+        logger?: unknown;
+        loggerLevel?: unknown;
       } = {
         appId: opts.appId,
         appSecret: opts.appSecret,
+        logger: sdkLogger,
+        loggerLevel,
       };
       if (domain !== undefined) wsOpts.domain = domain;
 
@@ -171,6 +195,11 @@ export async function createSdkRealtime(opts: SdkRealtimeOptions): Promise<Feish
         }
       })();
 
+      if (signal.aborted || !client) {
+        closeClient();
+        return;
+      }
+
       try {
         const started = Promise.resolve(client.start({ eventDispatcher: dispatcher }));
         await Promise.race([
@@ -194,4 +223,25 @@ export async function createSdkRealtime(opts: SdkRealtimeOptions): Promise<Feish
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function stderrSdkLogger(): {
+  debug: (...args: unknown[]) => void;
+  info: (...args: unknown[]) => void;
+  warn: (...args: unknown[]) => void;
+  error: (...args: unknown[]) => void;
+  trace: (...args: unknown[]) => void;
+} {
+  const write = (level: string, args: unknown[]): void => {
+    process.stderr.write(
+      `[${level}]: ${args.map((a) => (typeof a === "string" ? a : JSON.stringify(a))).join(" ")}\n`,
+    );
+  };
+  return {
+    debug: (...args) => write("debug", args),
+    info: (...args) => write("info", args),
+    warn: (...args) => write("warn", args),
+    error: (...args) => write("error", args),
+    trace: (...args) => write("trace", args),
+  };
 }

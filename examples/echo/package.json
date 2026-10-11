@@ -10,7 +10,10 @@
   },
   "dependencies": {
     "@imwire/core": "workspace:*",
+    "@imwire/dingtalk": "workspace:*",
     "@imwire/feishu": "workspace:*",
-    "@imwire/telegram": "workspace:*"
+    "@imwire/slack": "workspace:*",
+    "@imwire/telegram": "workspace:*",
+    "@imwire/wecom": "workspace:*"
   }
 }

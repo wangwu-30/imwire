@@ -29,3 +29,8 @@ jobs:
         run: pnpm lint
       - name: Test
         run: pnpm test
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Python client
+        run: PYTHONPATH=python/src python3 -m unittest discover -s python/tests

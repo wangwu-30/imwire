@@ -1,0 +1,10 @@
+{
+  "specVersion": "1.0",
+  "type": "CALLBACK",
+  "headers": {
+    "topic": "/v1.0/im/bot/messages/get",
+    "messageId": "msg-frame-1",
+    "contentType": "application/json"
+  },
+  "data": "{\"conversationId\":\"cid_dm_1\",\"atUsers\":[{\"dingtalkId\":\"$staff\",\"staffId\":\"staff_ada\"}],\"chatbotCorpId\":\"ding_corp\",\"chatbotUserId\":\"$bot\",\"msgId\":\"msg2hello==\",\"senderNick\":\"Ada\",\"isAdmin\":true,\"senderStaffId\":\"staff_ada\",\"sessionWebhookExpiredTime\":1695204671648,\"createAt\":1695199269062,\"senderCorpId\":\"ding_corp\",\"conversationType\":\"1\",\"senderId\":\"$:LWCP_v1:$sender\",\"isInAtList\":true,\"sessionWebhook\":\"https://oapi.dingtalk.com/robot/sendBySession?session=test-session\",\"text\":{\"content\":\"hello\"},\"robotCode\":\"dingxxxxxxx\",\"msgtype\":\"text\"}"
+}

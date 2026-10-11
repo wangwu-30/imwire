@@ -13,7 +13,8 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "example:echo": "pnpm --filter @imwire/example-echo start",
-    "example:assistant": "pnpm --filter @imwire/example-assistant start"
+    "example:assistant": "pnpm --filter @imwire/example-assistant start",
+    "serve": "pnpm --filter imwire start"
   },
   "pnpm": {
     "onlyBuiltDependencies": ["esbuild", "protobufjs", "better-sqlite3"]
