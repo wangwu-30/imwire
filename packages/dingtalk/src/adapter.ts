@@ -7,6 +7,7 @@ import {
   markdownText,
   statusText,
   type Adapter,
+  type Button,
   type Capabilities,
   type ChatRef,
   type Connectable,
@@ -195,7 +196,7 @@ export class DingTalkAdapter implements Adapter, Connectable {
         streamFinish: async (ctx, msg) => {
           const token = asCardToken(ctx.token);
           if (!token) return ctx.refs;
-          await this.streamCard(token.outTrackId, markdownText(msg) || "…", true);
+          await this.streamCard(token.outTrackId, markdownText(msg) || "…", true, false, collectButtons(msg));
           return ctx.refs;
         },
         streamAbort: async (ctx, note) => {
@@ -235,22 +236,37 @@ export class DingTalkAdapter implements Adapter, Connectable {
     }
   }
 
-  private async deliver(chat: ChatRef, text: string, buttons: ReturnType<typeof collectButtons>, _replyTo?: MsgRef): Promise<MsgRef> {
+  private async deliver(chat: ChatRef, text: string, buttons: Button[], _replyTo?: MsgRef): Promise<MsgRef> {
     if (this.cardTemplateId) {
       const parts = splitUtf8(text, DINGTALK_STREAM_CONTENT_LIMIT);
       const head = parts[0] ?? "…";
       const outTrackId = newId("card");
       await this.createAndDeliver(chat, outTrackId, cardParamMap(head, undefined, parts.length === 1 ? buttons : []), true);
-      for (let i = 1; i < parts.length; i += 1) {
-        const last = i === parts.length - 1;
-        await this.deliverPlain(chat, parts[i] ?? "…", last ? buttons : []);
-      }
+      await this.deliverOverflow(chat, parts.slice(1), buttons);
       return { chat, messageId: outTrackId };
     }
     return this.deliverPlain(chat, text, buttons);
   }
 
-  private async deliverPlain(chat: ChatRef, text: string, _buttons: ReturnType<typeof collectButtons>): Promise<MsgRef> {
+  /**
+   * Overflow after the 1 KB streaming cap. The last piece keeps buttons as a
+   * createAndDeliver card so a long approval still has Approve/Deny.
+   * https://open.dingtalk.com/document/orgapp/api-streamingupdate
+   */
+  private async deliverOverflow(chat: ChatRef, parts: string[], buttons: Button[]): Promise<void> {
+    for (let i = 0; i < parts.length; i += 1) {
+      const last = i === parts.length - 1;
+      const text = parts[i] ?? "…";
+      if (last && buttons.length > 0 && this.cardTemplateId) {
+        const outTrackId = newId("card");
+        await this.createAndDeliver(chat, outTrackId, cardParamMap(text, undefined, buttons), true);
+      } else {
+        await this.deliverPlain(chat, text, []);
+      }
+    }
+  }
+
+  private async deliverPlain(chat: ChatRef, text: string, _buttons: Button[]): Promise<MsgRef> {
     const session = this.sessions.get(chat.chatId);
     const webhookFresh = session?.webhook && (!session.expiresAt || session.expiresAt > Date.now());
     if (webhookFresh && session?.webhook) {
@@ -323,7 +339,13 @@ export class DingTalkAdapter implements Adapter, Connectable {
    * PUT /v1.0/card/streaming
    * https://open.dingtalk.com/document/orgapp/api-streamingupdate
    */
-  private async streamCard(outTrackId: string, content: string, isFinalize: boolean, isError = false): Promise<void> {
+  private async streamCard(
+    outTrackId: string,
+    content: string,
+    isFinalize: boolean,
+    isError = false,
+    buttons: Button[] = [],
+  ): Promise<void> {
     const parts = splitUtf8(content, DINGTALK_STREAM_CONTENT_LIMIT);
     await this.http.request({
       method: "PUT",
@@ -341,9 +363,7 @@ export class DingTalkAdapter implements Adapter, Connectable {
     if (!isFinalize || isError || parts.length <= 1) return;
     const chat = this.cardChats.get(outTrackId);
     if (!chat) return;
-    for (const part of parts.slice(1)) {
-      await this.deliverPlain(chat, part, []);
-    }
+    await this.deliverOverflow(chat, parts.slice(1), buttons);
   }
 }
 

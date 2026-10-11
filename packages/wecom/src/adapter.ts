@@ -21,11 +21,9 @@ import { wecomCapabilities } from "./capabilities.js";
 import { respondBody, streamBody } from "./cards.js";
 import { WecomKickError, wecomShouldRetry } from "./errors.js";
 import { isDisconnectedEvent, mapWecomEvent, replyContextOf } from "./map.js";
+import { WecomReplyStore, type ReplySlot } from "./reply-store.js";
 import { createRawWecomTransport, type WecomFrame, type WecomTransport } from "./transport.js";
 import { asRecord, asString, newId } from "./util.js";
-
-const REPLY_TTL_MS = 10 * 60 * 1000;
-const REPLY_MAX = 256;
 
 export interface WecomAdapterOptions {
   botId: string;
@@ -34,12 +32,15 @@ export interface WecomAdapterOptions {
   transport?: WecomTransport;
   draftThrottleMs?: number;
   logger?: Logger;
-}
-
-interface ReplySlot {
-  reqId: string;
-  msgid: string;
-  at: number;
+  /**
+   * Optional JSON snapshot of the inbound req_id map so a process restart
+   * can still reply inside the official 24h window.
+   */
+  replyStorePath?: string;
+  /** Memory budget for the reply LRU (bytes). Default 1 MiB. */
+  replyMaxBytes?: number;
+  /** Test hook for the 24h TTL. */
+  now?: () => number;
 }
 
 interface StreamToken {
@@ -62,13 +63,19 @@ export class WecomAdapter implements Adapter, Connectable {
   private readonly draftThrottleMs: number;
   private readonly createTransport: () => WecomTransport;
   private transport?: WecomTransport;
-  private readonly replies = new Map<string, ReplySlot>();
+  private readonly replies: WecomReplyStore;
   private readonly logger?: Logger;
 
   constructor(opts: WecomAdapterOptions) {
     this.accountId = opts.accountId ?? opts.botId;
     this.draftThrottleMs = opts.draftThrottleMs ?? 200;
     this.logger = opts.logger;
+    this.replies = new WecomReplyStore({
+      persistPath: opts.replyStorePath,
+      maxBytes: opts.replyMaxBytes,
+      now: opts.now,
+      logger: opts.logger,
+    });
     this.createTransport = () =>
       opts.transport ??
       createRawWecomTransport({
@@ -119,7 +126,7 @@ export class WecomAdapter implements Adapter, Connectable {
   }
 
   rememberReply(chatId: string, reqId: string, msgid?: string): void {
-    const slot: ReplySlot = { reqId, msgid: msgid ?? reqId, at: Date.now() };
+    const slot: ReplySlot = { reqId, msgid: msgid ?? reqId, at: this.replies.now() };
     this.putReply(chatId, slot);
     this.putReply(slot.msgid, slot);
   }
@@ -132,7 +139,7 @@ export class WecomAdapter implements Adapter, Connectable {
     }
     const slot = replyContextOf(raw);
     if (slot) {
-      const rec: ReplySlot = { reqId: slot.reqId, msgid: slot.msgid, at: Date.now() };
+      const rec: ReplySlot = { reqId: slot.reqId, msgid: slot.msgid, at: this.replies.now() };
       this.putReply(slot.chatId, rec);
       this.putReply(slot.msgid, rec);
     }
@@ -264,24 +271,10 @@ export class WecomAdapter implements Adapter, Connectable {
   }
 
   private putReply(key: string, slot: ReplySlot): void {
-    this.pruneReplies();
     this.replies.set(key, slot);
-    this.pruneReplies();
-  }
-
-  private pruneReplies(now = Date.now()): void {
-    for (const [key, slot] of this.replies) {
-      if (now - slot.at > REPLY_TTL_MS) this.replies.delete(key);
-    }
-    while (this.replies.size > REPLY_MAX) {
-      const oldest = this.replies.keys().next().value;
-      if (oldest === undefined) break;
-      this.replies.delete(oldest);
-    }
   }
 
   private reqId(chatId: string, messageId?: string): string {
-    this.pruneReplies();
     const slot = (messageId ? this.replies.get(messageId) : undefined) ?? this.replies.get(chatId);
     if (!slot) throw new Error(`wecom: no req_id for ${chatId} (reply-only; wait for inbound)`);
     return slot.reqId;

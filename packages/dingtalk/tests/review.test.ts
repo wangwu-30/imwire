@@ -319,3 +319,88 @@ test("4.5KB reply is fully delivered (card + follow-ups)", async () => {
   const xs = pieces.join("").replace(/[^x]/g, "");
   expect(xs.length).toBeGreaterThanOrEqual(4500);
 });
+
+function cardButtons(call?: { body?: Record<string, unknown> }): Array<{ id: string; label?: string }> {
+  const card = call?.body?.cardData as { cardParamMap?: { buttons?: string } } | undefined;
+  const raw = card?.cardParamMap?.buttons;
+  if (!raw) return [];
+  try {
+    return JSON.parse(raw) as Array<{ id: string; label?: string }>;
+  } catch {
+    return [];
+  }
+}
+
+// https://open.dingtalk.com/document/orgapp/api-streamingupdate
+test("text over 1KB keeps Approve/Deny on the final card", async () => {
+  const calls: Array<{ path: string; body?: Record<string, unknown> }> = [];
+  const http: DingTalkHttp = {
+    async request(r) {
+      calls.push({ path: r.path, body: r.body as Record<string, unknown> });
+      return {};
+    },
+  };
+  const ad = new DingTalkAdapter({
+    clientId: "c",
+    clientSecret: "s",
+    robotCode: "ROBOT",
+    cardTemplateId: "tpl",
+    http,
+    stream: { isAlive: () => false, stop() {}, async start() {} },
+  });
+  const buttons = [
+    { id: "approve", label: "Approve", style: "primary" as const },
+    { id: "deny", label: "Deny", style: "danger" as const },
+  ];
+  await ad.send(
+    { platform: "dingtalk", accountId: ad.accountId, chatId: "staff_1", kind: "dm" },
+    {
+      blocks: [
+        { kind: "markdown", text: "x".repeat(2500) },
+        { kind: "buttons", buttons },
+      ],
+    },
+  );
+  const cards = calls.filter((c) => c.path.includes("createAndDeliver"));
+  expect(cards.length).toBeGreaterThanOrEqual(2);
+  expect(cardButtons(cards[0])).toEqual([]);
+  expect(cardButtons(cards.at(-1)).map((b) => b.id)).toEqual(["approve", "deny"]);
+});
+
+test("streaming finalize over 1KB keeps Approve/Deny on the final card", async () => {
+  const calls: Array<{ path: string; body?: Record<string, unknown> }> = [];
+  const http: DingTalkHttp = {
+    async request(r) {
+      calls.push({ path: r.path, body: r.body as Record<string, unknown> });
+      return {};
+    },
+  };
+  const ad = new DingTalkAdapter({
+    clientId: "c",
+    clientSecret: "s",
+    robotCode: "ROBOT",
+    cardTemplateId: "tpl",
+    http,
+    stream: { isAlive: () => false, stop() {}, async start() {} },
+    draftThrottleMs: 0,
+  });
+  const chat = { platform: "dingtalk" as const, accountId: ad.accountId, chatId: "staff_1", kind: "dm" as const };
+  const draft = await ad.draft(chat);
+  const text = "x".repeat(2500);
+  draft.append(text);
+  await draft.finalize({
+    blocks: [
+      { kind: "markdown", text },
+      {
+        kind: "buttons",
+        buttons: [
+          { id: "approve", label: "Approve", style: "primary" },
+          { id: "deny", label: "Deny", style: "danger" },
+        ],
+      },
+    ],
+  });
+  const cards = calls.filter((c) => c.path.includes("createAndDeliver"));
+  expect(cards.length).toBeGreaterThanOrEqual(2);
+  expect(cardButtons(cards.at(-1)).map((b) => b.id)).toEqual(["approve", "deny"]);
+});
