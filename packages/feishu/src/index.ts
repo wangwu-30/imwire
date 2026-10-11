@@ -3,10 +3,18 @@ export { feishuCapabilities, FEISHU_MAX_TEXT, FEISHU_CARD_BYTE_CAP } from "./cap
 export { createFeishuHttp, FeishuApiError, type FeishuHttp, type FeishuFetch } from "./http.js";
 export { mapFeishuEvent, type FeishuMapContext } from "./map.js";
 export {
+  ELEMENT_ID_RE,
+  STREAM_ELEMENT_ID,
   assertCardJsonV2,
   buildCardJson,
   buttonElement,
+  buttonElementId,
   cardFromOutMessage,
   clipToBytes,
 } from "./cards.js";
-export { createSdkRealtime, type FeishuRealtime } from "./realtime.js";
+export {
+  createSdkRealtime,
+  isWsConnectionAlive,
+  readWsConnectionState,
+  type FeishuRealtime,
+} from "./realtime.js";

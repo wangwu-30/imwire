@@ -18,9 +18,8 @@ import {
   type OutMessage,
 } from "@imwire/core";
 import { TelegramApi, type TelegramFetch, type TelegramMessage, type TelegramUser } from "./api.js";
-import { inlineKeyboard } from "./buttons.js";
+import { createCallbackTable, decodeCallbackData, inlineKeyboard } from "./buttons.js";
 import { telegramCapabilities } from "./capabilities.js";
-import { decodeCallbackData } from "./buttons.js";
 import { mapTelegramUpdate } from "./map.js";
 import { asNumber, asRecord, asString } from "./util.js";
 
@@ -50,7 +49,7 @@ export class TelegramAdapter implements Adapter, Connectable {
   private botUsername?: string;
   private offset = 0;
   private alive = false;
-  private readonly callbackTable = new Map<string, { id: string; value?: string }>();
+  private readonly callbackTable = createCallbackTable();
   private webhookCleared = false;
 
   constructor(opts: TelegramAdapterOptions) {

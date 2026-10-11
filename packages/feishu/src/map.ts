@@ -114,12 +114,19 @@ function mapAction(
   const chatId = asString(context?.open_chat_id);
   const messageId = asString(context?.open_message_id);
   if (!chatId || !messageId) return undefined;
-  const chatType = asString(context?.chat_type) ?? asString(event.chat_type);
+  // Docs: card.action.trigger context has open_chat_id / open_message_id only —
+  // no chat_type. Prefer an explicit field if present, else default dm; the
+  // adapter looks up GET /im/v1/chats/:id (chat_mode) and inbound cache.
+  const chatType =
+    asString(context?.chat_type) ??
+    asString(context?.chat_mode) ??
+    asString(event.chat_type) ??
+    asString(event.chat_mode);
   const chat: ChatRef = {
     platform: PLATFORM,
     accountId: ctx.accountId,
     chatId,
-    kind: chatType === "p2p" || chatType === "private" || chatType === "dm" ? "dm" : "group",
+    kind: chatType === "group" ? "group" : "dm",
   };
   const from: UserRef = {
     platform: PLATFORM,

@@ -8,7 +8,6 @@ export const telegramCapabilities: Capabilities = {
   streamingCard: false,
   edit: true,
   editScope: "any",
-  editTextMessages: true,
   proactiveSend: true,
   delete: true,
   buttons: true,

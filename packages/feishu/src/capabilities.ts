@@ -9,7 +9,6 @@ export const feishuCapabilities: Capabilities = {
   streamingCard: true,
   edit: true,
   editScope: "cards",
-  editTextMessages: false,
   proactiveSend: true,
   delete: true,
   buttons: true,

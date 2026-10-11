@@ -129,10 +129,12 @@ export interface Capabilities {
   streaming: StreamingMode;
   streamingCard: boolean;
   edit: boolean;
-  /** What `edit()` can actually change. Feishu PATCH only accepts interactive cards. */
+  /**
+   * What `edit()` can actually change.
+   * `any` — text and cards (Telegram). `cards` — interactive cards only (Feishu).
+   * `none` — no edits. Replaces the old `editTextMessages` flag.
+   */
   editScope: EditScope;
-  /** False when the platform cannot edit a plain text message (Feishu). */
-  editTextMessages: boolean;
   /** False when the bot can only reply in-window (some WeCom setups). */
   proactiveSend: boolean;
   delete: boolean;

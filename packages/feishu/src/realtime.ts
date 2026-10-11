@@ -17,8 +17,31 @@ export interface SdkRealtimeOptions {
 type WsLike = {
   start: (opts: { eventDispatcher: unknown }) => Promise<void> | void;
   close?: () => void;
-  getConnectionStatus?: () => string | number;
+  getConnectionStatus?: () => unknown;
 };
+
+const LIVE_STATES = new Set(["idle", "connecting", "connected", "reconnecting"]);
+
+/**
+ * `WSClient.getConnectionStatus()` returns `{ state, reconnectAttempts, … }`,
+ * not a string. `String(status)` is `"[object Object]"` and hides `failed`.
+ */
+export function readWsConnectionState(status: unknown): string | undefined {
+  if (status == null) return undefined;
+  if (typeof status === "string" || typeof status === "number") return String(status).toLowerCase();
+  if (typeof status === "object" && "state" in status) {
+    const state = (status as { state?: unknown }).state;
+    if (typeof state === "string" || typeof state === "number") return String(state).toLowerCase();
+  }
+  return undefined;
+}
+
+export function isWsConnectionAlive(status: unknown, closed: boolean): boolean {
+  if (closed) return false;
+  const state = readWsConnectionState(status);
+  if (state === undefined) return true;
+  return LIVE_STATES.has(state);
+}
 
 /**
  * Official `@larksuiteoapi/node-sdk` long connection. Loaded lazily so mapping
@@ -28,7 +51,7 @@ type WsLike = {
  * This wrapper therefore:
  * - creates **one** client
  * - does not treat `start()` resolving as a disconnect
- * - waits until abort or a terminal start() rejection
+ * - waits until abort or a terminal start() / `state: failed` / `onError`
  * - acks card callbacks without awaiting user handlers (3 s deadline)
  */
 export async function createSdkRealtime(opts: SdkRealtimeOptions): Promise<FeishuRealtime> {
@@ -37,7 +60,12 @@ export async function createSdkRealtime(opts: SdkRealtimeOptions): Promise<Feish
     EventDispatcher: new (opts: Record<string, never>) => {
       register: (handlers: Record<string, (data: unknown) => Promise<unknown>>) => unknown;
     };
-    WSClient: new (opts: { appId: string; appSecret: string; domain?: unknown }) => WsLike;
+    WSClient: new (opts: {
+      appId: string;
+      appSecret: string;
+      domain?: unknown;
+      onError?: (err: Error) => void;
+    }) => WsLike;
     Domain?: { Lark?: unknown; Feishu?: unknown };
   };
   const Lark = (mod.default ?? mod) as typeof mod;
@@ -59,10 +87,7 @@ export async function createSdkRealtime(opts: SdkRealtimeOptions): Promise<Feish
 
   const statusAlive = (): boolean => {
     if (closed || !client) return false;
-    const status = client.getConnectionStatus?.();
-    if (status === undefined) return true;
-    const s = String(status).toLowerCase();
-    return s !== "closed" && s !== "failed" && s !== "close" && s !== "0";
+    return isWsConnectionAlive(client.getConnectionStatus?.(), closed);
   };
 
   return {
@@ -93,7 +118,12 @@ export async function createSdkRealtime(opts: SdkRealtimeOptions): Promise<Feish
         },
       });
 
-      const wsOpts: { appId: string; appSecret: string; domain?: unknown } = {
+      const wsOpts: {
+        appId: string;
+        appSecret: string;
+        domain?: unknown;
+        onError?: (err: Error) => void;
+      } = {
         appId: opts.appId,
         appSecret: opts.appSecret,
       };
@@ -101,6 +131,21 @@ export async function createSdkRealtime(opts: SdkRealtimeOptions): Promise<Feish
 
       closeClient();
       closed = false;
+
+      let settleFatal: ((err: Error) => void) | undefined;
+      const fatal = new Promise<never>((_resolve, reject) => {
+        settleFatal = (err) => {
+          closeClient();
+          reject(err);
+        };
+      });
+      const onFatal = (err: unknown): void => {
+        const error = err instanceof Error ? err : new Error(String(err));
+        settleFatal?.(error);
+        settleFatal = undefined;
+      };
+      wsOpts.onError = (err) => onFatal(err);
+
       client = new Lark.WSClient(wsOpts);
 
       const aborted = new Promise<void>((resolve) => {
@@ -115,15 +160,28 @@ export async function createSdkRealtime(opts: SdkRealtimeOptions): Promise<Feish
         signal.addEventListener("abort", onAbort, { once: true });
       });
 
+      const watchFailed = (async () => {
+        while (!closed && !signal.aborted) {
+          await sleep(250);
+          const state = readWsConnectionState(client?.getConnectionStatus?.());
+          if (state === "failed") {
+            onFatal(new Error("feishu websocket failed (bad credentials or exhausted reconnect)"));
+            return;
+          }
+        }
+      })();
+
       try {
         const started = Promise.resolve(client.start({ eventDispatcher: dispatcher }));
         await Promise.race([
           aborted,
+          fatal,
+          watchFailed,
           started.then(
             () => aborted,
             (err: unknown) => {
-              closeClient();
-              throw err;
+              onFatal(err);
+              return fatal;
             },
           ),
         ]);
@@ -132,4 +190,8 @@ export async function createSdkRealtime(opts: SdkRealtimeOptions): Promise<Feish
       }
     },
   };
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }

@@ -1,5 +1,13 @@
 import { describe, expect, it } from "vitest";
-import { assertCardJsonV2, buildCardJson, cardFromOutMessage } from "../src/cards.js";
+import type { Button } from "@imwire/core";
+import { ELEMENT_ID_RE, assertCardJsonV2, buildCardJson, cardFromOutMessage } from "../src/cards.js";
+
+function buttonIds(buttons: Button[]): string[] {
+  const card = buildCardJson({ text: "x", buttons });
+  assertCardJsonV2(card);
+  const elements = (card.body as { elements: Array<Record<string, unknown>> }).elements;
+  return elements.filter((el) => el.tag === "button").map((el) => String(el.element_id));
+}
 
 describe("Feishu Card JSON 2.0", () => {
   it("emits schema 2.0 buttons as body elements with callback behaviors", () => {
@@ -52,5 +60,31 @@ describe("Feishu Card JSON 2.0", () => {
       ],
     });
     assertCardJsonV2(card);
+  });
+
+  it("assigns letter-prefixed unique element_ids ≤20 chars", () => {
+    const long = buttonIds([{ id: "approve_tool_call", label: "Go" }]);
+    expect(long).toHaveLength(1);
+    expect(long[0]).toMatch(ELEMENT_ID_RE);
+    expect((long[0] ?? "").length).toBeLessThanOrEqual(20);
+
+    const punct = buttonIds([
+      { id: "approve:1", label: "A" },
+      { id: "approve.1", label: "B" },
+    ]);
+    expect(punct).toHaveLength(2);
+    expect(new Set(punct).size).toBe(2);
+    for (const id of punct) {
+      expect(id).toMatch(ELEMENT_ID_RE);
+      expect(id.length).toBeLessThanOrEqual(20);
+    }
+
+    const sameId = buttonIds([
+      { id: "approve", label: "One", value: "first" },
+      { id: "approve", label: "Two", value: "second" },
+    ]);
+    expect(sameId).toHaveLength(2);
+    expect(new Set(sameId).size).toBe(2);
+    for (const id of sameId) expect(id).toMatch(ELEMENT_ID_RE);
   });
 });

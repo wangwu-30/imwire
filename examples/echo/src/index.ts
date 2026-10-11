@@ -69,7 +69,7 @@ function sleep(ms: number): Promise<void> {
 
 async function main(): Promise<void> {
   const adapters: Adapter[] = [];
-  const telegramToken = env("TELEGRAM_BOT_TOKEN");
+  const telegramToken = env("TELEGRAM_BOT_TOKEN") ?? env("IMWIRE_TELEGRAM_BOT_TOKEN");
   const feishuAppId = env("FEISHU_APP_ID");
   const feishuAppSecret = env("FEISHU_APP_SECRET");
 
@@ -101,6 +101,7 @@ async function main(): Promise<void> {
 Set env vars (see .env.example) and re-run:
 
   TELEGRAM_BOT_TOKEN          Telegram bot token (long polling)
+  IMWIRE_TELEGRAM_BOT_TOKEN   alias of TELEGRAM_BOT_TOKEN
   TELEGRAM_ACCOUNT_ID         optional override for the bot id
   FEISHU_APP_ID               Feishu / Lark app id
   FEISHU_APP_SECRET           Feishu / Lark app secret

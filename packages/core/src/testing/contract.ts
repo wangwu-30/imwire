@@ -27,7 +27,6 @@ export const contractCapabilitiesShape: Array<keyof Capabilities> = [
   "streamingCard",
   "edit",
   "editScope",
-  "editTextMessages",
   "proactiveSend",
   "delete",
   "buttons",

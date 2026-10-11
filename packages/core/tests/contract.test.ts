@@ -36,7 +36,6 @@ function harness(streamingCard: boolean) {
       streamingCard,
       edit: true,
       editScope: "any",
-      editTextMessages: true,
       proactiveSend: true,
       delete: true,
       buttons: true,

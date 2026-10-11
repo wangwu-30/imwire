@@ -71,8 +71,7 @@ Config is env vars only. Never commit tokens.
 | `streaming` | `edit` | `card` | — | — | — |
 | `streamingCard` | no | yes | — | — | — |
 | `buttons` | inline keyboard | Card JSON 2.0 button + `behaviors.callback` | — | — | — |
-| `edit` / `editScope` | yes / `any` | yes / `cards` | — | — | — |
-| `editTextMessages` | yes | **false** — `PATCH /im/v1/messages` only accepts interactive cards. `send()` therefore always uses cards so later `edit()` works. | — | — | — |
+| `edit` / `editScope` | yes / `any` | yes / `cards` — `PATCH /im/v1/messages` only accepts interactive cards, so `send()` always uses cards. (`editTextMessages` was folded into `editScope`.) | — | — | — |
 | `proactiveSend` | yes | yes | — | — | — |
 | `delete` | yes | yes | — | — | — |
 | `threads` | forum topics (`is_topic_message`) | `thread_id` / reply | — | — | — |
@@ -83,7 +82,7 @@ Config is env vars only. Never commit tokens.
 
 Streaming drafts degrade automatically: card update when the platform can, otherwise edit-in-place, otherwise buffered chunked sends. Stream updates are latest-wins coalesced (one in-flight + one pending) and skip unchanged text.
 
-`Button` is `{ id, label, style?, value? }` on every platform. Telegram callback_data is limited to 64 **bytes**; longer payloads (including CJK ids) are hashed with an in-memory fallback table.
+`Button` is `{ id, label, style?, value? }` on every platform. Telegram callback_data is limited to 64 **bytes**; longer payloads (including CJK ids) are hashed (`h:<16 hex>`) into a bounded LRU table (256). After a process restart the table is empty, so those clicks arrive as unresolved `actionId: "h:…"`.
 
 ## Roadmap
 
@@ -104,7 +103,7 @@ cp .env.example .env   # echo 用 node --env-file 加载
 pnpm --filter @imwire/example-echo start
 ```
 
-飞书 `send()` 一律发交互卡片：飞书的 `PATCH` 只能改卡片，不能改普通文本（`editTextMessages=false`，`editScope:"cards"`）。卡片用 Card JSON 2.0（按钮直接放在 `body.elements`，带 `behaviors.callback`，不要 `tag:action` / `wide_screen_mode`）。
+飞书 `send()` 一律发交互卡片：飞书的 `PATCH` 只能改卡片，不能改普通文本（`editScope:"cards"`）。卡片用 Card JSON 2.0（按钮直接放在 `body.elements`，带 `behaviors.callback`，不要 `tag:action` / `wide_screen_mode`）。`element_id` 必须字母开头、≤20 字符、卡内唯一。
 
 ## Develop
 

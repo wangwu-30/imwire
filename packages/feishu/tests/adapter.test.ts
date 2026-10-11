@@ -106,6 +106,58 @@ describe("FeishuAdapter stream cards", () => {
     expect(settings.settings).toContain('"streaming_mode":false');
   });
 
+  it("closes streaming_mode even when the final content PUT fails", async () => {
+    const { http, calls } = mockHttp({
+      onRequest: (c) => {
+        const seq = (c.body as { sequence?: number } | undefined)?.sequence;
+        if (c.path.includes("/content") && c.method === "PUT" && (seq ?? 0) >= 2) {
+          throw Object.assign(new Error("content failed"), { code: 300317 });
+        }
+      },
+    });
+    const adapter = new FeishuAdapter({
+      appId: "cli_test",
+      appSecret: "secret",
+      http,
+      realtime: { start: async () => undefined, isAlive: () => false, stop() {} },
+      draftThrottleMs: 0,
+    });
+    const draft = await adapter.draft(chatA);
+    draft.append("hello");
+    await draft.finalize({ blocks: [{ kind: "markdown", text: "hello" }] });
+    expect(calls.some((c) => c.path.endsWith("/settings") && c.method === "PATCH")).toBe(true);
+  });
+
+  it("looks up chat_mode for card actions when the payload has no chat_type", async () => {
+    const { http } = mockHttp();
+    const orig = http.request.bind(http);
+    http.request = async (opts) => {
+      if (opts.path.includes("/im/v1/chats/") && opts.method === "GET") {
+        return { chat_mode: "group" };
+      }
+      return orig(opts);
+    };
+    const adapter = new FeishuAdapter({
+      appId: "cli_test",
+      appSecret: "secret",
+      http,
+      realtime: { start: async () => undefined, isAlive: () => false, stop() {} },
+    });
+    const seen: string[] = [];
+    adapter.on(async (e) => {
+      if (e.type === "action") seen.push(e.target.chat.kind);
+    });
+    await adapter.ingest(
+      {
+        operator: { open_id: "ou_x" },
+        action: { value: { actionId: "approve" } },
+        context: { open_chat_id: "oc_group_looks_like_dm", open_message_id: "om_1" },
+      },
+      "card.action.trigger",
+    );
+    expect(seen).toEqual(["group"]);
+  });
+
   it("download() returns the real bytes from requestBytes", async () => {
     const { http } = mockHttp();
     const adapter = new FeishuAdapter({

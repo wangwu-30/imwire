@@ -41,6 +41,7 @@ describe("mapFeishuEvent", () => {
     expect(event.target.messageId).toBe("om_card_1");
     expect(event.from.userId).toBe("ou_operator");
     expect(event.from.displayName).toBeUndefined();
+    expect(event.target.chat.kind).toBe("dm");
   });
 
   it("reads explicit button value from the callback payload", () => {
