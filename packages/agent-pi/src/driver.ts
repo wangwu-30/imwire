@@ -107,7 +107,7 @@ export class PiAgentDriver implements AgentDriver {
       return existing;
     }
     const models = this.models ?? (await loadModels());
-    const model = models.getModel(this.modelProvider, this.modelId);
+    const model = resolveModel(models, this.modelProvider, this.modelId);
     if (!model) {
       throw new Error(`Unknown model ${this.modelProvider}/${this.modelId}. Set IMWIRE_PI_PROVIDER / IMWIRE_PI_MODEL.`);
     }
@@ -272,6 +272,24 @@ function abortDecision(signal?: AbortSignal): Promise<ApprovalDecision> {
     }
     signal.addEventListener("abort", () => resolve("deny"), { once: true });
   });
+}
+
+/**
+ * Look up a model; if the provider is known but this id isn't in pi's catalog yet
+ * (new or preview releases), reuse a sibling model's transport config under the
+ * requested id so the provider's API decides whether the id is valid.
+ * Enabled with IMWIRE_PI_ALLOW_UNLISTED_MODEL=1.
+ */
+function resolveModel(models: Models, provider: string, id: string): Model<Api> | undefined {
+  const exact = models.getModel(provider, id) as Model<Api> | undefined;
+  if (exact) return exact;
+  // Opt-in: an unknown id is usually a typo, which should surface as an error.
+  if (process.env.IMWIRE_PI_ALLOW_UNLISTED_MODEL !== "1") return undefined;
+  const siblings = (models.getModels?.(provider) ?? []) as Model<Api>[];
+  const base = siblings[0];
+  if (!base) return undefined;
+  console.warn(`pi: ${provider}/${id} is not in the built-in catalog; using ${base.id}'s settings with id ${id}`);
+  return { ...base, id, name: id };
 }
 
 async function loadModels(): Promise<Models> {
