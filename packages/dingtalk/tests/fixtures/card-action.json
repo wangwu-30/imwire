@@ -1,0 +1,10 @@
+{
+  "specVersion": "1.0",
+  "type": "CALLBACK",
+  "headers": {
+    "topic": "/v1.0/card/instances/callback",
+    "messageId": "card-frame-1",
+    "contentType": "application/json"
+  },
+  "data": "{\"outTrackId\":\"card-track-1\",\"userId\":\"staff_ada\",\"openConversationId\":\"cid_dm_1\",\"conversationType\":\"1\",\"content\":{\"cardPrivateData\":{\"params\":{\"actionId\":\"approve\",\"value\":\"ok\"}}},\"value\":\"ok\"}"
+}

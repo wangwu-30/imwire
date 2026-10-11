@@ -50,12 +50,21 @@ importers:
       '@imwire/core':
         specifier: workspace:*
         version: link:../../packages/core
+      '@imwire/dingtalk':
+        specifier: workspace:*
+        version: link:../../packages/dingtalk
       '@imwire/feishu':
         specifier: workspace:*
         version: link:../../packages/feishu
+      '@imwire/slack':
+        specifier: workspace:*
+        version: link:../../packages/slack
       '@imwire/telegram':
         specifier: workspace:*
         version: link:../../packages/telegram
+      '@imwire/wecom':
+        specifier: workspace:*
+        version: link:../../packages/wecom
 
   packages/agent-pi:
     dependencies:
@@ -75,6 +84,19 @@ importers:
         specifier: ^3.0.0
         version: 3.2.7(@types/node@22.20.5)
 
+  packages/dingtalk:
+    dependencies:
+      '@imwire/core':
+        specifier: workspace:*
+        version: link:../core
+      ws:
+        specifier: ^8.18.3
+        version: 8.22.0
+    devDependencies:
+      '@types/ws':
+        specifier: ^8.18.1
+        version: 8.18.2
+
   packages/feishu:
     dependencies:
       '@imwire/core':
@@ -83,6 +105,34 @@ importers:
       '@larksuiteoapi/node-sdk':
         specifier: ^1.55.0
         version: 1.74.0
+
+  packages/imwire:
+    dependencies:
+      '@imwire/core':
+        specifier: workspace:*
+        version: link:../core
+      '@imwire/dingtalk':
+        specifier: workspace:*
+        version: link:../dingtalk
+      '@imwire/feishu':
+        specifier: workspace:*
+        version: link:../feishu
+      '@imwire/slack':
+        specifier: workspace:*
+        version: link:../slack
+      '@imwire/telegram':
+        specifier: workspace:*
+        version: link:../telegram
+      '@imwire/wecom':
+        specifier: workspace:*
+        version: link:../wecom
+      ws:
+        specifier: ^8.18.3
+        version: 8.22.0
+    devDependencies:
+      '@types/ws':
+        specifier: ^8.18.1
+        version: 8.18.2
 
   packages/session:
     dependencies:
@@ -97,11 +147,37 @@ importers:
         specifier: ^7.6.13
         version: 7.6.13
 
+  packages/slack:
+    dependencies:
+      '@imwire/core':
+        specifier: workspace:*
+        version: link:../core
+      ws:
+        specifier: ^8.18.3
+        version: 8.22.0
+    devDependencies:
+      '@types/ws':
+        specifier: ^8.18.1
+        version: 8.18.2
+
   packages/telegram:
     dependencies:
       '@imwire/core':
         specifier: workspace:*
         version: link:../core
+
+  packages/wecom:
+    dependencies:
+      '@imwire/core':
+        specifier: workspace:*
+        version: link:../core
+      ws:
+        specifier: ^8.18.3
+        version: 8.22.0
+    devDependencies:
+      '@types/ws':
+        specifier: ^8.18.1
+        version: 8.18.2
 
 packages:
 
@@ -659,6 +735,9 @@ packages:
 
   '@types/retry@0.12.0':
     resolution: {integrity: sha512-wWKOClTTiizcZhXnPY4wikVAwmdYHp8q6DmC+EJUzAMsycb7HB32Kh9RN4+0gExjmPmZSAQjgURXIGATPegAvA==}
+
+  '@types/ws@8.18.2':
+    resolution: {integrity: sha512-67MQl+fpWKVTT1NYdnmo3U4sc/xPo/zQBncVnI74qmQa0z/b+1g6iYqNmGCPbxO+zz2aklb08a0oHfegiVd0/w==}
 
   '@typescript-eslint/eslint-plugin@8.71.1':
     resolution: {integrity: sha512-nNlBf6HuotqMgZvSkWD5hNdemiBIxQ2NmrlgfcUIeZRs+BbakjscCQRq/Hb74EFVnFiSWWdL12JruqwBy3ERDw==}
@@ -2254,6 +2333,10 @@ snapshots:
       undici-types: 6.21.0
 
   '@types/retry@0.12.0': {}
+
+  '@types/ws@8.18.2':
+    dependencies:
+      '@types/node': 22.20.5
 
   '@typescript-eslint/eslint-plugin@8.71.1(@typescript-eslint/parser@8.71.1(eslint@9.39.5)(typescript@5.9.3))(eslint@9.39.5)(typescript@5.9.3)':
     dependencies:

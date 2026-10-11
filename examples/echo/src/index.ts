@@ -1,5 +1,8 @@
+import { DingTalkAdapter } from "@imwire/dingtalk";
 import { FeishuAdapter } from "@imwire/feishu";
+import { SlackAdapter } from "@imwire/slack";
 import { TelegramAdapter } from "@imwire/telegram";
+import { WecomAdapter } from "@imwire/wecom";
 import type { Adapter, Inbound } from "@imwire/core";
 
 function env(name: string): string | undefined {
@@ -95,6 +98,48 @@ async function main(): Promise<void> {
     console.log(`feishu adapter enabled (${domain})`);
   }
 
+  const dingClientId = env("DINGTALK_CLIENT_ID") ?? env("DINGTALK_APP_KEY");
+  const dingSecret = env("DINGTALK_CLIENT_SECRET") ?? env("DINGTALK_APP_SECRET");
+  if (dingClientId && dingSecret) {
+    const dingtalk = new DingTalkAdapter({
+      clientId: dingClientId,
+      clientSecret: dingSecret,
+      accountId: env("DINGTALK_ACCOUNT_ID"),
+      robotCode: env("DINGTALK_ROBOT_CODE"),
+      cardTemplateId: env("DINGTALK_CARD_TEMPLATE_ID"),
+      streamKey: env("DINGTALK_CARD_STREAM_KEY"),
+    });
+    attach(dingtalk);
+    adapters.push(dingtalk);
+    console.log("dingtalk adapter enabled (Stream; live org unverified)");
+  }
+
+  const wecomBot = env("WECOM_BOT_ID") ?? env("WECOM_AIBOT_ID");
+  const wecomSecret = env("WECOM_SECRET") ?? env("WECOM_AIBOT_SECRET");
+  if (wecomBot && wecomSecret) {
+    const wecom = new WecomAdapter({
+      botId: wecomBot,
+      secret: wecomSecret,
+      accountId: env("WECOM_ACCOUNT_ID"),
+    });
+    attach(wecom);
+    adapters.push(wecom);
+    console.log("wecom adapter enabled (智能机器人 long-conn; live unverified)");
+  }
+
+  const slackBot = env("SLACK_BOT_TOKEN");
+  const slackApp = env("SLACK_APP_TOKEN");
+  if (slackBot && slackApp) {
+    const slack = new SlackAdapter({
+      botToken: slackBot,
+      appToken: slackApp,
+      accountId: env("SLACK_ACCOUNT_ID"),
+    });
+    attach(slack);
+    adapters.push(slack);
+    console.log("slack adapter enabled (Socket Mode; live unverified)");
+  }
+
   if (adapters.length === 0) {
     console.error(`imwire echo example
 
@@ -106,8 +151,14 @@ Set env vars (see .env.example) and re-run:
   FEISHU_APP_ID               Feishu / Lark app id
   FEISHU_APP_SECRET           Feishu / Lark app secret
   FEISHU_DOMAIN               feishu | lark  (default feishu)
+  DINGTALK_CLIENT_ID          DingTalk Stream client id / app key
+  DINGTALK_CLIENT_SECRET      DingTalk client secret
+  DINGTALK_CARD_TEMPLATE_ID   AI card template (streaming + callbacks)
+  WECOM_BOT_ID / WECOM_SECRET WeCom 智能机器人 long-connection
+  SLACK_BOT_TOKEN             xoxb- bot token
+  SLACK_APP_TOKEN             xapp- app-level token (connections:write)
 
-You can enable one or both adapters. They share the same handler.`);
+You can enable any combination. They share the same handler.`);
     process.exitCode = 1;
     return;
   }

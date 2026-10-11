@@ -20,7 +20,7 @@ export default defineConfig({
         replacement: `${root}packages/core/src/testing/index.ts`,
       },
       { find: /^@imwire\/core$/, replacement: `${root}packages/core/src/index.ts` },
-      { find: /^imwire$/, replacement: `${root}packages/core/src/index.ts` },
+      { find: /^imwire$/, replacement: `${root}packages/imwire/src/index.ts` },
       {
         find: /^@imwire\/telegram$/,
         replacement: `${root}packages/telegram/src/index.ts`,
@@ -28,6 +28,18 @@ export default defineConfig({
       {
         find: /^@imwire\/feishu$/,
         replacement: `${root}packages/feishu/src/index.ts`,
+      },
+      {
+        find: /^@imwire\/dingtalk$/,
+        replacement: `${root}packages/dingtalk/src/index.ts`,
+      },
+      {
+        find: /^@imwire\/wecom$/,
+        replacement: `${root}packages/wecom/src/index.ts`,
+      },
+      {
+        find: /^@imwire\/slack$/,
+        replacement: `${root}packages/slack/src/index.ts`,
       },
       {
         find: /^@imwire\/session$/,

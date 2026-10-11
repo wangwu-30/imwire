@@ -4,7 +4,7 @@ One adapter interface for Feishu, DingTalk, WeCom, Telegram, and Slack. Long-con
 
 L1 (`@imwire/core` + platform adapters) does not know about people or sessions and stays independently usable. L2 (`@imwire/session`) sits on top of the adapter interface. L3 (`@imwire/agent-pi`) is one `AgentDriver` implementation; ACP drivers can be added later.
 
-Packages are **ESM-only** (Node 20+). The npm name `imwire` is reserved for the future CLI / `imwire serve` package; import the SDK as `@imwire/core`.
+Packages are **ESM-only** (Node 20+). The npm name `imwire` is the `imwire serve` CLI (JSON-RPC over stdio / WebSocket). Import the SDK as `@imwire/core`. A thin PyPI client (`imwire`) talks to that process.
 
 ## Quickstart
 
@@ -63,12 +63,17 @@ Config is env vars only. Never commit tokens.
 
 | Package | Role |
 |---|---|
-| `@imwire/core` | Normalized events, `Adapter`, capability table, dedup, rate limit, retry, reconnect, chunking, streaming-draft degrade. The `imwire` name is reserved for the CLI. |
+| `@imwire/core` | Normalized events, `Adapter`, capability table, dedup, rate limit, retry, reconnect, chunking, streaming-draft degrade. |
 | `@imwire/telegram` | Bot API long polling (`getUpdates`), edits, inline keyboards, typing, stream-via-`editMessageText` |
 | `@imwire/feishu` | Official `@larksuiteoapi/node-sdk` WebSocket long connection, Card JSON 2.0, CardKit streaming with patch fallback |
+| `@imwire/dingtalk` | Stream mode (raw WS, same topics as `dingtalk-stream`): robot `/v1.0/im/bot/messages/get`, AI card `PUT /v1.0/card/streaming`, card callbacks, `editScope: cards` |
+| `@imwire/wecom` | 智能机器人 long-connection (`wss://openws.work.weixin.qq.com`). Stream replies via `aibot_respond_msg` + inbound `req_id`. `proactiveSend: false` (never `aibot_send_msg`) |
+| `@imwire/slack` | Socket Mode (raw WS via `apps.connections.open`), Block Kit buttons, `chat.update` streaming, threads (`thread_ts`) |
+| `imwire` | `imwire serve` CLI — JSON-RPC 2.0 over stdio and optional WebSocket. Spec: [`docs/protocol.md`](docs/protocol.md) |
+| `imwire` (PyPI) | Thin async client (`python/`) for serve over stdio / WS, typed dataclasses. Example: `python/examples/echo.py` |
 | `@imwire/session` | Person identities, hashed 8-digit `/pair` codes (per-sender lockout + per-code burn, never a global revoke), default + named topics, group isolation, follow-the-user routing, mid-stream switch, first-click-wins + authorized + TTL approvals. SQLite WAL + `busy_timeout` (better-sqlite3, or `node:sqlite` on Node 22+). Depends only on `@imwire/core`. |
 | `@imwire/agent-pi` | `AgentDriver` over `@earendil-works/pi-agent-core` + `@earendil-works/pi-ai` 1.1.0. One Agent per conversation; log → pi `Message` shapes; live `text_delta` streaming; `beforeToolCall` → imwire approvals. Tests use pi-ai `fauxProvider` (no network). |
-| `@imwire/example-echo` | Tiny dual-adapter demo |
+| `@imwire/example-echo` | Starts every adapter you configured |
 | `@imwire/example-assistant` | Telegram + Feishu + session + pi, env-config only |
 
 `@imwire/core/testing` imports `vitest` at runtime; vitest is an optional peer dependency of `@imwire/core`.
@@ -77,18 +82,19 @@ Config is env vars only. Never commit tokens.
 
 | | Telegram | Feishu | DingTalk | WeCom | Slack |
 |---|---|---|---|---|---|
-| Connection (v0) | long polling | WebSocket | Stream (week 3) | long connection (week 3) | Socket Mode (week 3) |
-| `streaming` | `edit` | `card` | — | — | — |
-| `streamingCard` | no | yes | — | — | — |
-| `buttons` | inline keyboard | Card JSON 2.0 button + `behaviors.callback` | — | — | — |
-| `edit` / `editScope` | yes / `any` | yes / `cards` — `PATCH /im/v1/messages` only accepts interactive cards, so `send()` always uses cards. (`editTextMessages` was folded into `editScope`.) | — | — | — |
-| `proactiveSend` | yes | yes | — | — | — |
-| `delete` | yes | yes | — | — | — |
-| `threads` | forum topics (`is_topic_message`) | `thread_id` / reply | — | — | — |
-| `typing` | `sendChatAction` | no | — | — | — |
-| `media` | not implemented (`false`) | not implemented (`false`) | — | — | — |
-| `maxTextLength` | 4096 | 8000 (card body also clipped to 30 KB) | — | — | — |
-| `markdown` | `none` (no `parse_mode`; `**x**` is literal) | `subset` (card `markdown` tag) | — | — | — |
+| Connection (v0) | long polling | WebSocket | Stream (raw WS) | 智能机器人 long-conn | Socket Mode (raw WS) |
+| `streaming` | `edit` | `card` | `card` (AI card `PUT /v1.0/card/streaming`) | `card` (`aibot_respond_msg` stream `{id,finish,content}`) | `edit` (`chat.update`) |
+| `streamingCard` | no | yes | yes | yes | no (`chat.startStream` exists in Slack docs; **unverified**, not used) |
+| `buttons` | inline keyboard | Card JSON 2.0 button + `behaviors.callback` | AI card / Stream `/v1.0/card/instances/callback` | template_card `button_interaction` / `aibot_event_callback` | Block Kit `block_actions` |
+| `edit` / `editScope` | yes / `any` | yes / `cards` — `PATCH /im/v1/messages` only accepts interactive cards, so `send()` always uses cards. (`editTextMessages` was folded into `editScope`.) | yes / `cards` (streaming + card instance) | yes / `cards` (`aibot_respond_update_msg`) | yes / `any` (`chat.update`) |
+| `proactiveSend` | yes | yes | yes (sessionWebhook + robot oTo/group send) | **false** — reply-only via inbound `req_id` + `aibot_respond_msg` (docs also have `aibot_send_msg`; we do not call it) | yes |
+| `delete` | yes | yes | no | no | yes (`chat.delete`) |
+| `threads` | forum topics (`is_topic_message`) | `thread_id` / reply | no | no | yes (`thread_ts`) |
+| `typing` | `sendChatAction` | no | no | no | no |
+| `media` | not implemented (`false`) | not implemented (`false`) | no | no | no |
+| `maxTextLength` | 4096 | 8000 (card body also clipped to 30 KB) | 5000 | 4096 | 40000 |
+| `markdown` | `none` (no `parse_mode`; `**x**` is literal) | `subset` (card `markdown` tag) | `subset` | `subset` | `subset` (`mrkdwn`) |
+| Live platform | fixture + optional live token | fixture + optional live token | **fixture-only** — Stream / AI card / sessionWebhook **not verified** against a real org | **fixture-only** — aibot WS **not verified** against a real corp | **fixture-only** — Socket Mode / Block Kit / `chat.update` **not verified** against a real workspace |
 
 Streaming drafts degrade automatically: card update when the platform can, otherwise edit-in-place, otherwise buffered chunked sends. Stream updates are latest-wins coalesced (one in-flight + one pending) and skip unchanged text.
 
@@ -97,8 +103,8 @@ Streaming drafts degrade automatically: card update when the platform can, other
 ## Roadmap
 
 - **Week 1** — L1 core + Telegram + Feishu, contract tests against recorded fixtures.
-- **Week 2 (this PR)** — L2 session (`@imwire/session`) + L3 pi driver (`@imwire/agent-pi`). Pairing, one conversation per person, follow-the-user streaming and approvals. The IM layer does not import the session package.
-- **Week 3** — DingTalk Stream, WeCom long connection, Slack Socket Mode, and a Python client via `imwire serve` (JSON-RPC).
+- **Week 2** — L2 session (`@imwire/session`) + L3 pi driver (`@imwire/agent-pi`). Pairing, one conversation per person, follow-the-user streaming and approvals. The IM layer does not import the session package.
+- **Week 3 (this PR)** — DingTalk Stream, WeCom 智能机器人 long connection, Slack Socket Mode, `imwire serve` (JSON-RPC stdio / WS), and the Python `imwire` client. Adapter tests are recorded fixtures cited against official docs; DingTalk / WeCom / Slack have **not** been verified against live platforms.
 
 ### Session commands and routing
 
@@ -117,7 +123,9 @@ Replies go to the IM that triggered the turn. Proactive messages go to the perso
 
 imwire 是给 agent 用的独立 IM SDK：一套 Adapter 接口接飞书 / 钉钉 / 企微 / Telegram / Slack，默认长连接，不需要公网 IP。面向 agent 的能力（流式回复、审批按钮、配对）是一等公民。L2 `@imwire/session` 让一个人在所有 IM 上共享一段对话；IM 层不依赖它，可以单独引用。`/pair` 出 8 位码，在新 IM 发给 bot 即完成绑定。群聊单独成会话，不会并进个人对话。中途换 IM 时，原侧草稿会标「continued in …」，已生成的文字在新侧续上。
 
-核心包名是 `@imwire/core`（`imwire` 留给以后的 CLI）。包是 ESM-only。
+核心包名是 `@imwire/core`。`imwire` 是 CLI（`imwire serve`，JSON-RPC，见 `docs/protocol.md`）；PyPI 上也有同名的薄客户端。包是 ESM-only。
+
+钉钉 / 企微 / Slack 的适配器按官方文档做了夹具测试，**没有**在真实组织上跑过。企微按「只能回不能主动发」映射：`proactiveSend=false`，出站一律带回调里的 `req_id` 走 `aibot_respond_msg`。
 
 ```bash
 pnpm install && pnpm build

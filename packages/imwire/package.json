@@ -1,0 +1,38 @@
+{
+  "name": "imwire",
+  "version": "0.1.0",
+  "description": "imwire serve CLI — run adapters as a JSON-RPC process (stdio / WebSocket).",
+  "type": "module",
+  "license": "MIT",
+  "engines": {
+    "node": ">=20"
+  },
+  "bin": {
+    "imwire": "./bin/imwire.js"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": ["dist", "src", "bin"],
+  "scripts": {
+    "build": "tsc -b",
+    "typecheck": "tsc -b --pretty false",
+    "start": "node dist/cli.js serve"
+  },
+  "dependencies": {
+    "@imwire/core": "workspace:*",
+    "@imwire/dingtalk": "workspace:*",
+    "@imwire/feishu": "workspace:*",
+    "@imwire/slack": "workspace:*",
+    "@imwire/telegram": "workspace:*",
+    "@imwire/wecom": "workspace:*",
+    "ws": "^8.18.3"
+  },
+  "devDependencies": {
+    "@types/ws": "^8.18.1"
+  }
+}

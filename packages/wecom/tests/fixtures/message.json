@@ -1,0 +1,19 @@
+{
+  "cmd": "aibot_msg_callback",
+  "headers": {
+    "req_id": "req-hello-1"
+  },
+  "body": {
+    "msgid": "MSGID_HELLO",
+    "aibotid": "aibot_test",
+    "chatid": "CHATID_DM",
+    "chattype": "single",
+    "from": {
+      "userid": "USERID_ADA"
+    },
+    "msgtype": "text",
+    "text": {
+      "content": "hello"
+    }
+  }
+}
