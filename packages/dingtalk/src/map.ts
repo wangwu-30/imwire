@@ -6,6 +6,7 @@ const PLATFORM: Platform = "dingtalk";
 
 export interface DingTalkMapContext {
   accountId: string;
+  chatForTrack?: (outTrackId: string) => ChatRef | undefined;
 }
 
 /**
@@ -82,6 +83,7 @@ function looksLikeRobot(payload: Record<string, unknown>): boolean {
 function looksLikeCardCallback(payload: Record<string, unknown>): boolean {
   return Boolean(
     asString(payload.outTrackId) ||
+      asString(payload.type) === "actionCallback" ||
       asRecord(payload.content)?.cardPrivateData ||
       asRecord(payload.cardPrivateData),
   );
@@ -134,7 +136,7 @@ function mapRobot(
     from,
     messageId,
     text,
-    mentionsBot: chat.kind === "dm" || payload.isInAtList === true || /@/.test(text),
+    mentionsBot: chat.kind === "dm" || payload.isInAtList === true,
     raw,
   };
 }
@@ -150,15 +152,16 @@ function mapCard(
     asString(payload.staffId) ??
     asString(asRecord(payload.userId)?.staffId) ??
     "unknown";
+  const remembered = ctx.chatForTrack?.(outTrackId);
   const chatId =
+    remembered?.chatId ??
     asString(payload.openConversationId) ??
     asString(payload.conversationId) ??
-    asString(payload.chatId) ??
-    outTrackId;
-  const chat: ChatRef = {
+    asString(payload.chatId);
+  const chat: ChatRef = remembered ?? {
     platform: PLATFORM,
     accountId: ctx.accountId,
-    chatId,
+    chatId: chatId ?? "unknown",
     kind: asString(payload.conversationType) === "1" ? "dm" : "group",
   };
   const { actionId, value } = cardAction(payload);
@@ -174,11 +177,25 @@ function mapCard(
   };
 }
 
+function parseContent(payload: Record<string, unknown>): Record<string, unknown> | undefined {
+  if (typeof payload.content === "string") {
+    try {
+      return asRecord(JSON.parse(payload.content));
+    } catch {
+      return undefined;
+    }
+  }
+  return asRecord(payload.content);
+}
+
 function cardAction(payload: Record<string, unknown>): { actionId: string; value?: string } {
-  const content = asRecord(payload.content);
+  const content = parseContent(payload);
   const privateData = asRecord(content?.cardPrivateData) ?? asRecord(payload.cardPrivateData);
+  const actionIds = asArray(privateData?.actionIds);
+  const fromIds = asString(actionIds?.[0]);
   const params = asRecord(privateData?.params);
   const fromParams = asString(params?.actionId) ?? asString(params?.action) ?? asString(params?.key);
+  if (fromIds) return { actionId: fromIds, value: asString(params?.value) ?? asString(payload.value) };
   if (fromParams) return { actionId: fromParams, value: asString(params?.value) ?? asString(payload.value) };
   const value = asString(payload.value) ?? asString(payload.cardAction);
   if (value) {

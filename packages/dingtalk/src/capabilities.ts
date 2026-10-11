@@ -3,6 +3,9 @@ import type { Capabilities } from "@imwire/core";
 /** Conservative chunk size for robot markdown / AI card bodies. */
 export const DINGTALK_MAX_TEXT = 5000;
 
+/** PUT /v1.0/card/streaming content size (error 200092). Official: ≤1 KB per update. */
+export const DINGTALK_STREAM_CONTENT_LIMIT = 1000;
+
 /**
  * DingTalk Stream robot + AI cards.
  * Live Stream / AI-card paths are fixture-tested against official docs; not

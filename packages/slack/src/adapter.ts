@@ -27,6 +27,7 @@ export interface SlackAdapterOptions {
   botToken: string;
   appToken?: string;
   accountId?: string;
+  botUserId?: string;
   web?: SlackWeb;
   socket?: SlackSocket;
   draftThrottleMs?: number;
@@ -42,9 +43,11 @@ export class SlackAdapter implements Adapter, Connectable {
   private readonly draftThrottleMs: number;
   private readonly createSocket: () => SlackSocket;
   private socket?: SlackSocket;
+  private botUserId?: string;
 
   constructor(opts: SlackAdapterOptions) {
     this.accountId = opts.accountId ?? "slack";
+    this.botUserId = opts.botUserId;
     this.web = opts.web ?? createSlackWeb(opts);
     this.draftThrottleMs = opts.draftThrottleMs ?? 400;
     this.createSocket = () =>
@@ -75,6 +78,8 @@ export class SlackAdapter implements Adapter, Connectable {
   }
 
   async connect(signal: AbortSignal): Promise<void> {
+    const me = await this.web.call<{ user_id?: string; user?: string; bot_id?: string }>("auth.test");
+    this.botUserId = asString(me.user_id) ?? asString(me.user) ?? this.botUserId;
     this.socket?.stop();
     this.socket = this.createSocket();
     await this.socket.start(
@@ -94,7 +99,7 @@ export class SlackAdapter implements Adapter, Connectable {
   }
 
   async ingest(raw: unknown, opts?: { wait?: boolean }): Promise<void> {
-    const events = mapSlackEvent(raw, { accountId: this.accountId });
+    const events = mapSlackEvent(raw, { accountId: this.accountId, botUserId: this.botUserId });
     for (const event of events) {
       await this.runtime.enqueue(event);
     }

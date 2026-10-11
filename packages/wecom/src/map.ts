@@ -41,6 +41,7 @@ export function mapWecomEvent(raw: unknown, ctx: WecomMapContext): Inbound[] {
 export function replyContextOf(raw: unknown): WecomReplyContext | undefined {
   const rec = asRecord(raw);
   if (!rec) return undefined;
+  if (asString(rec.cmd) !== "aibot_msg_callback") return undefined;
   const headers = asRecord(rec.headers);
   const body = asRecord(rec.body) ?? rec;
   const reqId = asString(headers?.req_id);
@@ -48,6 +49,14 @@ export function replyContextOf(raw: unknown): WecomReplyContext | undefined {
   const chat = chatFromBody(body, "acct");
   if (!reqId || !chat) return undefined;
   return { reqId, msgid: msgid ?? reqId, chatId: chat.chatId };
+}
+
+export function isDisconnectedEvent(raw: unknown): boolean {
+  const rec = asRecord(raw);
+  if (!rec) return false;
+  const body = asRecord(rec.body) ?? rec;
+  const event = asRecord(body.event) ?? body;
+  return asString(event.eventtype) === "disconnected_event";
 }
 
 function mapMessage(

@@ -1,6 +1,6 @@
 """Thin async client for `imwire serve` (JSON-RPC over stdio / WebSocket)."""
 
-from .client import Draft, ImwireClient
+from .client import Draft, ImwireClient, ImwireError
 from .types import (
     ActionEvent,
     Button,
@@ -23,6 +23,7 @@ __all__ = [
     "Draft",
     "EditEvent",
     "ImwireClient",
+    "ImwireError",
     "InboundEvent",
     "MessageEvent",
     "MsgRef",

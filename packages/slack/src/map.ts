@@ -48,7 +48,8 @@ export function envelopeIdOf(raw: unknown): string | undefined {
 }
 
 function mapMessage(event: Record<string, unknown>, ctx: SlackMapContext, raw: unknown): Inbound | undefined {
-  if (asString(event.bot_id) && asString(event.user) === ctx.botUserId) return undefined;
+  if (asString(event.bot_id)) return undefined;
+  if (ctx.botUserId && asString(event.user) === ctx.botUserId) return undefined;
   const chat = mapChat(event, ctx);
   if (!chat) return undefined;
   const userId = asString(event.user) ?? "unknown";
@@ -173,7 +174,7 @@ function mapChat(event: Record<string, unknown>, ctx: SlackMapContext): ChatRef 
 }
 
 function mentionsBot(text: string, botUserId?: string): boolean {
-  if (!botUserId) return /<@U[A-Z0-9]+>/.test(text);
+  if (!botUserId) return false;
   return text.includes(`<@${botUserId}>`);
 }
 

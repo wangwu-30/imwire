@@ -1,6 +1,8 @@
 import type { ChatRef, DraftHandle, Inbound, MsgRef, OutMessage } from "@imwire/core";
+import { RPC_INVALID_REQUEST, RpcFail } from "./rpc.js";
 
 export const PROTOCOL_VERSION = "1.0";
+export const MAX_RPC_BYTES = 1_048_576;
 
 export interface JsonRpcRequest {
   jsonrpc: "2.0";
@@ -30,11 +32,23 @@ export interface JsonRpcNotification {
 export type JsonRpcMessage = JsonRpcRequest | JsonRpcSuccess | JsonRpcError | JsonRpcNotification;
 
 export function parseRpc(raw: string): JsonRpcRequest {
-  const rec = JSON.parse(raw) as JsonRpcRequest;
-  if (rec.jsonrpc !== "2.0" || typeof rec.method !== "string") {
-    throw rpcError(-32600, "invalid JSON-RPC request");
+  let rec: unknown;
+  try {
+    rec = JSON.parse(raw);
+  } catch {
+    throw new RpcFail(-32700, "parse error");
   }
-  return rec;
+  if (Array.isArray(rec)) {
+    throw new RpcFail(RPC_INVALID_REQUEST, "batch requests are not supported");
+  }
+  if (!rec || typeof rec !== "object") {
+    throw new RpcFail(RPC_INVALID_REQUEST, "invalid JSON-RPC request");
+  }
+  const obj = rec as JsonRpcRequest;
+  if (obj.jsonrpc !== "2.0" || typeof obj.method !== "string") {
+    throw new RpcFail(RPC_INVALID_REQUEST, "invalid JSON-RPC request");
+  }
+  return obj;
 }
 
 export function rpcResult(id: string | number | null | undefined, result: unknown): JsonRpcSuccess {
@@ -80,4 +94,10 @@ export interface ApprovalParams {
   chat: ChatRef;
   text: string;
   requestId: string;
+}
+
+export function asRecord(value: unknown): Record<string, unknown> | undefined {
+  return typeof value === "object" && value !== null && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : undefined;
 }

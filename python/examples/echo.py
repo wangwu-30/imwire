@@ -24,9 +24,9 @@ if str(ROOT / "python" / "src") not in sys.path:
 from imwire import Button, ImwireClient, OutMessage  # noqa: E402
 
 
-async def run(command: list[str] | None, url: str | None) -> None:
+async def run(command: list[str] | None, url: str | None, token: str | None) -> None:
     if url:
-        ctx = ImwireClient.ws(url)
+        ctx = ImwireClient.ws(url, token)
     else:
         ctx = ImwireClient.stdio(command)
     async with ctx as client:
@@ -43,7 +43,11 @@ async def run(command: list[str] | None, url: str | None) -> None:
             text = event.text if event.type == "message" else f"/{event.name} {event.args}".strip()
             draft = await client.start_draft(event.chat)
             await draft.set_status("echoing…")
-            await draft.append(text or "(empty)")
+            # Character groups — CJK has no whitespace. Pace slower than serve/adapter throttle.
+            body = text or "(empty)"
+            for i in range(0, len(body), 2):
+                await draft.append(body[i : i + 2])
+                await asyncio.sleep(0.4)
             await draft.finalize(
                 OutMessage(
                     markdown=text or "(empty)",
@@ -58,10 +62,11 @@ async def run(command: list[str] | None, url: str | None) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description="Python echo client for imwire serve")
     parser.add_argument("--ws", dest="url", help="WebSocket URL (ws://127.0.0.1:8765)")
+    parser.add_argument("--token", dest="token", help="IMWIRE_WS_TOKEN / --ws-token value")
     parser.add_argument("command", nargs="*", help="stdio command after `--` (default: imwire serve)")
     args = parser.parse_args()
     command = args.command or None
-    asyncio.run(run(command, args.url))
+    asyncio.run(run(command, args.url, args.token))
 
 
 if __name__ == "__main__":

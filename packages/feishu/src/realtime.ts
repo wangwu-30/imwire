@@ -12,6 +12,15 @@ export interface SdkRealtimeOptions {
   appId: string;
   appSecret: string;
   domain?: "feishu" | "lark";
+  /** Must write to stderr — stdout is reserved for JSON-RPC when served. */
+  logger?: {
+    debug?: (...args: unknown[]) => void;
+    info?: (...args: unknown[]) => void;
+    warn?: (...args: unknown[]) => void;
+    error?: (...args: unknown[]) => void;
+    trace?: (...args: unknown[]) => void;
+  };
+  loggerLevel?: string;
 }
 
 type WsLike = {
@@ -65,6 +74,8 @@ export async function createSdkRealtime(opts: SdkRealtimeOptions): Promise<Feish
       appSecret: string;
       domain?: unknown;
       onError?: (err: Error) => void;
+      logger?: unknown;
+      loggerLevel?: unknown;
     }) => WsLike;
     Domain?: { Lark?: unknown; Feishu?: unknown };
   };
@@ -123,9 +134,13 @@ export async function createSdkRealtime(opts: SdkRealtimeOptions): Promise<Feish
         appSecret: string;
         domain?: unknown;
         onError?: (err: Error) => void;
+        logger?: unknown;
+        loggerLevel?: unknown;
       } = {
         appId: opts.appId,
         appSecret: opts.appSecret,
+        logger: opts.logger ?? stderrSdkLogger(),
+        loggerLevel: opts.loggerLevel ?? "error",
       };
       if (domain !== undefined) wsOpts.domain = domain;
 
@@ -194,4 +209,25 @@ export async function createSdkRealtime(opts: SdkRealtimeOptions): Promise<Feish
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function stderrSdkLogger(): {
+  debug: (...args: unknown[]) => void;
+  info: (...args: unknown[]) => void;
+  warn: (...args: unknown[]) => void;
+  error: (...args: unknown[]) => void;
+  trace: (...args: unknown[]) => void;
+} {
+  const write = (level: string, args: unknown[]): void => {
+    process.stderr.write(
+      `[${level}]: ${args.map((a) => (typeof a === "string" ? a : JSON.stringify(a))).join(" ")}\n`,
+    );
+  };
+  return {
+    debug: (...args) => write("debug", args),
+    info: (...args) => write("info", args),
+    warn: (...args) => write("warn", args),
+    error: (...args) => write("error", args),
+    trace: (...args) => write("trace", args),
+  };
 }

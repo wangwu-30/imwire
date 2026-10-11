@@ -18,8 +18,8 @@ import {
   type OutMessage,
   type StreamContext,
 } from "@imwire/core";
-import { cardDataFromOut, cardParamMap, DEFAULT_STREAM_KEY, webhookActionCard, webhookMarkdown } from "./cards.js";
-import { dingtalkCapabilities } from "./capabilities.js";
+import { cardDataFromOut, cardParamMap, DEFAULT_STREAM_KEY, webhookMarkdown } from "./cards.js";
+import { DINGTALK_STREAM_CONTENT_LIMIT, dingtalkCapabilities } from "./capabilities.js";
 import { createDingTalkHttp, type DingTalkHttp } from "./http.js";
 import { mapDingTalkEvent, robotSessionOf } from "./map.js";
 import { createRawDingTalkStream, type DingTalkStream } from "./stream.js";
@@ -52,7 +52,7 @@ interface SessionHook {
 
 export class DingTalkAdapter implements Adapter, Connectable {
   readonly platform = "dingtalk" as const;
-  readonly capabilities: Capabilities = dingtalkCapabilities;
+  readonly capabilities: Capabilities;
   readonly accountId: string;
   private readonly runtime: AdapterRuntime;
   private readonly http: DingTalkHttp;
@@ -63,11 +63,18 @@ export class DingTalkAdapter implements Adapter, Connectable {
   private readonly createStream: () => DingTalkStream;
   private stream?: DingTalkStream;
   private readonly sessions = new Map<string, SessionHook>();
+  private readonly cardChats = new Map<string, ChatRef>();
 
   constructor(opts: DingTalkAdapterOptions) {
     this.accountId = opts.accountId ?? opts.clientId;
     this.robotCode = opts.robotCode ?? opts.clientId;
     this.cardTemplateId = opts.cardTemplateId;
+    this.capabilities = {
+      ...dingtalkCapabilities,
+      buttons: Boolean(opts.cardTemplateId),
+      streamingCard: Boolean(opts.cardTemplateId),
+      streaming: opts.cardTemplateId ? "card" : "buffer",
+    };
     this.streamKey = opts.streamKey ?? DEFAULT_STREAM_KEY;
     this.http = opts.http ?? createDingTalkHttp(opts);
     this.draftThrottleMs = opts.draftThrottleMs ?? 200;
@@ -124,11 +131,14 @@ export class DingTalkAdapter implements Adapter, Connectable {
         senderStaffId: session.senderStaffId,
       });
     }
-    const events = mapDingTalkEvent(raw, { accountId: this.accountId });
+    const events = mapDingTalkEvent(raw, {
+      accountId: this.accountId,
+      chatForTrack: (id) => this.cardChats.get(id),
+    });
     for (const event of events) {
       if (event.type === "action") {
         const known = this.sessions.get(event.target.chat.chatId);
-        if (!known && event.target.chat.chatId) {
+        if (!known && event.target.chat.chatId && event.target.chat.chatId !== "unknown") {
           this.sessions.set(event.target.chat.chatId, {});
         }
       }
@@ -215,6 +225,7 @@ export class DingTalkAdapter implements Adapter, Connectable {
   }
 
   private async startCard(chat: ChatRef): Promise<StreamContext | undefined> {
+    if (!this.cardTemplateId) return undefined;
     const outTrackId = newId("card");
     try {
       await this.createAndDeliver(chat, outTrackId, cardParamMap("…"), false);
@@ -231,8 +242,9 @@ export class DingTalkAdapter implements Adapter, Connectable {
       return { chat, messageId: outTrackId };
     }
     const session = this.sessions.get(chat.chatId);
-    if (session?.webhook) {
-      const body = buttons.length > 0 ? webhookActionCard(text, buttons) : webhookMarkdown(text);
+    const webhookFresh = session?.webhook && (!session.expiresAt || session.expiresAt > Date.now());
+    if (webhookFresh && session?.webhook) {
+      const body = webhookMarkdown(text);
       await this.http.request({
         method: "POST",
         path: session.webhook,
@@ -273,22 +285,25 @@ export class DingTalkAdapter implements Adapter, Connectable {
     cardParam: Record<string, string>,
     finalize: boolean,
   ): Promise<void> {
-    const templateId = this.cardTemplateId ?? "imwire-unconfigured";
+    if (!this.cardTemplateId) throw new Error("dingtalk AI card requires cardTemplateId");
+    // https://open.dingtalk.com/document/development/create-and-deliver-cards.md
     const openSpaceId =
-      chat.kind === "group" ? `dtv1.card//IM_GROUP.${chat.chatId}` : `dtv1.card//IM_ROBOT.${this.robotCode}.${chat.chatId}`;
+      chat.kind === "group" ? `dtv1.card//IM_GROUP.${chat.chatId}` : `dtv1.card//IM_ROBOT.${chat.chatId}`;
     await this.http.request({
       method: "POST",
       path: "/v1.0/card/instances/createAndDeliver",
       body: {
-        cardTemplateId: templateId,
+        cardTemplateId: this.cardTemplateId,
         outTrackId,
         cardData: { cardParamMap: cardParam },
         callbackType: "STREAM",
         openSpaceId,
-        imGroupOpenSpaceModel: chat.kind === "group" ? { lastMessageI18n: { ZH_CN: cardParam.content } } : undefined,
-        imRobotOpenSpaceModel: chat.kind === "dm" ? { supportForward: true } : undefined,
+        imRobotOpenDeliverModel:
+          chat.kind === "dm" ? { spaceType: "IM_ROBOT", robotCode: this.robotCode } : undefined,
+        imGroupOpenDeliverModel: chat.kind === "group" ? { robotCode: this.robotCode } : undefined,
       },
     });
+    this.cardChats.set(outTrackId, chat);
     if (finalize) {
       await this.streamCard(outTrackId, cardParam.content ?? "…", true);
     }
@@ -306,7 +321,7 @@ export class DingTalkAdapter implements Adapter, Connectable {
         outTrackId,
         guid: newId("guid"),
         key: this.streamKey,
-        content,
+        content: clipStreamContent(content),
         isFull: true,
         isFinalize,
         isError,
@@ -320,6 +335,15 @@ function asCardToken(token: unknown): CardToken | undefined {
   const outTrackId = asString(rec?.outTrackId);
   if (!outTrackId) return undefined;
   return { outTrackId, seq: 0 };
+}
+
+function clipStreamContent(content: string): string {
+  if (Buffer.byteLength(content, "utf8") <= DINGTALK_STREAM_CONTENT_LIMIT) return content;
+  let out = content;
+  while (out.length > 0 && Buffer.byteLength(out, "utf8") > DINGTALK_STREAM_CONTENT_LIMIT) {
+    out = out.slice(0, -1);
+  }
+  return out;
 }
 
 function render(text: string, status?: string): string {

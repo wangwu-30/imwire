@@ -19,7 +19,7 @@ import {
 } from "@imwire/core";
 import { wecomCapabilities } from "./capabilities.js";
 import { respondBody, streamBody } from "./cards.js";
-import { mapWecomEvent, replyContextOf } from "./map.js";
+import { isDisconnectedEvent, mapWecomEvent, replyContextOf } from "./map.js";
 import { createRawWecomTransport, type WecomFrame, type WecomTransport } from "./transport.js";
 import { asRecord, asString, newId } from "./util.js";
 
@@ -101,12 +101,21 @@ export class WecomAdapter implements Adapter, Connectable {
   }
 
   rememberReply(chatId: string, reqId: string, msgid?: string): void {
-    this.replies.set(chatId, { reqId, msgid: msgid ?? reqId });
+    const slot = { reqId, msgid: msgid ?? reqId };
+    this.replies.set(chatId, slot);
+    this.replies.set(slot.msgid, slot);
   }
 
   async ingest(raw: unknown, opts?: { wait?: boolean }): Promise<void> {
+    if (isDisconnectedEvent(raw)) {
+      this.transport?.stop("wecom disconnected_event: another instance subscribed");
+      throw new Error("wecom disconnected_event: another instance subscribed");
+    }
     const slot = replyContextOf(raw);
-    if (slot) this.replies.set(slot.chatId, { reqId: slot.reqId, msgid: slot.msgid });
+    if (slot) {
+      this.replies.set(slot.chatId, { reqId: slot.reqId, msgid: slot.msgid });
+      this.replies.set(slot.msgid, { reqId: slot.reqId, msgid: slot.msgid });
+    }
     const events = mapWecomEvent(raw, { accountId: this.accountId });
     for (const event of events) {
       await this.runtime.enqueue(event);
@@ -135,7 +144,7 @@ export class WecomAdapter implements Adapter, Connectable {
         },
         newId("task"),
       );
-      const messageId = await this.runtime.outbound(chat, () => this.respond(chat, body));
+      const messageId = await this.runtime.outbound(chat, () => this.respond(chat, body, msg.replyTo?.messageId));
       refs.push({ chat, messageId });
     }
     return refs;
@@ -146,7 +155,7 @@ export class WecomAdapter implements Adapter, Connectable {
     await this.runtime.outbound(ref.chat, () =>
       this.push({
         cmd: "aibot_respond_update_msg",
-        headers: { req_id: this.reqId(ref.chat.chatId) },
+        headers: { req_id: this.reqId(ref.chat.chatId, ref.messageId) },
         body: {
           response_type: "update_template_card",
           template_card: respondBody(msg, ref.messageId).template_card ?? {
@@ -172,7 +181,7 @@ export class WecomAdapter implements Adapter, Connectable {
         edit: (r, m) => this.edit(r, m),
         streamStart: async (c) => {
           const streamId = newId("stream");
-          const reqId = this.reqId(c.chatId);
+          const reqId = this.reqId(c.chatId, opts?.replyTo?.messageId);
           await this.push({
             cmd: "aibot_respond_msg",
             headers: { req_id: reqId },
@@ -199,7 +208,7 @@ export class WecomAdapter implements Adapter, Connectable {
               headers: { req_id: token.reqId },
               body: streamBody(token.streamId, markdownText(msg) || "…", true),
             });
-            const messageId = await this.respond(ctx.refs[0]?.chat ?? chat, respondBody(msg, token.streamId));
+            const messageId = await this.respond(ctx.refs[0]?.chat ?? chat, respondBody(msg, token.streamId), token.streamId);
             return [{ chat, messageId }];
           }
           await this.push({
@@ -234,12 +243,14 @@ export class WecomAdapter implements Adapter, Connectable {
     throw new Error("wecom media download is not implemented");
   }
 
-  private reqId(chatId: string): string {
-    return this.replies.get(chatId)?.reqId ?? newId("req");
+  private reqId(chatId: string, messageId?: string): string {
+    const slot = (messageId ? this.replies.get(messageId) : undefined) ?? this.replies.get(chatId);
+    if (!slot) throw new Error(`wecom: no req_id for ${chatId} (reply-only; wait for inbound)`);
+    return slot.reqId;
   }
 
-  private async respond(chat: ChatRef, body: Record<string, unknown>): Promise<string> {
-    const reqId = this.reqId(chat.chatId);
+  private async respond(chat: ChatRef, body: Record<string, unknown>, messageId?: string): Promise<string> {
+    const reqId = this.reqId(chat.chatId, messageId);
     await this.push({
       cmd: "aibot_respond_msg",
       headers: { req_id: reqId },

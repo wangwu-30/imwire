@@ -69,7 +69,7 @@ Config is env vars only. Never commit tokens.
 | `@imwire/dingtalk` | Stream mode (raw WS, same topics as `dingtalk-stream`): robot `/v1.0/im/bot/messages/get`, AI card `PUT /v1.0/card/streaming`, card callbacks, `editScope: cards` |
 | `@imwire/wecom` | 智能机器人 long-connection (`wss://openws.work.weixin.qq.com`). Stream replies via `aibot_respond_msg` + inbound `req_id`. `proactiveSend: false` (never `aibot_send_msg`) |
 | `@imwire/slack` | Socket Mode (raw WS via `apps.connections.open`), Block Kit buttons, `chat.update` streaming, threads (`thread_ts`) |
-| `imwire` | `imwire serve` CLI — JSON-RPC 2.0 over stdio and optional WebSocket. Spec: [`docs/protocol.md`](docs/protocol.md) |
+| `imwire` | `imwire serve` CLI — JSON-RPC 2.0 over stdio and optional authenticated WebSocket (`IMWIRE_ADAPTERS` / `--adapter` required; leftover tokens are ignored). Spec: [`docs/protocol.md`](docs/protocol.md) |
 | `imwire` (PyPI) | Thin async client (`python/`) for serve over stdio / WS, typed dataclasses. Example: `python/examples/echo.py` |
 | `@imwire/session` | Person identities, hashed 8-digit `/pair` codes (per-sender lockout + per-code burn, never a global revoke), default + named topics, group isolation, follow-the-user routing, mid-stream switch, first-click-wins + authorized + TTL approvals. SQLite WAL + `busy_timeout` (better-sqlite3, or `node:sqlite` on Node 22+). Depends only on `@imwire/core`. |
 | `@imwire/agent-pi` | `AgentDriver` over `@earendil-works/pi-agent-core` + `@earendil-works/pi-ai` 1.1.0. One Agent per conversation; log → pi `Message` shapes; live `text_delta` streaming; `beforeToolCall` → imwire approvals. Tests use pi-ai `fauxProvider` (no network). |

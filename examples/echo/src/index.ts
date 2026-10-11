@@ -43,10 +43,13 @@ async function handle(adapter: Adapter, event: Inbound): Promise<void> {
     replyTo: messageId ? { chat, messageId } : undefined,
   });
   draft.setStatus("echoing…");
-  const chunks = text.length > 0 ? text.split(/(\s+)/) : ["(empty)"];
+  // CJK and other scripts have no whitespace — split by character groups
+  // and wait longer than the adapter throttle so each update is visible.
+  const chunks = visibleChunks(text);
+  const pace = streamPaceMs(adapter.platform);
   for (const chunk of chunks) {
     draft.append(chunk);
-    await sleep(40);
+    await sleep(pace);
   }
   await draft.finalize({
     blocks: [
@@ -68,6 +71,27 @@ function attach(adapter: Adapter): void {
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/** 1–2 code points so CJK streams visibly (whitespace split yields one blob). */
+export function visibleChunks(text: string): string[] {
+  if (!text) return ["(empty)"];
+  const chars = [...text];
+  const out: string[] = [];
+  for (let i = 0; i < chars.length; i += 2) {
+    out.push(chars.slice(i, i + 2).join(""));
+  }
+  return out;
+}
+
+/**
+ * Slower than each adapter's draft throttle so streaming is visible:
+ * telegram edit ~1000 ms, slack chat.update ~600 ms, card platforms ~350 ms.
+ */
+export function streamPaceMs(platform: string): number {
+  if (platform === "telegram") return 1100;
+  if (platform === "slack") return 700;
+  return 400;
 }
 
 async function main(): Promise<void> {

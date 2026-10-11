@@ -66,6 +66,13 @@ export function createRawSlackSocket(opts: RawSocketOptions): SlackSocket {
         const type = asString(frame.type);
         if (type === "hello") return;
         if (type === "disconnect") {
+          const reason = asString(frame.reason);
+          // https://docs.slack.dev/apis/events-api/using-socket-mode#disconnect
+          if (reason === "warning") return;
+          if (reason === "link_disabled") {
+            alive = false;
+            return;
+          }
           ws.close();
           return;
         }

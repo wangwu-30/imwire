@@ -1,15 +1,45 @@
 # imwire serve protocol
 
-`imwire serve` runs every adapter you configured (env vars) as a standalone process. Clients talk **JSON-RPC 2.0**.
+`imwire serve` runs the adapters you **explicitly** enable and speaks **JSON-RPC 2.0**. Tokens in the environment are never enough on their own — leftover `TELEGRAM_BOT_TOKEN` / Feishu / Slack secrets will not start a bot.
+
+```bash
+imwire serve --adapter telegram --adapter slack
+# or
+IMWIRE_ADAPTERS=telegram,feishu imwire serve
+```
 
 | Transport | Framing |
 |---|---|
-| **stdio** | One JSON-RPC object per line (UTF-8, `\n` delimited). Logs go to **stderr**. |
-| **WebSocket** | One JSON-RPC object per text frame. `imwire serve --ws 8765` |
+| **stdio** | One JSON-RPC object per line (UTF-8, `\n` delimited). **Stdout is JSON-RPC only.** Logs (including the Feishu SDK logger) go to **stderr**. Stdin EOF exits the process. |
+| **WebSocket** | One JSON-RPC object per text frame. `imwire serve --ws [port]` (default `8765`). `--ws-host` implies `--ws`. |
 
-Protocol version: **`1.0`**.
+Max line / frame size: **1 MiB**. Protocol version: **`1.0`**.
 
-Normalized events (the same `Inbound` model as `@imwire/core`) flow **out** as notifications. `send` / `edit` / `draft` / `approval` flow **in** as requests.
+Normalized events (the same `Inbound` model as `@imwire/core`) flow **out** as notifications. `send` / `edit` / `draft` / `approval` flow **in** as requests. Each client has its own request-id namespace; a response is written only to the client that sent the request.
+
+## Security (WebSocket)
+
+`--ws` binds **`127.0.0.1`** by default. A token is **required**:
+
+- `IMWIRE_WS_TOKEN` or `--ws-token TOKEN`
+- if neither is set, serve generates one and prints `imwire serve ws token …` to **stderr**
+
+Clients must present the token as `Authorization: Bearer <token>`, `Sec-WebSocket-Protocol: imwire, <token>`, or `?token=`. Comparison is constant-time.
+
+- Any request that carries a browser `Origin` header is **rejected** (this is not a browser API).
+- Non-loopback `--ws-host` (e.g. `0.0.0.0`) is refused unless `--ws-allow-remote` **and** a token are both set.
+- `maxPayload` is 1 MiB.
+
+## subscribe
+
+`hello` / `initialize` automatically subscribe that client to inbound `event` notifications. Additional clients (especially WebSocket) start **unsubscribed** until they call `hello` or `subscribe`.
+
+```json
+{"jsonrpc":"2.0","id":1,"method":"subscribe","params":{}}
+{"jsonrpc":"2.0","id":2,"method":"unsubscribe","params":{}}
+```
+
+Events are broadcast only to subscribed writers. Draft ids are scoped to the client that called `draft.start`.
 
 ## Hello
 
@@ -147,7 +177,16 @@ Also available: `typing` `{ chat }` and `delete` `{ ref }`.
 {"jsonrpc":"2.0","id":2,"error":{"code":-32000,"message":"no adapter for wecom:missing"}}
 ```
 
-Parse errors use `-32700` / invalid request `-32600`.
+| Code | Meaning |
+|---|---|
+| `-32700` | Parse error (invalid JSON) |
+| `-32600` | Invalid request (batch, missing `method`, oversized line) |
+| `-32601` | Method not found |
+| `-32602` | Invalid params (`params` not an object; missing `chat` / `msg`; unknown `accountId` is **not** this — see `-32000`) |
+| `-32603` | Internal error |
+| `-32000` | Application error (unknown `platform:accountId`, unknown `draftId`, adapter throw) |
+
+An unknown `accountId` is an error — serve will not silently route to another account of the same platform. Notifications (`id` omitted) never receive an error response.
 
 ## Python
 

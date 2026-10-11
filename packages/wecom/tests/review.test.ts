@@ -1,0 +1,136 @@
+import { EventEmitter } from "node:events";
+import { expect, test } from "vitest";
+import { WecomAdapter } from "../src/adapter.js";
+import { WecomApiError } from "../src/errors.js";
+import { isDisconnectedEvent } from "../src/map.js";
+import { createRawWecomTransport, type WecomTransport } from "../src/transport.js";
+
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+class MockWs extends EventEmitter {
+  static last: MockWs | undefined;
+  sent: unknown[] = [];
+  closed = false;
+  url: string;
+  onSend?: (f: Record<string, unknown>) => void;
+  constructor(url: string) {
+    super();
+    this.url = url;
+    MockWs.last = this;
+    setTimeout(() => this.emit("open"), 5);
+  }
+  send(d: string) {
+    if (this.closed) return;
+    const parsed = JSON.parse(d) as Record<string, unknown>;
+    this.sent.push(parsed);
+    this.onSend?.(parsed);
+  }
+  close() {
+    if (this.closed) return;
+    this.closed = true;
+    this.emit("close");
+  }
+  push(o: unknown) {
+    this.emit("message", Buffer.from(JSON.stringify(o)));
+  }
+}
+
+// https://developer.work.weixin.qq.com/document/path/101463
+test("WC1 subscribe errcode rejects start() and clears isAlive", async () => {
+  class FailSub extends MockWs {
+    onSend = (f: Record<string, unknown>) => {
+      if (f.cmd === "aibot_subscribe") {
+        setTimeout(
+          () => this.push({ headers: f.headers, errcode: 40058, errmsg: "invalid secret" }),
+          2,
+        );
+      }
+    };
+  }
+  const t = createRawWecomTransport({ botId: "b", secret: "s", WebSocketImpl: FailSub, pingMs: 50 });
+  const ac = new AbortController();
+  const started = t.start(async () => undefined, ac.signal);
+  await expect(started).rejects.toBeInstanceOf(WecomApiError);
+  expect(t.isAlive()).toBe(false);
+  ac.abort();
+});
+
+test("WC2 send() after socket close rejects instead of hanging", async () => {
+  class OkSub extends MockWs {
+    onSend = (f: Record<string, unknown>) => {
+      if (f.cmd === "aibot_subscribe") {
+        setTimeout(() => this.push({ headers: f.headers, errcode: 0 }), 2);
+      }
+    };
+  }
+  const t = createRawWecomTransport({ botId: "b", secret: "s", WebSocketImpl: OkSub, pingMs: 50 });
+  const ac = new AbortController();
+  const started = t.start(async () => undefined, ac.signal);
+  await sleep(30);
+  MockWs.last!.close();
+  await started;
+  const sendP = t.send({
+    cmd: "aibot_respond_msg",
+    headers: { req_id: "R1" },
+    body: { msgtype: "markdown", markdown: { content: "x" } },
+  });
+  const raced = await Promise.race([
+    sendP.then(
+      () => "resolved",
+      (e: unknown) => "rejected " + (e instanceof Error ? e.message : String(e)),
+    ),
+    sleep(1500).then(() => "STILL PENDING after 1.5s"),
+  ]);
+  expect(raced).toMatch(/^rejected /);
+  ac.abort();
+});
+
+test("WC3 respond_msg errcode is surfaced as WecomApiError", async () => {
+  class ReplyErr extends MockWs {
+    onSend = (f: Record<string, unknown>) => {
+      setTimeout(() => {
+        this.push({
+          headers: f.headers,
+          errcode: f.cmd === "aibot_respond_msg" ? 846609 : 0,
+          errmsg: "req_id expired",
+        });
+      }, 2);
+    };
+  }
+  const t = createRawWecomTransport({ botId: "b", secret: "s", WebSocketImpl: ReplyErr, pingMs: 50 });
+  const ac = new AbortController();
+  void t.start(async () => undefined, ac.signal);
+  await sleep(25);
+  await expect(t.send({ cmd: "aibot_respond_msg", headers: { req_id: "OLD" }, body: {} })).rejects.toBeInstanceOf(
+    WecomApiError,
+  );
+  ac.abort();
+});
+
+test("rate-limit errcodes are retryable", () => {
+  expect(new WecomApiError("busy", 45009).retryable).toBe(true);
+  expect(new WecomApiError("expired", 846609).retryable).toBe(false);
+});
+
+test("disconnected_event stops the transport", async () => {
+  const frames: unknown[] = [];
+  const transport: WecomTransport = {
+    async send(frame) {
+      frames.push(frame);
+      return { errcode: 0 };
+    },
+    isAlive: () => true,
+    stop() {
+      frames.push("stopped");
+    },
+    async start() {},
+  };
+  const ad = new WecomAdapter({ botId: "b", secret: "s", transport });
+  const raw = {
+    cmd: "aibot_event_callback",
+    body: { event: { eventtype: "disconnected_event" } },
+  };
+  expect(isDisconnectedEvent(raw)).toBe(true);
+  await expect(ad.ingest(raw)).rejects.toThrow(/disconnected_event/);
+  expect(frames).toContain("stopped");
+});

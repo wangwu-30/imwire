@@ -1,4 +1,5 @@
 import { WECOM_WS_URL } from "./capabilities.js";
+import { WecomApiError } from "./errors.js";
 import { asNumber, asRecord, asString, newId } from "./util.js";
 
 export interface WecomFrame {
@@ -11,7 +12,7 @@ export interface WecomTransport {
   send(frame: WecomFrame): Promise<unknown>;
   start(onFrame: (frame: unknown) => Promise<void>, signal: AbortSignal): Promise<void>;
   isAlive(): boolean;
-  stop(): void;
+  stop(reason?: string): void;
 }
 
 export interface RawWecomOptions {
@@ -20,6 +21,7 @@ export interface RawWecomOptions {
   url?: string;
   WebSocketImpl?: new (url: string) => MinimalWs;
   pingMs?: number;
+  requestTimeoutMs?: number;
 }
 
 export interface MinimalWs {
@@ -29,6 +31,8 @@ export interface MinimalWs {
   close: () => void;
 }
 
+type Pending = { resolve: (value: unknown) => void; reject: (err: Error) => void };
+
 /**
  * WeCom 智能机器人 long-connection.
  * wss://openws.work.weixin.qq.com then aibot_subscribe { bot_id, secret }.
@@ -37,26 +41,54 @@ export interface MinimalWs {
 export function createRawWecomTransport(opts: RawWecomOptions): WecomTransport {
   let alive = false;
   let socket: MinimalWs | undefined;
-  const pending = new Map<string, (value: unknown) => void>();
+  const pending = new Map<string, Pending>();
+  let endStart: ((err?: Error) => void) | undefined;
+
+  const rejectAll = (err: Error): void => {
+    for (const waiter of pending.values()) waiter.reject(err);
+    pending.clear();
+  };
 
   const send = async (frame: WecomFrame): Promise<unknown> => {
     const reqId = frame.headers?.req_id ?? newId("req");
     const payload = { ...frame, headers: { ...frame.headers, req_id: reqId } };
-    if (!socket) throw new Error("wecom transport is not connected");
-    const wait = new Promise<unknown>((resolve) => {
-      pending.set(reqId, resolve);
+    if (!socket || !alive) throw new Error("wecom transport is not connected");
+    const wait = new Promise<unknown>((resolve, reject) => {
+      const timer = setTimeout(() => {
+        pending.delete(reqId);
+        reject(new WecomApiError("wecom request timed out", -1));
+      }, opts.requestTimeoutMs ?? 15_000);
+      pending.set(reqId, {
+        resolve: (value) => {
+          clearTimeout(timer);
+          resolve(value);
+        },
+        reject: (err) => {
+          clearTimeout(timer);
+          reject(err);
+        },
+      });
     });
     socket.send(JSON.stringify(payload));
     return wait;
   };
 
+  const teardown = (err?: Error): void => {
+    const current = socket;
+    alive = false;
+    socket = undefined;
+    rejectAll(err ?? new Error("wecom transport closed"));
+    const end = endStart;
+    endStart = undefined;
+    end?.(err);
+    current?.close();
+  };
+
   return {
     send,
     isAlive: () => alive,
-    stop() {
-      alive = false;
-      socket?.close();
-      socket = undefined;
+    stop(reason) {
+      teardown(new Error(reason ?? "wecom transport closed"));
     },
     async start(onFrame, signal) {
       const WS = opts.WebSocketImpl ?? (await loadWs());
@@ -76,10 +108,19 @@ export function createRawWecomTransport(opts: RawWecomOptions): WecomTransport {
         const waiter = reqId ? pending.get(reqId) : undefined;
         if (waiter && asNumber(frame.errcode) !== undefined && !asString(frame.cmd)) {
           pending.delete(reqId!);
-          waiter(frame);
+          const code = asNumber(frame.errcode) ?? 0;
+          if (code !== 0) {
+            waiter.reject(new WecomApiError(asString(frame.errmsg) ?? `wecom errcode ${code}`, code));
+          } else {
+            waiter.resolve(frame);
+          }
           return;
         }
-        await onFrame(frame);
+        try {
+          await onFrame(frame);
+        } catch {
+          // adapter may stop() on disconnected_event
+        }
       };
 
       const ping = setInterval(() => {
@@ -92,27 +133,35 @@ export function createRawWecomTransport(opts: RawWecomOptions): WecomTransport {
       }, opts.pingMs ?? 30_000);
 
       await new Promise<void>((resolve, reject) => {
-        const finish = (): void => {
+        let settled = false;
+        endStart = (err) => {
           clearInterval(ping);
-          alive = false;
-          resolve();
+          if (settled) return;
+          settled = true;
+          if (err) reject(err);
+          else resolve();
+        };
+        const finish = (): void => teardown();
+        const fail = (err: unknown): void => {
+          teardown(err instanceof Error ? err : new Error(String(err)));
         };
         const onOpen = (): void => {
           void send({
             cmd: "aibot_subscribe",
             headers: { req_id: newId("sub") },
             body: { bot_id: opts.botId, secret: opts.secret },
-          }).catch(reject);
+          }).then(
+            () => undefined,
+            (err: unknown) => fail(err),
+          );
         };
         if (signal.aborted) {
-          ws.close();
           finish();
           return;
         }
         signal.addEventListener(
           "abort",
           () => {
-            ws.close();
             finish();
           },
           { once: true },
@@ -122,10 +171,7 @@ export function createRawWecomTransport(opts: RawWecomOptions): WecomTransport {
           message: (data) => {
             void handleData(data);
           },
-          error: (err) => {
-            alive = false;
-            reject(err instanceof Error ? err : new Error(String(err)));
-          },
+          error: (err) => fail(err),
           close: () => finish(),
         });
       });

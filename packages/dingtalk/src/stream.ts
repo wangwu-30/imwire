@@ -32,22 +32,28 @@ export interface MinimalWs {
  * Official Stream protocol (same topics as `dingtalk-stream`):
  * POST /v1.0/gateway/connections/open then WS with ticket.
  * https://open.dingtalk.com/document/resourcedownload/introduction-to-stream-mode.md
+ * Ping ack: echo the original `data` JSON *string* (contains `opaque`).
+ * https://github.com/open-dingtalk/developerpedia/blob/main/docs/learn/stream/protocol.md
  */
 export function createRawDingTalkStream(opts: RawStreamOptions): DingTalkStream {
   let alive = false;
   let socket: MinimalWs | undefined;
+  let stopped = false;
 
   return {
     isAlive: () => alive,
     stop() {
+      stopped = true;
       alive = false;
       socket?.close();
       socket = undefined;
     },
     async start(handlers, signal) {
+      stopped = false;
       const opened = await opts.http.request<{ endpoint?: string; ticket?: string }>({
         method: "POST",
         path: "/v1.0/gateway/connections/open",
+        anonymous: true,
         body: {
           clientId: opts.clientId,
           clientSecret: opts.clientSecret,
@@ -68,34 +74,48 @@ export function createRawDingTalkStream(opts: RawStreamOptions): DingTalkStream 
       socket = ws;
       alive = true;
 
-      const handleData = async (data: unknown): Promise<void> => {
-        const text = typeof data === "string" ? data : data instanceof Buffer ? data.toString("utf8") : String(data);
-        let frame: Record<string, unknown>;
-        try {
-          frame = asRecord(JSON.parse(text)) ?? {};
-        } catch {
-          return;
-        }
-        const type = asString(frame.type);
-        const headers = asRecord(frame.headers);
-        const messageId = asString(headers?.messageId);
-        const topic = asString(headers?.topic);
-        if (type === "SYSTEM" && topic === "ping") {
-          ack(ws, messageId, { topic: "pong" });
-          return;
-        }
-        if (type === "CALLBACK") {
-          ack(ws, messageId);
-          await handlers.onEvent(frame, topic);
-        }
-      };
-
       await new Promise<void>((resolve, reject) => {
         const finish = (): void => {
           alive = false;
+          if (socket === ws) socket = undefined;
           resolve();
         };
-        if (signal.aborted) {
+        const fail = (err: unknown): void => {
+          alive = false;
+          if (socket === ws) socket = undefined;
+          reject(err instanceof Error ? err : new Error(String(err)));
+        };
+
+        const handleData = async (data: unknown): Promise<void> => {
+          const text = typeof data === "string" ? data : data instanceof Buffer ? data.toString("utf8") : String(data);
+          let frame: Record<string, unknown>;
+          try {
+            frame = asRecord(JSON.parse(text)) ?? {};
+          } catch {
+            return;
+          }
+          const type = asString(frame.type);
+          const headers = asRecord(frame.headers);
+          const messageId = asString(headers?.messageId);
+          const topic = asString(headers?.topic);
+          if (type === "SYSTEM" && topic === "ping") {
+            const echoed = typeof frame.data === "string" ? frame.data : JSON.stringify(frame.data ?? {});
+            ack(ws, messageId, echoed);
+            return;
+          }
+          if (type === "SYSTEM" && topic === "disconnect") {
+            alive = false;
+            ws.close();
+            fail(new Error("dingtalk stream disconnect"));
+            return;
+          }
+          if (type === "CALLBACK") {
+            ack(ws, messageId, JSON.stringify({ response: {} }));
+            await handlers.onEvent(frame, topic);
+          }
+        };
+
+        if (signal.aborted || stopped) {
           ws.close();
           finish();
           return;
@@ -112,11 +132,10 @@ export function createRawDingTalkStream(opts: RawStreamOptions): DingTalkStream 
           message: (data) => {
             void handleData(data);
           },
-          error: (err) => {
-            alive = false;
-            reject(err instanceof Error ? err : new Error(String(err)));
+          error: (err) => fail(err),
+          close: () => {
+            if (alive) finish();
           },
-          close: () => finish(),
         });
       });
     },
