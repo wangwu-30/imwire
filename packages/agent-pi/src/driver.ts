@@ -289,7 +289,10 @@ function resolveModel(models: Models, provider: string, id: string): Model<Api> 
   const base = siblings[0];
   if (!base) return undefined;
   console.warn(`pi: ${provider}/${id} is not in the built-in catalog; using ${base.id}'s settings with id ${id}`);
-  return { ...base, id, name: id };
+  // Don't force thinking off on a model we know nothing about: some (e.g. MiniMax
+  // M3.1 previews) reject thinking.type="disabled". Omitting it uses the provider default.
+  const thinkingLevelMap = { ...(base as { thinkingLevelMap?: Record<string, unknown> }).thinkingLevelMap, off: null };
+  return { ...base, id, name: id, thinkingLevelMap } as Model<Api>;
 }
 
 async function loadModels(): Promise<Models> {
