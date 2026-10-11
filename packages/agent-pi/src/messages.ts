@@ -20,6 +20,34 @@ export function userTextOf(msg: { role?: string; content?: unknown }): string {
   return "";
 }
 
+const PLATFORM_LABELS: Record<string, string> = {
+  telegram: "Telegram",
+  feishu: "Feishu",
+  dingtalk: "DingTalk",
+  wecom: "WeCom",
+  slack: "Slack",
+};
+
+/** `[via Telegram] ` — tells the model which IM a user message came from. */
+export function platformTag(platform: string | undefined): string {
+  if (!platform) return "";
+  return `[via ${PLATFORM_LABELS[platform] ?? platform}] `;
+}
+
+const TAG_RE = /^\[via [^\]\n]{1,40}\] /;
+
+/** Inverse of {@link platformTag}, for comparing model-side text with session text. */
+export function stripPlatformTag(text: string): string {
+  return text.replace(TAG_RE, "");
+}
+
+/** Appended to the system prompt so the model treats tagged turns as one conversation. */
+export const CROSS_IM_NOTE =
+  "This is one continuous conversation with the same person across several chat apps (IMs). " +
+  "Each user message starts with a tag such as [via Telegram] or [via Feishu] naming the app it was sent from. " +
+  "Everything earlier in this conversation is visible to you, whichever app it came from, so answer questions " +
+  "about what was said in another app from that history. Do not add such tags to your own replies.";
+
 export function toPiMessages(
   log: LogMessage[],
   opts: { systemPrompt: string; provider: string; model: string },
@@ -33,7 +61,7 @@ export function toPiMessages(
       continue;
     }
     if (m.role === "user") {
-      out.push({ role: "user", content: m.text, timestamp: m.createdAt });
+      out.push({ role: "user", content: platformTag(m.surface?.platform) + m.text, timestamp: m.createdAt });
       continue;
     }
     out.push(toAssistantMessage(m.text, m.createdAt, opts.provider, opts.model));

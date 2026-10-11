@@ -10,7 +10,7 @@ import type {
 } from "@imwire/session";
 import { isExplicitApprove } from "@imwire/session";
 import { createFakePiProvider, type PiTokenSource } from "./fake-provider.js";
-import { snapshotToPi, userTextOf, windowMessages } from "./messages.js";
+import { CROSS_IM_NOTE, platformTag, snapshotToPi, stripPlatformTag, userTextOf, windowMessages } from "./messages.js";
 
 export interface PiAgentDriverOptions {
   source?: PiTokenSource;
@@ -59,8 +59,9 @@ export class PiAgentDriver implements AgentDriver {
   private readonly cancels = new Map<string, AbortController>();
 
   constructor(opts: PiAgentDriverOptions = {}) {
-    this.systemPrompt = opts.systemPrompt ?? "You are a helpful assistant.";
     this.usePi = Boolean(opts.usePi || opts.models);
+    const base = opts.systemPrompt ?? "You are a helpful assistant.";
+    this.systemPrompt = this.usePi ? `${base}\n\n${CROSS_IM_NOTE}` : base;
     this.modelProvider = opts.modelProvider ?? process.env.IMWIRE_PI_PROVIDER ?? "openai";
     this.modelId = opts.modelId ?? process.env.IMWIRE_PI_MODEL ?? "gpt-4o-mini";
     this.models = opts.models;
@@ -94,7 +95,7 @@ export class PiAgentDriver implements AgentDriver {
     const live = this.agents.get(sessionId);
     if (!live) return false;
     if (!live.agent.state.isStreaming && !this.prompting.has(sessionId)) return false;
-    live.agent.steer({ role: "user", content: input.text, timestamp: Date.now() });
+    live.agent.steer({ role: "user", content: tagged(input), timestamp: Date.now() });
     return true;
   }
 
@@ -205,7 +206,7 @@ export class PiAgentDriver implements AgentDriver {
 
       const already = inputAlreadyPresent(live.agent.state.messages, input.text);
       if (already) await live.agent.continue();
-      else await live.agent.prompt({ role: "user", content: input.text, timestamp: Date.now() });
+      else await live.agent.prompt({ role: "user", content: tagged(input), timestamp: Date.now() });
       unsub();
 
       const err = live.agent.state.errorMessage;
@@ -264,13 +265,17 @@ function snapHasUser(snap: ConversationSnapshot | undefined, text: string): bool
   return last?.role === "user" && last.text === text;
 }
 
+function tagged(input: UserTurn): string {
+  return platformTag(input.source?.chat?.platform) + input.text;
+}
+
 function inputAlreadyPresent(messages: Array<{ role?: string; content?: unknown }>, text: string): boolean {
-  const users = messages.filter((m) => m.role === "user").map((m) => userTextOf(m));
+  const users = messages.filter((m) => m.role === "user").map((m) => stripPlatformTag(userTextOf(m)));
   if (users.includes(text)) return true;
   const parts = text.split("\n").filter(Boolean);
   if (parts.length > 1 && parts.every((p) => users.includes(p))) return true;
   const last = messages.at(-1);
-  return last?.role === "user" && userTextOf(last) === text;
+  return last?.role === "user" && stripPlatformTag(userTextOf(last)) === text;
 }
 
 function abortDecision(signal?: AbortSignal): Promise<ApprovalDecision> {
