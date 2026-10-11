@@ -62,33 +62,22 @@ function driver(): PiAgentDriver {
   });
 }
 
+function installProcessSafety(): void {
+  process.on("unhandledRejection", (err) => {
+    console.error("unhandledRejection", err);
+  });
+  process.on("uncaughtException", (err) => {
+    console.error("uncaughtException", err);
+  });
+}
+
 async function main(): Promise<void> {
-  const adapters: Adapter[] = [];
+  installProcessSafety();
   const telegramToken = env("TELEGRAM_BOT_TOKEN") ?? env("IMWIRE_TELEGRAM_BOT_TOKEN");
   const feishuAppId = env("FEISHU_APP_ID");
   const feishuAppSecret = env("FEISHU_APP_SECRET");
 
-  if (telegramToken) {
-    adapters.push(
-      new TelegramAdapter({
-        token: telegramToken,
-        accountId: env("TELEGRAM_ACCOUNT_ID"),
-      }),
-    );
-    console.log("telegram adapter enabled");
-  }
-  if (feishuAppId && feishuAppSecret) {
-    adapters.push(
-      new FeishuAdapter({
-        appId: feishuAppId,
-        appSecret: feishuAppSecret,
-        domain: env("FEISHU_DOMAIN") === "lark" ? "lark" : "feishu",
-      }),
-    );
-    console.log("feishu adapter enabled");
-  }
-
-  if (adapters.length === 0) {
+  if (!telegramToken && !(feishuAppId && feishuAppSecret)) {
     console.error(`imwire assistant
 
 Set env vars (see .env.example):
@@ -108,6 +97,31 @@ Set env vars (see .env.example):
     driver: driver(),
     allowlist: allowlist(),
   });
+
+  const adapters: Adapter[] = [];
+  if (telegramToken) {
+    adapters.push(
+      new TelegramAdapter({
+        token: telegramToken,
+        accountId: env("TELEGRAM_ACCOUNT_ID"),
+        callbackStore: {
+          get: (k) => gw.store.getCallback(k),
+          set: (k, v) => gw.store.setCallback(k, v),
+        },
+      }),
+    );
+    console.log("telegram adapter enabled");
+  }
+  if (feishuAppId && feishuAppSecret) {
+    adapters.push(
+      new FeishuAdapter({
+        appId: feishuAppId,
+        appSecret: feishuAppSecret,
+        domain: env("FEISHU_DOMAIN") === "lark" ? "lark" : "feishu",
+      }),
+    );
+    console.log("feishu adapter enabled");
+  }
   for (const adapter of adapters) gw.attach(adapter);
 
   const ac = new AbortController();

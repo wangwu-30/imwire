@@ -11,7 +11,7 @@ import type {
 } from "./types.js";
 
 export const PAIR_ATTEMPT_LIMIT = 5;
-export const PAIR_GLOBAL_LIMIT = 50;
+export const PAIR_CODE_ATTEMPT_LIMIT = 5;
 export const PAIR_WINDOW_MS = 10 * 60 * 1000;
 export const GROUP_NOTICE_WINDOW_MS = 24 * 60 * 60 * 1000;
 export const DEFAULT_LOG_WINDOW = 40;
@@ -37,7 +37,8 @@ CREATE TABLE IF NOT EXISTS pairing (
   expires_at INTEGER NOT NULL,
   created_at INTEGER NOT NULL,
   created_by TEXT NOT NULL,
-  used_at INTEGER
+  used_at INTEGER,
+  attempts INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS pair_attempt (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -107,7 +108,14 @@ CREATE TABLE IF NOT EXISTS group_notice (
   last_at INTEGER NOT NULL
 );
 CREATE TABLE IF NOT EXISTS interrupt_notice (
-  conversation_id TEXT PRIMARY KEY
+  conversation_id TEXT PRIMARY KEY,
+  last_seq INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS telegram_callback (
+  hash TEXT PRIMARY KEY,
+  action_id TEXT NOT NULL,
+  value TEXT,
+  updated_at INTEGER NOT NULL
 );
 `;
 
@@ -130,6 +138,8 @@ export class SessionStore {
       "ALTER TABLE approval ADD COLUMN requested_by TEXT",
       "ALTER TABLE approval ADD COLUMN chosen TEXT",
       "ALTER TABLE approval ADD COLUMN created_at INTEGER",
+      "ALTER TABLE pairing ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0",
+      "ALTER TABLE interrupt_notice ADD COLUMN last_seq INTEGER NOT NULL DEFAULT 0",
     ];
     for (const sql of alters) {
       try {
@@ -228,7 +238,9 @@ export class SessionStore {
       const code = pairCode();
       try {
         this.db
-          .prepare("INSERT INTO pairing(code, person_id, expires_at, created_at, created_by) VALUES (?, ?, ?, ?, ?)")
+          .prepare(
+            "INSERT INTO pairing(code, person_id, expires_at, created_at, created_by, attempts) VALUES (?, ?, ?, ?, ?, 0)",
+          )
           .run(hashPairCode(code), personId, expiresAt, now, createdBy);
         return code;
       } catch {
@@ -236,6 +248,18 @@ export class SessionStore {
       }
     }
     throw new Error("could not allocate pairing code");
+  }
+
+  livePairPerson(code: string, now: number): string | undefined {
+    this.purgePairing(now);
+    const hashed = hashPairCode(code);
+    const row = this.db
+      .prepare<{ person_id: string; expires_at: number; used_at: number | null }>(
+        "SELECT person_id, expires_at, used_at FROM pairing WHERE code = ?",
+      )
+      .get(hashed);
+    if (!row || row.used_at !== null || row.expires_at <= now) return undefined;
+    return row.person_id;
   }
 
   consumePairCode(code: string, now: number): string | undefined {
@@ -254,14 +278,26 @@ export class SessionStore {
     return row.person_id;
   }
 
+  /** Increment the per-code counter for a live hash. Burns only that row at the limit. */
+  recordCodeMiss(code: string, now: number): { burned: true; personId: string } | undefined {
+    const hashed = hashPairCode(code);
+    const row = this.db
+      .prepare<{ person_id: string; used_at: number | null; expires_at: number; attempts: number }>(
+        "SELECT person_id, used_at, expires_at, attempts FROM pairing WHERE code = ?",
+      )
+      .get(hashed);
+    if (!row || row.used_at !== null || row.expires_at <= now) return undefined;
+    const next = row.attempts + 1;
+    if (next >= PAIR_CODE_ATTEMPT_LIMIT) {
+      this.db.prepare("UPDATE pairing SET used_at = ?, attempts = ? WHERE code = ? AND used_at IS NULL").run(now, next, hashed);
+      return { burned: true, personId: row.person_id };
+    }
+    this.db.prepare("UPDATE pairing SET attempts = ? WHERE code = ?").run(next, hashed);
+    return undefined;
+  }
+
   recordPairAttempt(sender: string, now: number, ok: boolean): void {
     this.db.prepare("INSERT INTO pair_attempt(sender, at, ok) VALUES (?, ?, ?)").run(sender, now, ok ? 1 : 0);
-    if (!ok) {
-      const fails = this.failedPairAttempts(sender, now);
-      if (fails >= PAIR_ATTEMPT_LIMIT) {
-        this.db.prepare("UPDATE pairing SET used_at = ? WHERE used_at IS NULL").run(now);
-      }
-    }
   }
 
   failedPairAttempts(sender: string, now: number, windowMs = PAIR_WINDOW_MS): number {
@@ -274,19 +310,8 @@ export class SessionStore {
     );
   }
 
-  failedPairAttemptsGlobal(now: number, windowMs = PAIR_WINDOW_MS): number {
-    return (
-      this.db
-        .prepare<{ n: number }>("SELECT COUNT(*) AS n FROM pair_attempt WHERE ok = 0 AND at >= ?")
-        .get(now - windowMs)?.n ?? 0
-    );
-  }
-
   pairLocked(sender: string, now: number): boolean {
-    return (
-      this.failedPairAttempts(sender, now) >= PAIR_ATTEMPT_LIMIT ||
-      this.failedPairAttemptsGlobal(now) >= PAIR_GLOBAL_LIMIT
-    );
+    return this.failedPairAttempts(sender, now) >= PAIR_ATTEMPT_LIMIT;
   }
 
   shouldTellLockout(sender: string, now: number): boolean {
@@ -473,34 +498,75 @@ export class SessionStore {
     return row ? (JSON.parse(row.last_surface) as ChatRef) : undefined;
   }
 
-  unansweredTails(): Array<{ conversationId: string; personId?: string; text: string; surface?: ChatRef }> {
+  unansweredTails(): Array<{
+    conversationId: string;
+    personId?: string;
+    text: string;
+    surface?: ChatRef;
+    seq: number;
+  }> {
     const convs = this.db
       .prepare<{ id: string; person_id: string | null }>("SELECT id, person_id FROM conversation")
       .all();
-    const out: Array<{ conversationId: string; personId?: string; text: string; surface?: ChatRef }> = [];
+    const out: Array<{
+      conversationId: string;
+      personId?: string;
+      text: string;
+      surface?: ChatRef;
+      seq: number;
+    }> = [];
     for (const c of convs) {
-      if (this.db.prepare<{ n: number }>("SELECT 1 AS n FROM interrupt_notice WHERE conversation_id = ?").get(c.id)) {
-        continue;
-      }
       const last = this.db
-        .prepare<{ role: string; content: string; surface: string | null }>(
-          "SELECT role, content, surface FROM message WHERE conversation_id = ? ORDER BY seq DESC LIMIT 1",
+        .prepare<{ role: string; content: string; surface: string | null; seq: number }>(
+          "SELECT role, content, surface, seq FROM message WHERE conversation_id = ? ORDER BY seq DESC LIMIT 1",
         )
         .get(c.id);
       if (!last || last.role !== "user") continue;
+      const noticed = this.db
+        .prepare<{ last_seq: number }>("SELECT last_seq FROM interrupt_notice WHERE conversation_id = ?")
+        .get(c.id);
+      if (noticed && noticed.last_seq >= last.seq) continue;
       const content = JSON.parse(last.content) as { text?: string };
       out.push({
         conversationId: c.id,
         personId: c.person_id ?? undefined,
         text: content.text ?? "",
         surface: last.surface ? (JSON.parse(last.surface) as ChatRef) : undefined,
+        seq: last.seq,
       });
     }
     return out;
   }
 
-  markInterruptNotified(conversationId: string): void {
-    this.db.prepare("INSERT OR REPLACE INTO interrupt_notice(conversation_id) VALUES (?)").run(conversationId);
+  markInterruptNotified(conversationId: string, seq: number): void {
+    this.db
+      .prepare("INSERT OR REPLACE INTO interrupt_notice(conversation_id, last_seq) VALUES (?, ?)")
+      .run(conversationId, seq);
+  }
+
+  listIdentities(personId: string): IdentityRecord[] {
+    return this.db
+      .prepare<{ platform: string; account_id: string; user_id: string; person_id: string }>(
+        "SELECT platform, account_id, user_id, person_id FROM identity WHERE person_id = ?",
+      )
+      .all(personId)
+      .map((r) => ({ platform: r.platform, accountId: r.account_id, userId: r.user_id, personId: r.person_id }));
+  }
+
+  getCallback(hash: string): { id: string; value?: string } | undefined {
+    const row = this.db
+      .prepare<{ action_id: string; value: string | null }>(
+        "SELECT action_id, value FROM telegram_callback WHERE hash = ?",
+      )
+      .get(hash);
+    if (!row) return undefined;
+    return { id: row.action_id, value: row.value ?? undefined };
+  }
+
+  setCallback(hash: string, entry: { id: string; value?: string }, now = Date.now()): void {
+    this.db
+      .prepare("INSERT OR REPLACE INTO telegram_callback(hash, action_id, value, updated_at) VALUES (?, ?, ?, ?)")
+      .run(hash, entry.id, entry.value ?? null, now);
   }
 
   createApproval(

@@ -5,8 +5,12 @@ export function newId(prefix = ""): string {
   return prefix ? `${prefix}_${hex}` : hex;
 }
 
+export const PAIR_CODE_LEN = 8;
+export const PAIR_CODE_RE = /^\d{8}$/;
+
+/** 8-digit code (~100M possibilities). Long enough that a global guess lock is unnecessary. */
 export function pairCode(): string {
-  return String(randomInt(0, 1_000_000)).padStart(6, "0");
+  return String(randomInt(0, 100_000_000)).padStart(PAIR_CODE_LEN, "0");
 }
 
 export function hashPairCode(code: string): string {

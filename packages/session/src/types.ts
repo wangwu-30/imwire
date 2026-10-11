@@ -33,7 +33,7 @@ export interface ConversationMeta {
   isDefault: boolean;
 }
 
-/** Chosen button id. Only `approve` / `approved` count as an explicit approve. */
+/** Chosen button id. Allow-like options (`approve`, `allow_once`, …) grant; unknown ids deny. */
 export type ApprovalDecision = string;
 
 export interface UserTurn {
@@ -91,7 +91,7 @@ export interface PendingApproval {
 }
 
 export function isExplicitApprove(option: string): boolean {
-  return /^(approve|approved)$/i.test(option.trim());
+  return /^(approve|approved|allow|allow_once|allow_always|yes)$/i.test(option.trim());
 }
 
 export function isDenyOption(option: string): boolean {

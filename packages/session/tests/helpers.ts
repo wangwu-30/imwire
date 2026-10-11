@@ -132,6 +132,17 @@ export async function waitFor(pred: () => boolean, ms = 1000): Promise<void> {
   }
 }
 
+export const PAIR_CODE_RE = /\b(\d{8})\b/;
+
+export function extractPairCode(...texts: string[]): string | undefined {
+  let found: string | undefined;
+  for (const t of texts) {
+    const matches = t.match(new RegExp(PAIR_CODE_RE.source, "g"));
+    if (matches) found = matches.at(-1);
+  }
+  return found;
+}
+
 export function lastApprovalId(adapter: FakeAdapter): string | undefined {
   for (let i = adapter.calls.length - 1; i >= 0; i -= 1) {
     const args = adapter.calls[i]?.args as { msg?: { blocks?: Array<{ kind: string; buttons?: Array<{ value?: string }> }> } };

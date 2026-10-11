@@ -9,6 +9,7 @@ import {
   action,
   cmd,
   dm,
+  extractPairCode,
   groupMsg,
   lastApprovalId,
   markdownCalls,
@@ -26,8 +27,8 @@ describe("pairing", () => {
     await tg.ingest(cmd({ platform: "telegram", userId: "ada", name: "pair" }));
     const pairText = markdownCalls(tg).find((t) => t.includes("Pairing code"));
     expect(pairText).toBeTruthy();
-    const code = pairText?.match(/(\d{6})/)?.[1];
-    expect(code).toHaveLength(6);
+    const code = extractPairCode(pairText ?? "");
+    expect(code).toHaveLength(8);
 
     await fs.ingest(dm({ platform: "feishu", userId: "ou_ada", text: code ?? "" }));
     expect(markdownCalls(fs).join(" ")).toMatch(/Linked/);
@@ -87,7 +88,7 @@ describe("topics and routing", () => {
     expect(markdownCalls(tg).some((t) => /Switched to travel/.test(t))).toBe(true);
 
     await tg.ingest(cmd({ platform: "telegram", userId: "ada", name: "pair" }));
-    const code = markdownCalls(tg).join("\n").match(/(\d{6})/)?.[1] ?? "";
+    const code = extractPairCode(markdownCalls(tg).join("\n")) ?? "";
     await fs.ingest(dm({ platform: "feishu", userId: "ou_ada", text: code }));
 
     await fs.ingest(cmd({ platform: "feishu", userId: "ou_ada", name: "topics" }));
@@ -118,7 +119,7 @@ describe("topics and routing", () => {
     expect(markdownCalls(tg).some((t) => t === "async result")).toBe(true);
 
     await tg.ingest(cmd({ platform: "telegram", userId: "ada", name: "pair" }));
-    const code = markdownCalls(tg).join("\n").match(/(\d{6})/)?.[1] ?? "";
+    const code = extractPairCode(markdownCalls(tg).join("\n")) ?? "";
     await fs.ingest(dm({ platform: "feishu", userId: "ou_ada", text: code }));
     await fs.ingest(dm({ platform: "feishu", userId: "ou_ada", text: "now here" }));
     await gw.waitForIdle();
@@ -173,7 +174,7 @@ describe("mid-stream switch and approvals", () => {
     const { gw, tg, fs } = openGateway({ driver });
     await tg.ingest(dm({ platform: "telegram", userId: "ada", text: "hi" }));
     await tg.ingest(cmd({ platform: "telegram", userId: "ada", name: "pair" }));
-    const code = markdownCalls(tg).join("\n").match(/(\d{6})/)?.[1] ?? "";
+    const code = extractPairCode(markdownCalls(tg).join("\n")) ?? "";
     await fs.ingest(dm({ platform: "feishu", userId: "ou_ada", text: code }));
 
     await tg.ingest(dm({ platform: "telegram", userId: "ada", text: "write a poem" }));
@@ -219,6 +220,31 @@ describe("restart persistence", () => {
     expect(second.store.findIdentity("telegram", "bot", "ada")?.personId).toBe(personId);
     const conv = second.store.defaultConversation(personId, Date.now());
     expect(conv.messages.some((m) => m.text === "remember this")).toBe(true);
+    second.store.setCallback("h:deadbeefdeadbeef", { id: "allow_once", value: "a_1" });
     second.close();
+    const third = new SessionGateway({
+      dbPath,
+      driver: new ScriptedDriver(),
+      allowlist: [owner("telegram", "ada")],
+    });
+    expect(third.store.getCallback("h:deadbeefdeadbeef")).toEqual({ id: "allow_once", value: "a_1" });
+    third.close();
+  });
+
+  it("stops an in-flight turn via /stop", async () => {
+    const driver = new ScriptedDriver(async (sink, ctl) => {
+      sink.text("partial ");
+      await ctl.wait("mid");
+      sink.text("should-not-appear");
+    });
+    const { gw, tg } = openGateway({ driver });
+    await tg.ingest(dm({ platform: "telegram", userId: "ada", text: "hello" }));
+    await tg.ingest(dm({ platform: "telegram", userId: "ada", text: "go" }));
+    await waitFor(() => markdownCalls(tg).some((t) => t.includes("partial")));
+    await tg.ingest(cmd({ platform: "telegram", userId: "ada", name: "stop" }));
+    await gw.waitForIdle();
+    expect(markdownCalls(tg).some((t) => t === "Stopped.")).toBe(true);
+    expect(markdownCalls(tg).join(" ")).not.toMatch(/should-not-appear/);
+    gw.close();
   });
 });

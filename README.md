@@ -25,7 +25,7 @@ The echo example starts every adapter you configured, prints normalized inbound 
 pnpm --filter @imwire/example-assistant start
 ```
 
-Owner bootstrap is the allowlist. From a linked IM send `/pair`, then paste the 6-digit code into the bot on a new IM. `/topic name` and `/topics` switch a named conversation across every linked IM. Group chats stay isolated.
+Owner bootstrap is the allowlist. From a linked IM send `/pair`, then paste the 8-digit code into the bot on a new IM. `/topic name` and `/topics` switch a named conversation across every linked IM. Group chats stay isolated. `/stop` cancels the in-flight turn.
 
 ```ts
 import { TelegramAdapter } from "@imwire/telegram";
@@ -66,7 +66,7 @@ Config is env vars only. Never commit tokens.
 | `@imwire/core` | Normalized events, `Adapter`, capability table, dedup, rate limit, retry, reconnect, chunking, streaming-draft degrade. The `imwire` name is reserved for the CLI. |
 | `@imwire/telegram` | Bot API long polling (`getUpdates`), edits, inline keyboards, typing, stream-via-`editMessageText` |
 | `@imwire/feishu` | Official `@larksuiteoapi/node-sdk` WebSocket long connection, Card JSON 2.0, CardKit streaming with patch fallback |
-| `@imwire/session` | Person identities, hashed `/pair` codes (lockout + one live code), default + named topics, group isolation, follow-the-user routing, mid-stream switch, first-click-wins + authorized + TTL approvals. SQLite WAL + `busy_timeout` (better-sqlite3, or `node:sqlite` on Node 22+). Depends only on `@imwire/core`. |
+| `@imwire/session` | Person identities, hashed 8-digit `/pair` codes (per-sender lockout + per-code burn, never a global revoke), default + named topics, group isolation, follow-the-user routing, mid-stream switch, first-click-wins + authorized + TTL approvals. SQLite WAL + `busy_timeout` (better-sqlite3, or `node:sqlite` on Node 22+). Depends only on `@imwire/core`. |
 | `@imwire/agent-pi` | `AgentDriver` over `@earendil-works/pi-agent-core` + `@earendil-works/pi-ai` 1.1.0. One Agent per conversation; log → pi `Message` shapes; live `text_delta` streaming; `beforeToolCall` → imwire approvals. Tests use pi-ai `fauxProvider` (no network). |
 | `@imwire/example-echo` | Tiny dual-adapter demo |
 | `@imwire/example-assistant` | Telegram + Feishu + session + pi, env-config only |
@@ -92,7 +92,7 @@ Config is env vars only. Never commit tokens.
 
 Streaming drafts degrade automatically: card update when the platform can, otherwise edit-in-place, otherwise buffered chunked sends. Stream updates are latest-wins coalesced (one in-flight + one pending) and skip unchanged text.
 
-`Button` is `{ id, label, style?, value? }` on every platform. Telegram callback_data is limited to 64 **bytes**; longer payloads (including CJK ids) are hashed (`h:<16 hex>`) into a bounded LRU table (256). After a process restart the table is empty, so those clicks arrive as unresolved `actionId: "h:…"`.
+`Button` is `{ id, label, style?, value? }` on every platform. Telegram callback_data is limited to 64 **bytes**; longer payloads (including CJK ids) are hashed (`h:<16 hex>`) into a bounded LRU plus a SQLite `telegram_callback` table so hashed clicks still resolve after a restart.
 
 ## Roadmap
 
@@ -104,7 +104,8 @@ Streaming drafts degrade automatically: card update when the platform can, other
 
 | Command | Effect |
 |---|---|
-| `/pair` | Linked sender gets a 6-digit code (TTL 10 min, single use, rate-limited). Send the code to the bot from a new IM to link that account. |
+| `/pair` | Linked sender gets an 8-digit code (TTL 10 min, single use, rate-limited). Send the code to the bot from a new IM to link that account. |
+| `/stop` | Cancel the in-flight turn and any pending approval wait. |
 | `/topic name` | Create or switch to a named topic. Applies on every linked IM. `/topic default` returns to the personal default. |
 | `/topics` | List topics; the active one is marked `→`. |
 
@@ -114,7 +115,7 @@ Replies go to the IM that triggered the turn. Proactive messages go to the perso
 
 ## 中文
 
-imwire 是给 agent 用的独立 IM SDK：一套 Adapter 接口接飞书 / 钉钉 / 企微 / Telegram / Slack，默认长连接，不需要公网 IP。面向 agent 的能力（流式回复、审批按钮、配对）是一等公民。L2 `@imwire/session` 让一个人在所有 IM 上共享一段对话；IM 层不依赖它，可以单独引用。`/pair` 出 6 位码，在新 IM 发给 bot 即完成绑定。群聊单独成会话，不会并进个人对话。中途换 IM 时，原侧草稿会标「continued in …」，已生成的文字在新侧续上。
+imwire 是给 agent 用的独立 IM SDK：一套 Adapter 接口接飞书 / 钉钉 / 企微 / Telegram / Slack，默认长连接，不需要公网 IP。面向 agent 的能力（流式回复、审批按钮、配对）是一等公民。L2 `@imwire/session` 让一个人在所有 IM 上共享一段对话；IM 层不依赖它，可以单独引用。`/pair` 出 8 位码，在新 IM 发给 bot 即完成绑定。群聊单独成会话，不会并进个人对话。中途换 IM 时，原侧草稿会标「continued in …」，已生成的文字在新侧续上。
 
 核心包名是 `@imwire/core`（`imwire` 留给以后的 CLI）。包是 ESM-only。
 

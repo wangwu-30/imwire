@@ -54,24 +54,86 @@ export function toAssistantMessage(text: string, timestamp: number, provider: st
   };
 }
 
-export function windowMessages<T extends { role?: string; content?: unknown }>(
+const TRUNCATED_PREFIX = "[truncated: original ";
+
+function messageSize(msg: { role?: string; content?: unknown }): number {
+  return Math.max(1, userTextOf(msg).length);
+}
+
+function hasToolCall(msg: { role?: string; content?: unknown }): boolean {
+  if (msg.role !== "assistant" || !Array.isArray(msg.content)) return false;
+  return msg.content.some((b) => b && typeof b === "object" && (b as { type?: string }).type === "toolCall");
+}
+
+function truncateToolResult<T extends { role?: string; content?: unknown; toolCallId?: string }>(
+  msg: T,
+  maxChars: number,
+): T {
+  const text = userTextOf(msg);
+  if (text.length <= maxChars) return msg;
+  const marker = `${TRUNCATED_PREFIX}${text.length} chars]`;
+  return { ...msg, content: [{ type: "text", text: marker }] };
+}
+
+/** Group assistant(toolCall) with the following toolResult row(s) so they are never split. */
+function groupTurns<T extends { role?: string; content?: unknown; toolCallId?: string }>(messages: T[]): T[][] {
+  const groups: T[][] = [];
+  for (let i = 0; i < messages.length; i += 1) {
+    const msg = messages[i]!;
+    if (hasToolCall(msg)) {
+      const group = [msg];
+      while (i + 1 < messages.length && messages[i + 1]?.role === "toolResult") {
+        i += 1;
+        group.push(messages[i]!);
+      }
+      groups.push(group);
+      continue;
+    }
+    groups.push([msg]);
+  }
+  return groups;
+}
+
+/**
+ * Bound context by character budget:
+ * - never drop the latest user message
+ * - keep tool_call + tool_result pairs together (truncate oversized tool results)
+ * - leave system messages in their original positions (do not hoist)
+ */
+export function windowMessages<T extends { role?: string; content?: unknown; toolCallId?: string }>(
   messages: T[],
   maxChars: number,
 ): T[] {
   if (maxChars <= 0) return messages;
-  const system = messages.filter((m) => m.role === "system");
-  const rest = messages.filter((m) => m.role !== "system");
-  const kept: T[] = [];
-  let used = system.reduce((n, m) => n + userTextOf(m).length, 0);
-  for (let i = rest.length - 1; i >= 0; i -= 1) {
-    const msg = rest[i]!;
-    const size = Math.max(1, userTextOf(msg).length);
-    if (kept.length > 0 && used + size > maxChars) break;
-    kept.push(msg);
-    used += size;
+  const prepared = messages.map((m) =>
+    m.role === "toolResult" ? truncateToolResult(m, Math.max(256, Math.floor(maxChars / 2))) : m,
+  );
+  const groups = groupTurns(prepared);
+  const sizes = groups.map((g) => g.reduce((n, m) => n + messageSize(m), 0));
+
+  let lastUser = -1;
+  for (let i = groups.length - 1; i >= 0; i -= 1) {
+    if (groups[i]!.some((m) => m.role === "user")) {
+      lastUser = i;
+      break;
+    }
   }
-  kept.reverse();
-  return [...system, ...kept];
+
+  const keep = new Array<boolean>(groups.length).fill(false);
+  let used = 0;
+  if (lastUser >= 0) {
+    keep[lastUser] = true;
+    used += sizes[lastUser]!;
+  }
+
+  for (let i = groups.length - 1; i >= 0; i -= 1) {
+    if (keep[i]) continue;
+    if (used + sizes[i]! > maxChars) continue;
+    keep[i] = true;
+    used += sizes[i]!;
+  }
+
+  return groups.flatMap((g, i) => (keep[i] ? g : []));
 }
 
 export function snapshotToPi(

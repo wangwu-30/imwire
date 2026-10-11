@@ -47,8 +47,9 @@ export class PiAgentDriver implements AgentDriver {
   private readonly tools: AgentTool[];
   private readonly agents = new Map<string, LiveAgent>();
   private readonly snaps = new Map<string, ConversationSnapshot>();
-  private readonly bootErrors = new Map<string, Error>();
   private readonly legacy = new Map<string, Array<{ role: string; content: string }>>();
+  private readonly prompting = new Set<string>();
+  private readonly cancels = new Map<string, AbortController>();
 
   constructor(opts: PiAgentDriverOptions = {}) {
     this.systemPrompt = opts.systemPrompt ?? "You are a helpful assistant.";
@@ -67,8 +68,8 @@ export class PiAgentDriver implements AgentDriver {
     if (this.usePi) {
       try {
         await this.ensureAgent(id, conv);
-      } catch (err) {
-        this.bootErrors.set(id, err instanceof Error ? err : new Error(String(err)));
+      } catch {
+        // retry on the next prompt — a transient loadModels/getModel failure must not stick
       }
     } else if (!this.legacy.has(id)) {
       this.legacy.set(id, [{ role: "system", content: this.systemPrompt }]);
@@ -84,11 +85,13 @@ export class PiAgentDriver implements AgentDriver {
   async steer(sessionId: string, input: UserTurn): Promise<boolean> {
     const live = this.agents.get(sessionId);
     if (!live) return false;
+    if (!live.agent.state.isStreaming && !this.prompting.has(sessionId)) return false;
     live.agent.steer({ role: "user", content: input.text, timestamp: Date.now() });
     return true;
   }
 
   async cancel(sessionId: string): Promise<void> {
+    this.cancels.get(sessionId)?.abort();
     this.agents.get(sessionId)?.agent.abort();
   }
 
@@ -123,14 +126,24 @@ export class PiAgentDriver implements AgentDriver {
       },
       streamFn: models.streamSimple.bind(models),
       transformContext: async (msgs) => windowMessages(msgs, this.contextChars),
-      beforeToolCall: async (ctx) => {
+      beforeToolCall: async (ctx, signal) => {
+        if (signal?.aborted || this.cancels.get(sessionId)?.signal.aborted) {
+          return { block: true, reason: "cancelled", terminate: true };
+        }
         const sink = this.activeSink.get(sessionId);
         if (!sink) return { block: true, reason: "no active turn" };
-        const decision: ApprovalDecision = await sink.requestApproval({
-          toolCallId: ctx.toolCall.id,
-          title: `Run ${ctx.toolCall.name}?`,
-          options: ["approve", "deny"],
-        });
+        const decision: ApprovalDecision = await Promise.race([
+          sink.requestApproval({
+            toolCallId: ctx.toolCall.id,
+            title: `Run ${ctx.toolCall.name}?`,
+            options: ["approve", "deny"],
+          }),
+          abortDecision(signal),
+          abortDecision(this.cancels.get(sessionId)?.signal),
+        ]);
+        if (signal?.aborted || this.cancels.get(sessionId)?.signal.aborted) {
+          return { block: true, reason: "cancelled", terminate: true };
+        }
         if (!isExplicitApprove(decision)) return { block: true, reason: `denied:${decision}`, terminate: true };
         return undefined;
       },
@@ -144,12 +157,10 @@ export class PiAgentDriver implements AgentDriver {
 
   private async promptPi(sessionId: string, input: UserTurn, sink: TurnSink): Promise<TurnResult> {
     this.activeSink.set(sessionId, sink);
+    const ac = new AbortController();
+    this.cancels.set(sessionId, ac);
+    this.prompting.add(sessionId);
     try {
-      const boot = this.bootErrors.get(sessionId);
-      if (boot) {
-        sink.text(boot.message);
-        return { text: boot.message };
-      }
       const snap = this.snaps.get(sessionId);
       let live: LiveAgent;
       try {
@@ -182,8 +193,7 @@ export class PiAgentDriver implements AgentDriver {
         }
       });
 
-      const last = live.agent.state.messages.at(-1);
-      const already = last?.role === "user" && userTextOf(last) === input.text;
+      const already = inputAlreadyPresent(live.agent.state.messages, input.text);
       if (already) await live.agent.continue();
       else await live.agent.prompt({ role: "user", content: input.text, timestamp: Date.now() });
       unsub();
@@ -201,7 +211,9 @@ export class PiAgentDriver implements AgentDriver {
       }
       return { text };
     } finally {
+      this.prompting.delete(sessionId);
       this.activeSink.delete(sessionId);
+      this.cancels.delete(sessionId);
     }
   }
 
@@ -231,8 +243,35 @@ export class PiAgentDriver implements AgentDriver {
 }
 
 function snapHasUser(snap: ConversationSnapshot | undefined, text: string): boolean {
-  const last = snap?.messages.at(-1);
+  if (!snap) return false;
+  if (snap.messages.some((m) => m.role === "user" && m.text === text)) return true;
+  const parts = text.split("\n").filter(Boolean);
+  if (parts.length > 1) {
+    const users = snap.messages.filter((m) => m.role === "user").map((m) => m.text);
+    if (parts.every((p) => users.includes(p))) return true;
+  }
+  const last = snap.messages.at(-1);
   return last?.role === "user" && last.text === text;
+}
+
+function inputAlreadyPresent(messages: Array<{ role?: string; content?: unknown }>, text: string): boolean {
+  const users = messages.filter((m) => m.role === "user").map((m) => userTextOf(m));
+  if (users.includes(text)) return true;
+  const parts = text.split("\n").filter(Boolean);
+  if (parts.length > 1 && parts.every((p) => users.includes(p))) return true;
+  const last = messages.at(-1);
+  return last?.role === "user" && userTextOf(last) === text;
+}
+
+function abortDecision(signal?: AbortSignal): Promise<ApprovalDecision> {
+  return new Promise((resolve) => {
+    if (!signal) return;
+    if (signal.aborted) {
+      resolve("deny");
+      return;
+    }
+    signal.addEventListener("abort", () => resolve("deny"), { once: true });
+  });
 }
 
 async function loadModels(): Promise<Models> {

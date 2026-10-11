@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { ScriptedDriver } from "../src/scripted-driver.js";
-import { action, cmd, dm, lastApprovalId, markdownCalls, openGateway, waitFor } from "./helpers.js";
+import { action, cmd, dm, extractPairCode, lastApprovalId, markdownCalls, openGateway, waitFor } from "./helpers.js";
 
 /**
  * Acceptance demo: ask on Telegram, switch to Feishu mid-stream,
@@ -31,7 +31,7 @@ describe("acceptance demo (fake adapters)", () => {
 
     await tg.ingest(dm({ platform: "telegram", userId: "ada", text: "hi" }));
     await tg.ingest(cmd({ platform: "telegram", userId: "ada", name: "pair" }));
-    const code = markdownCalls(tg).join("\n").match(/(\d{6})/)?.[1] ?? "";
+    const code = extractPairCode(markdownCalls(tg).join("\n")) ?? "";
     await fs.ingest(dm({ platform: "feishu", userId: "ou_ada", text: code }));
     log.push("paired Telegram + Feishu");
 

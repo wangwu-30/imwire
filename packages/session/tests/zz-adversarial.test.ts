@@ -7,7 +7,7 @@ import type { DraftHandle } from "@imwire/core";
 import { SessionGateway } from "../src/gateway.js";
 import { ScriptedDriver } from "../src/scripted-driver.js";
 import type { AgentDriver, ConversationSnapshot, TurnSink, UserTurn } from "../src/types.js";
-import { action, cmd, dm, fakeAdapter, groupMsg, lastApprovalId, markdownCalls, openGateway, waitFor } from "./helpers.js";
+import { action, cmd, dm, extractPairCode, fakeAdapter, groupMsg, lastApprovalId, markdownCalls, openGateway, waitFor } from "./helpers.js";
 
 const tick = () => new Promise((r) => setTimeout(r, 10));
 
@@ -18,7 +18,7 @@ async function bootstrapAndPairFeishu(
 ) {
   await tg.ingest(dm({ platform: "telegram", userId: "ada", text: "hello" }));
   await tg.ingest(cmd({ platform: "telegram", userId: "ada", name: "pair" }));
-  const code = markdownCalls(tg).find((t) => t.includes("Pairing code"))!.match(/(\d{6})/)![1]!;
+  const code = extractPairCode(...markdownCalls(tg).filter((t) => t.includes("Pairing code")))!;
   await fs.ingest(dm({ platform: "feishu", userId: "ou_ada", text: code }));
   return code;
 }
@@ -53,11 +53,11 @@ describe("ADV pairing", () => {
     const { gw, tg, fs } = openGateway();
     await tg.ingest(dm({ platform: "telegram", userId: "ada", text: "hello" }));
     await tg.ingest(cmd({ platform: "telegram", userId: "ada", name: "pair" }));
-    const code = markdownCalls(tg).find((t) => t.includes("Pairing code"))!.match(/(\d{6})/)![1]!;
+    const code = extractPairCode(...markdownCalls(tg).filter((t) => t.includes("Pairing code")))!;
     const before = fs.calls.length;
     let n = 0;
     for (let i = 0; n < 500; i += 1) {
-      const guess = String(i).padStart(6, "0");
+      const guess = String(i).padStart(8, "0");
       if (guess === code) continue;
       await fs.ingest(dm({ platform: "feishu", userId: "mallory", text: guess }));
       n += 1;
@@ -66,6 +66,12 @@ describe("ADV pairing", () => {
     await fs.ingest(dm({ platform: "feishu", userId: "mallory", text: code }));
     expect(replies).toBeLessThan(20);
     expect(gw.store.findIdentity("feishu", "bot", "mallory")).toBeUndefined();
+    await tg.ingest(cmd({ platform: "telegram", userId: "ada", name: "pair" }));
+    const fresh = extractPairCode(...markdownCalls(tg).filter((t) => t.includes("Pairing code")))!;
+    await fs.ingest(dm({ platform: "feishu", userId: "ou_ada", text: fresh }));
+    expect(gw.store.findIdentity("feishu", "bot", "ou_ada")?.personId).toBe(
+      gw.store.findIdentity("telegram", "bot", "ada")?.personId,
+    );
     gw.close();
   }, 60_000);
 });
@@ -245,6 +251,15 @@ describe("ADV concurrency", () => {
     driver.releaseAll();
     await gw.waitForIdle();
     expect(driver.maxConcurrent).toBe(1);
+    expect(driver.prompts.join("\n")).toContain("M1");
+    expect(driver.prompts.join("\n")).toContain("M2");
+    expect(driver.prompts.join("\n")).toContain("M3");
+    expect(driver.prompts.join("\n")).toContain("M4 in the gap");
+    const order = driver.prompts.join("\n");
+    expect(order.indexOf("M1")).toBeGreaterThanOrEqual(0);
+    expect(order.indexOf("M2")).toBeGreaterThan(order.indexOf("M1"));
+    expect(order.indexOf("M3")).toBeGreaterThan(order.indexOf("M2"));
+    expect(order.indexOf("M4 in the gap")).toBeGreaterThan(order.indexOf("M3"));
     gw.close();
   });
 
@@ -291,6 +306,7 @@ describe("ADV concurrency", () => {
     await tick();
     expect(driver.prompts.join("\n")).toContain("Q2 from Feishu");
     expect(fsDrafts === 0 || fsFinalized === fsDrafts).toBe(true);
+    expect(markdownCalls(fs).some((t) => /Q2 from Feishu|re:/.test(t))).toBe(true);
     gw.close();
   });
 });

@@ -14,6 +14,7 @@ export class ScriptedDriver implements AgentDriver {
   private script: Script;
   private readonly gates = new Map<string, { promise: Promise<void>; resolve: () => void }>();
   lastSessionId?: string;
+  private cancelled = false;
 
   constructor(script?: Script) {
     this.script = script ?? (async (sink) => {
@@ -37,8 +38,13 @@ export class ScriptedDriver implements AgentDriver {
   }
 
   async prompt(_sessionId: string, _input: UserTurn, sink: TurnSink): Promise<TurnResult> {
+    this.cancelled = false;
     const ctl: ScriptedController = {
-      wait: (name) => this.gate(name).promise,
+      wait: async (name) => {
+        if (this.cancelled) throw new Error("cancelled");
+        await this.gate(name).promise;
+        if (this.cancelled) throw new Error("cancelled");
+      },
       release: (name) => this.release(name),
     };
     await this.script(sink, ctl);
@@ -46,6 +52,7 @@ export class ScriptedDriver implements AgentDriver {
   }
 
   async cancel(): Promise<void> {
+    this.cancelled = true;
     for (const g of this.gates.values()) g.resolve();
   }
 
