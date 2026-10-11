@@ -51,7 +51,7 @@ TELEGRAM_ACCOUNT_ID=mybot
 
 不设、或设成 `telegram` 时，`adapter.start()` 里 `getMe` 成功后会把 `accountId` 改成 **bot 数字 id**（等于 token 冒号前那串，也等于 `getMe.id`）。已经设成别的值（例如 `mybot`）时 **不会**改。
 
-群里使用时注意 privacy mode：在 [@BotFather](https://t.me/BotFather) 对这个 bot 发 `/setprivacy`。默认开启时 bot 只能看到命令、@mention 和回复它的消息。
+群里使用时注意 privacy mode：在 [@BotFather](https://t.me/BotFather) 对这个 bot 发 `/setprivacy`。默认开启时 bot 只能看到 `/command@bot` 命令和回复它的消息。把 bot 设为群管理员后可以收到全部消息。改完 privacy 必须把 bot 从群里移除再加回来才会生效。
 
 echo / assistant **另外**接受 `IMWIRE_TELEGRAM_BOT_TOKEN`（与 `TELEGRAM_BOT_TOKEN` 二选一）。`imwire serve` **只认** `TELEGRAM_BOT_TOKEN`。
 
@@ -60,7 +60,12 @@ echo / assistant **另外**接受 `IMWIRE_TELEGRAM_BOT_TOKEN`（与 `TELEGRAM_BO
 ### 飞书 / Lark（官方 SDK WebSocket 长连接）
 
 1. [飞书开放平台](https://open.feishu.cn/app) 或 [Lark](https://open.larksuite.com/app) 创建企业自建应用。
-2. 打开「机器人」能力；在权限管理里开通官方 scope：`im:message`、`im:message:send_as_bot`。
+2. 打开「机器人」能力；在权限管理里开通官方 scope：
+   - `im:message`、`im:message:send_as_bot`（发消息）
+   - `im:message.p2p_msg:readonly`（收私聊）
+   - `im:message.group_at_msg:readonly`（群里 @机器人）
+   - `cardkit:card:write`（流式卡片；没有时 `startCard` 会退回普通 PATCH 更新）
+   只开 `im:message` **不会**投递 `im.message.receive_v1` 的私聊 / 群 @ 事件（见[接收消息](https://open.feishu.cn/document/server-docs/im-v1/message/events/receive)）。
 3. 订阅事件 `im.message.receive_v1`、`card.action.trigger`（以及你要用的 reaction 事件）。
 4. 拿到 App ID / App Secret。长连接不需要公网回调 URL。
 5. 写入 `.env`：
@@ -110,9 +115,11 @@ WECOM_SECRET=          # 别名 WECOM_AIBOT_SECRET
 ### Slack Socket Mode（本仓库**没有**在真实 workspace 上跑过）
 
 1. [Slack API](https://api.slack.com/apps) 创建应用。打开 Socket Mode。
-2. Bot Token（`xoxb-`）需要 bot 权限 `chat:write`、`im:history`；并在 Event Subscriptions 订阅消息事件。
-3. App-level Token（`xapp-`，scope 含 `connections:write`）。
-4. 写入 `.env`：
+2. Bot Token（`xoxb-`）需要 bot 权限 `chat:write`、`im:history`。适配器会加 reaction，还要 `reactions:write`。
+3. Event Subscriptions 必须订阅 `message.im`（私聊）。群里 @bot 还要订阅 `app_mention` 事件，并开通 `app_mentions:read`。
+4. 打开 Interactivity（按钮要用）；App Home 打开 Messages tab。
+5. App-level Token（`xapp-`，scope 含 `connections:write`）。
+6. 写入 `.env`：
 
 ```bash
 SLACK_BOT_TOKEN=xoxb-...
