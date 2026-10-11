@@ -1,0 +1,18 @@
+{
+  "name": "@imwire/example-assistant",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "license": "MIT",
+  "scripts": {
+    "start": "node --env-file=../../.env dist/index.js",
+    "build": "tsc -b"
+  },
+  "dependencies": {
+    "@imwire/agent-pi": "workspace:*",
+    "@imwire/core": "workspace:*",
+    "@imwire/feishu": "workspace:*",
+    "@imwire/session": "workspace:*",
+    "@imwire/telegram": "workspace:*"
+  }
+}

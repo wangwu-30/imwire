@@ -9,3 +9,7 @@ coverage
 .turbo
 .eslintcache
 *.tsbuildinfo
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+*.db

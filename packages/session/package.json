@@ -1,0 +1,29 @@
+{
+  "name": "@imwire/session",
+  "version": "0.1.0",
+  "description": "Person-scoped session layer: pairing, topics, follow-the-user routing.",
+  "type": "module",
+  "license": "MIT",
+  "engines": {
+    "node": ">=20"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": ["dist", "src"],
+  "scripts": {
+    "build": "tsc -b",
+    "typecheck": "tsc -b --pretty false"
+  },
+  "dependencies": {
+    "@imwire/core": "workspace:*",
+    "better-sqlite3": "^12.4.1"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.13"
+  }
+}

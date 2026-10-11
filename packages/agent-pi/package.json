@@ -1,0 +1,27 @@
+{
+  "name": "@imwire/agent-pi",
+  "version": "0.1.0",
+  "description": "AgentDriver backed by @earendil-works/pi-agent-core + pi-ai.",
+  "type": "module",
+  "license": "MIT",
+  "engines": {
+    "node": ">=20"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": ["dist", "src"],
+  "scripts": {
+    "build": "tsc -b",
+    "typecheck": "tsc -b --pretty false"
+  },
+  "dependencies": {
+    "@earendil-works/pi-agent-core": "^1.1.0",
+    "@earendil-works/pi-ai": "^1.1.0",
+    "@imwire/session": "workspace:*"
+  }
+}
