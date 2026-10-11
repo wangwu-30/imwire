@@ -8,4 +8,5 @@ export {
 } from "./capabilities.js";
 export { createDingTalkHttp, DingTalkApiError, type DingTalkHttp, type DingTalkFetch } from "./http.js";
 export { mapDingTalkEvent, robotSessionOf, type DingTalkMapContext } from "./map.js";
+export { splitUtf8 } from "./util.js";
 export { createRawDingTalkStream, type DingTalkStream } from "./stream.js";

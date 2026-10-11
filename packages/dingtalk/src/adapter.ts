@@ -23,7 +23,7 @@ import { DINGTALK_STREAM_CONTENT_LIMIT, dingtalkCapabilities } from "./capabilit
 import { createDingTalkHttp, type DingTalkHttp } from "./http.js";
 import { mapDingTalkEvent, robotSessionOf } from "./map.js";
 import { createRawDingTalkStream, type DingTalkStream } from "./stream.js";
-import { asRecord, asString, newId } from "./util.js";
+import { asRecord, asString, newId, splitUtf8 } from "./util.js";
 
 export interface DingTalkAdapterOptions {
   clientId: string;
@@ -237,10 +237,20 @@ export class DingTalkAdapter implements Adapter, Connectable {
 
   private async deliver(chat: ChatRef, text: string, buttons: ReturnType<typeof collectButtons>, _replyTo?: MsgRef): Promise<MsgRef> {
     if (this.cardTemplateId) {
+      const parts = splitUtf8(text, DINGTALK_STREAM_CONTENT_LIMIT);
+      const head = parts[0] ?? "…";
       const outTrackId = newId("card");
-      await this.createAndDeliver(chat, outTrackId, cardParamMap(text, undefined, buttons), true);
+      await this.createAndDeliver(chat, outTrackId, cardParamMap(head, undefined, parts.length === 1 ? buttons : []), true);
+      for (let i = 1; i < parts.length; i += 1) {
+        const last = i === parts.length - 1;
+        await this.deliverPlain(chat, parts[i] ?? "…", last ? buttons : []);
+      }
       return { chat, messageId: outTrackId };
     }
+    return this.deliverPlain(chat, text, buttons);
+  }
+
+  private async deliverPlain(chat: ChatRef, text: string, _buttons: ReturnType<typeof collectButtons>): Promise<MsgRef> {
     const session = this.sessions.get(chat.chatId);
     const webhookFresh = session?.webhook && (!session.expiresAt || session.expiresAt > Date.now());
     if (webhookFresh && session?.webhook) {
@@ -314,6 +324,7 @@ export class DingTalkAdapter implements Adapter, Connectable {
    * https://open.dingtalk.com/document/orgapp/api-streamingupdate
    */
   private async streamCard(outTrackId: string, content: string, isFinalize: boolean, isError = false): Promise<void> {
+    const parts = splitUtf8(content, DINGTALK_STREAM_CONTENT_LIMIT);
     await this.http.request({
       method: "PUT",
       path: "/v1.0/card/streaming",
@@ -321,12 +332,18 @@ export class DingTalkAdapter implements Adapter, Connectable {
         outTrackId,
         guid: newId("guid"),
         key: this.streamKey,
-        content: clipStreamContent(content),
+        content: parts[0] ?? "…",
         isFull: true,
         isFinalize,
         isError,
       },
     });
+    if (!isFinalize || isError || parts.length <= 1) return;
+    const chat = this.cardChats.get(outTrackId);
+    if (!chat) return;
+    for (const part of parts.slice(1)) {
+      await this.deliverPlain(chat, part, []);
+    }
   }
 }
 
@@ -335,15 +352,6 @@ function asCardToken(token: unknown): CardToken | undefined {
   const outTrackId = asString(rec?.outTrackId);
   if (!outTrackId) return undefined;
   return { outTrackId, seq: 0 };
-}
-
-function clipStreamContent(content: string): string {
-  if (Buffer.byteLength(content, "utf8") <= DINGTALK_STREAM_CONTENT_LIMIT) return content;
-  let out = content;
-  while (out.length > 0 && Buffer.byteLength(out, "utf8") > DINGTALK_STREAM_CONTENT_LIMIT) {
-    out = out.slice(0, -1);
-  }
-  return out;
 }
 
 function render(text: string, status?: string): string {

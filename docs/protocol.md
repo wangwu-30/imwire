@@ -24,7 +24,7 @@ Normalized events (the same `Inbound` model as `@imwire/core`) flow **out** as n
 - `IMWIRE_WS_TOKEN` or `--ws-token TOKEN`
 - if neither is set, serve generates one and prints `imwire serve ws token …` to **stderr**
 
-Clients must present the token as `Authorization: Bearer <token>`, `Sec-WebSocket-Protocol: imwire, <token>`, or `?token=`. Comparison is constant-time.
+Clients must present the token as `Authorization: Bearer <token>` only (query-string and `Sec-WebSocket-Protocol` are rejected). Comparison is constant-time. A generated token is printed to stderr; a user-supplied token is not.
 
 - Any request that carries a browser `Origin` header is **rejected** (this is not a browser API).
 - Non-loopback `--ws-host` (e.g. `0.0.0.0`) is refused unless `--ws-allow-remote` **and** a token are both set.

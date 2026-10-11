@@ -2,10 +2,13 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import sys
 import warnings
 from collections.abc import AsyncIterator, Sequence
 from typing import Any
+
+_SERVE_LOG = logging.getLogger("imwire.serve")
 
 from .types import ChatRef, InboundEvent, MsgRef, OutMessage, inbound_from_rpc, refs_from_rpc
 
@@ -118,9 +121,10 @@ class ImwireClient:
             return
         try:
             while True:
-                chunk = await err.read(65536)
-                if not chunk:
+                line = await err.readline()
+                if not line:
                     return
+                _SERVE_LOG.info("%s", line.decode("utf-8", errors="replace").rstrip())
         except (asyncio.CancelledError, ConnectionError):
             return
 

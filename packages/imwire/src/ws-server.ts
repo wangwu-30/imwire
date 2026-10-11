@@ -41,17 +41,6 @@ export function tokenFromRequest(req: IncomingMessage): string | undefined {
   if (typeof auth === "string" && auth.toLowerCase().startsWith("bearer ")) {
     return auth.slice(7).trim();
   }
-  const proto = req.headers["sec-websocket-protocol"];
-  if (typeof proto === "string") {
-    const parts = proto.split(",").map((s) => s.trim());
-    const idx = parts.findIndex((p) => p === "imwire");
-    if (idx >= 0 && parts[idx + 1]) return parts[idx + 1];
-    if (parts.length === 1 && parts[0] && parts[0] !== "imwire") return parts[0];
-  }
-  if (req.url) {
-    const q = new URL(req.url, "http://localhost").searchParams.get("token");
-    if (q) return q;
-  }
   return undefined;
 }
 

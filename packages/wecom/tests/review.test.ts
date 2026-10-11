@@ -1,7 +1,7 @@
 import { EventEmitter } from "node:events";
 import { expect, test } from "vitest";
 import { WecomAdapter } from "../src/adapter.js";
-import { WecomApiError } from "../src/errors.js";
+import { WecomApiError, wecomShouldRetry } from "../src/errors.js";
 import { isDisconnectedEvent } from "../src/map.js";
 import { createRawWecomTransport, type WecomTransport } from "../src/transport.js";
 
@@ -110,6 +110,8 @@ test("WC3 respond_msg errcode is surfaced as WecomApiError", async () => {
 test("rate-limit errcodes are retryable", () => {
   expect(new WecomApiError("busy", 45009).retryable).toBe(true);
   expect(new WecomApiError("expired", 846609).retryable).toBe(false);
+  expect(wecomShouldRetry(new WecomApiError("invalid secret", 40058))).toBe(false);
+  expect(wecomShouldRetry(new Error("wecom disconnected_event: another instance took over"))).toBe(true);
 });
 
 test("disconnected_event stops the transport", async () => {
@@ -131,6 +133,53 @@ test("disconnected_event stops the transport", async () => {
     body: { event: { eventtype: "disconnected_event" } },
   };
   expect(isDisconnectedEvent(raw)).toBe(true);
-  await expect(ad.ingest(raw)).rejects.toThrow(/disconnected_event/);
+  await expect(ad.ingest(raw)).rejects.toThrow(/another instance took over/);
   expect(frames).toContain("stopped");
+});
+
+test("bad secret is fatal and stops reconnect", async () => {
+  let connects = 0;
+  const transport: WecomTransport = {
+    async send() {
+      return { errcode: 0 };
+    },
+    isAlive: () => false,
+    stop() {},
+    async start() {
+      connects += 1;
+      throw new WecomApiError("invalid secret", 40058);
+    },
+  };
+  const ad = new WecomAdapter({ botId: "b", secret: "s", transport });
+  const ac = new AbortController();
+  await ad.start(ac.signal);
+  expect(connects).toBe(1);
+});
+
+test("reply map is bounded", async () => {
+  const frames: unknown[] = [];
+  const transport: WecomTransport = {
+    async send(frame) {
+      frames.push(frame);
+      return { errcode: 0 };
+    },
+    isAlive: () => true,
+    stop() {},
+    async start() {},
+  };
+  const ad = new WecomAdapter({ botId: "b", secret: "s", transport });
+  for (let i = 0; i < 300; i += 1) {
+    ad.rememberReply(`c${i}`, `r${i}`, `m${i}`);
+  }
+  await expect(
+    ad.send(
+      { platform: "wecom", accountId: "b", chatId: "c0", kind: "dm" },
+      { blocks: [{ kind: "markdown", text: "x" }] },
+    ),
+  ).rejects.toThrow(/no req_id/);
+  await ad.send(
+    { platform: "wecom", accountId: "b", chatId: "c299", kind: "dm" },
+    { blocks: [{ kind: "markdown", text: "ok" }] },
+  );
+  expect(frames.length).toBeGreaterThan(0);
 });

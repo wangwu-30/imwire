@@ -43,11 +43,12 @@ async def run(command: list[str] | None, url: str | None, token: str | None) -> 
             text = event.text if event.type == "message" else f"/{event.name} {event.args}".strip()
             draft = await client.start_draft(event.chat)
             await draft.set_status("echoing…")
-            # Character groups — CJK has no whitespace. Pace slower than serve/adapter throttle.
+            # Character groups — finish any message within ~8s (ceil(len/40) × 200ms).
             body = text or "(empty)"
-            for i in range(0, len(body), 2):
-                await draft.append(body[i : i + 2])
-                await asyncio.sleep(0.4)
+            step = max(1, -(-len(body) // 40))
+            for i in range(0, len(body), step):
+                await draft.append(body[i : i + step])
+                await asyncio.sleep(0.2)
             await draft.finalize(
                 OutMessage(
                     markdown=text or "(empty)",

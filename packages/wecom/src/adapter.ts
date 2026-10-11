@@ -19,9 +19,13 @@ import {
 } from "@imwire/core";
 import { wecomCapabilities } from "./capabilities.js";
 import { respondBody, streamBody } from "./cards.js";
+import { WecomKickError, wecomShouldRetry } from "./errors.js";
 import { isDisconnectedEvent, mapWecomEvent, replyContextOf } from "./map.js";
 import { createRawWecomTransport, type WecomFrame, type WecomTransport } from "./transport.js";
 import { asRecord, asString, newId } from "./util.js";
+
+const REPLY_TTL_MS = 10 * 60 * 1000;
+const REPLY_MAX = 256;
 
 export interface WecomAdapterOptions {
   botId: string;
@@ -35,6 +39,7 @@ export interface WecomAdapterOptions {
 interface ReplySlot {
   reqId: string;
   msgid: string;
+  at: number;
 }
 
 interface StreamToken {
@@ -58,10 +63,12 @@ export class WecomAdapter implements Adapter, Connectable {
   private readonly createTransport: () => WecomTransport;
   private transport?: WecomTransport;
   private readonly replies = new Map<string, ReplySlot>();
+  private readonly logger?: Logger;
 
   constructor(opts: WecomAdapterOptions) {
     this.accountId = opts.accountId ?? opts.botId;
     this.draftThrottleMs = opts.draftThrottleMs ?? 200;
+    this.logger = opts.logger;
     this.createTransport = () =>
       opts.transport ??
       createRawWecomTransport({
@@ -76,6 +83,16 @@ export class WecomAdapter implements Adapter, Connectable {
       ratePerSec: 1,
       burst: 3,
       logger: opts.logger,
+      reconnect: {
+        minMs: 5_000,
+        maxMs: 120_000,
+        shouldRetry: wecomShouldRetry,
+        onError: (err) => {
+          if (err instanceof WecomKickError || String(err).includes("another instance")) {
+            opts.logger?.warn("wecom: another instance took over; backing off", { err: String(err) });
+          }
+        },
+      },
     });
   }
 
@@ -102,20 +119,22 @@ export class WecomAdapter implements Adapter, Connectable {
   }
 
   rememberReply(chatId: string, reqId: string, msgid?: string): void {
-    const slot = { reqId, msgid: msgid ?? reqId };
-    this.replies.set(chatId, slot);
-    this.replies.set(slot.msgid, slot);
+    const slot: ReplySlot = { reqId, msgid: msgid ?? reqId, at: Date.now() };
+    this.putReply(chatId, slot);
+    this.putReply(slot.msgid, slot);
   }
 
   async ingest(raw: unknown, opts?: { wait?: boolean }): Promise<void> {
     if (isDisconnectedEvent(raw)) {
-      this.transport?.stop("wecom disconnected_event: another instance subscribed");
-      throw new Error("wecom disconnected_event: another instance subscribed");
+      this.logger?.warn("wecom disconnected_event: another instance took over; backing off");
+      this.transport?.stop("wecom disconnected_event: another instance took over");
+      throw new WecomKickError();
     }
     const slot = replyContextOf(raw);
     if (slot) {
-      this.replies.set(slot.chatId, { reqId: slot.reqId, msgid: slot.msgid });
-      this.replies.set(slot.msgid, { reqId: slot.reqId, msgid: slot.msgid });
+      const rec: ReplySlot = { reqId: slot.reqId, msgid: slot.msgid, at: Date.now() };
+      this.putReply(slot.chatId, rec);
+      this.putReply(slot.msgid, rec);
     }
     const events = mapWecomEvent(raw, { accountId: this.accountId });
     for (const event of events) {
@@ -244,7 +263,25 @@ export class WecomAdapter implements Adapter, Connectable {
     throw new Error("wecom media download is not implemented");
   }
 
+  private putReply(key: string, slot: ReplySlot): void {
+    this.pruneReplies();
+    this.replies.set(key, slot);
+    this.pruneReplies();
+  }
+
+  private pruneReplies(now = Date.now()): void {
+    for (const [key, slot] of this.replies) {
+      if (now - slot.at > REPLY_TTL_MS) this.replies.delete(key);
+    }
+    while (this.replies.size > REPLY_MAX) {
+      const oldest = this.replies.keys().next().value;
+      if (oldest === undefined) break;
+      this.replies.delete(oldest);
+    }
+  }
+
   private reqId(chatId: string, messageId?: string): string {
+    this.pruneReplies();
     const slot = (messageId ? this.replies.get(messageId) : undefined) ?? this.replies.get(chatId);
     if (!slot) throw new Error(`wecom: no req_id for ${chatId} (reply-only; wait for inbound)`);
     return slot.reqId;

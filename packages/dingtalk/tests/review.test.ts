@@ -251,7 +251,7 @@ test("DT7 no card template: buttons capability off, no dead actionURL", async ()
 });
 
 // https://open.dingtalk.com/document/development/api-streamingupdate.md
-test("streaming content is clipped to the 1 KB card update limit", async () => {
+test("streaming card updates stay within 1 KB; overflow is follow-up messages", async () => {
   const calls: Array<{ path: string; body?: Record<string, unknown> }> = [];
   const http: DingTalkHttp = {
     async request(r) {
@@ -277,4 +277,45 @@ test("streaming content is clipped to the 1 KB card update limit", async () => {
     const content = String(c.body?.content ?? "");
     expect(Buffer.byteLength(content, "utf8")).toBeLessThanOrEqual(DINGTALK_STREAM_CONTENT_LIMIT);
   }
+  expect(calls.some((c) => c.path.includes("oToMessages") || c.path.includes("groupMessages"))).toBe(true);
+});
+
+test("4.5KB reply is fully delivered (card + follow-ups)", async () => {
+  const calls: Array<{ path: string; body?: Record<string, unknown> }> = [];
+  const http: DingTalkHttp = {
+    async request(r) {
+      calls.push({ path: r.path, body: r.body as Record<string, unknown> });
+      return {};
+    },
+  };
+  const ad = new DingTalkAdapter({
+    clientId: "c",
+    clientSecret: "s",
+    robotCode: "ROBOT",
+    cardTemplateId: "tpl",
+    http,
+    stream: { isAlive: () => false, stop() {}, async start() {} },
+  });
+  const text = "x".repeat(4500);
+  await ad.send(
+    { platform: "dingtalk", accountId: ad.accountId, chatId: "staff_1", kind: "dm" },
+    { blocks: [{ kind: "markdown", text }] },
+  );
+  const pieces: string[] = [];
+  for (const c of calls) {
+    const body = c.body ?? {};
+    if (typeof body.content === "string") pieces.push(body.content);
+    const card = body.cardData as { cardParamMap?: { content?: string } } | undefined;
+    if (typeof card?.cardParamMap?.content === "string") pieces.push(card.cardParamMap.content);
+    if (typeof body.msgParam === "string") {
+      try {
+        const parsed = JSON.parse(body.msgParam) as { text?: string };
+        if (parsed.text) pieces.push(parsed.text);
+      } catch {
+        // ignore
+      }
+    }
+  }
+  const xs = pieces.join("").replace(/[^x]/g, "");
+  expect(xs.length).toBeGreaterThanOrEqual(4500);
 });

@@ -103,6 +103,22 @@ test("WS rejects a missing / wrong token", async () => {
   );
 });
 
+test("WS accepts Authorization only — query and subprotocol tokens are rejected", async () => {
+  const { host } = hostOf();
+  const ws = await listen(host);
+  await expect(open(`${ws.url}/?token=${ws.token}`)).rejects.toThrow(/http 401|Unexpected server response/);
+  await expect(
+    new Promise((_, reject) => {
+      const socket = new WebSocket(ws.url, ["imwire", ws.token]);
+      socket.on("open", () => reject(new Error("should not open")));
+      socket.on("unexpected-response", (_req, res) => {
+        reject(Object.assign(new Error(`http ${res.statusCode}`), { statusCode: res.statusCode }));
+      });
+      socket.on("error", reject);
+    }),
+  ).rejects.toThrow(/http 401|Unexpected server response|should not open/);
+});
+
 test("RPC responses stay on the originating client; events only go to subscribers", async () => {
   const { adapter, host, stdout } = hostOf();
   const ws = await listen(host);

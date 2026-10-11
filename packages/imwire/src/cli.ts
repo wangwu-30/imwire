@@ -68,7 +68,8 @@ See docs/protocol.md.`);
   const wsPortRaw = flagValue("--ws");
   const wsPort = wantWs ? (wsPortRaw && Number.isFinite(Number(wsPortRaw)) ? Number(wsPortRaw) : 8765) : undefined;
   const wsHost = flagValue("--ws-host") || "127.0.0.1";
-  const wsToken = flagValue("--ws-token") || process.env.IMWIRE_WS_TOKEN || (wantWs ? generateWsToken() : undefined);
+  const suppliedToken = flagValue("--ws-token") || process.env.IMWIRE_WS_TOKEN;
+  const wsToken = suppliedToken || (wantWs ? generateWsToken() : undefined);
   const allowRemote = has("--ws-allow-remote");
 
   if (wantWs && wsPort !== undefined && !Number.isFinite(wsPort)) {
@@ -101,7 +102,7 @@ See docs/protocol.md.`);
       allowRemote,
     });
     process.stderr.write(`imwire serve websocket ${ws.url}\n`);
-    process.stderr.write(`imwire serve ws token ${ws.token}\n`);
+    if (!suppliedToken) process.stderr.write(`imwire serve ws token ${ws.token}\n`);
   }
 
   process.stderr.write(`imwire serve ${adapters.map((a) => `${a.platform}:${a.accountId}`).join(", ")}\n`);

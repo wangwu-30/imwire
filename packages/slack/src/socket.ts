@@ -55,6 +55,7 @@ export function createRawSlackSocket(opts: RawSocketOptions): SlackSocket {
       socket = ws;
       alive = true;
 
+      let fatal: Error | undefined;
       const handleData = async (data: unknown): Promise<void> => {
         const text = typeof data === "string" ? data : data instanceof Buffer ? data.toString("utf8") : String(data);
         let frame: Record<string, unknown>;
@@ -70,7 +71,8 @@ export function createRawSlackSocket(opts: RawSocketOptions): SlackSocket {
           // https://docs.slack.dev/apis/events-api/using-socket-mode#disconnect
           if (reason === "warning") return;
           if (reason === "link_disabled") {
-            alive = false;
+            fatal = new Error("slack link_disabled");
+            ws.close();
             return;
           }
           ws.close();
@@ -80,9 +82,13 @@ export function createRawSlackSocket(opts: RawSocketOptions): SlackSocket {
       };
 
       await new Promise<void>((resolve, reject) => {
+        let settled = false;
         const finish = (): void => {
+          if (settled) return;
+          settled = true;
           alive = false;
-          resolve();
+          if (fatal) reject(fatal);
+          else resolve();
         };
         if (signal.aborted) {
           ws.close();
@@ -102,8 +108,8 @@ export function createRawSlackSocket(opts: RawSocketOptions): SlackSocket {
             void handleData(data);
           },
           error: (err) => {
-            alive = false;
-            reject(err instanceof Error ? err : new Error(String(err)));
+            if (!fatal) fatal = err instanceof Error ? err : new Error(String(err));
+            finish();
           },
           close: () => finish(),
         });

@@ -62,6 +62,9 @@ export class SlackAdapter implements Adapter, Connectable {
       ratePerSec: 1,
       burst: 3,
       logger: opts.logger,
+      reconnect: {
+        shouldRetry: (err) => !String(err).includes("link_disabled"),
+      },
     });
   }
 

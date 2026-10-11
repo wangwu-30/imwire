@@ -15,6 +15,8 @@ export interface ReconnectOptions {
   random?: () => number;
   logger?: Logger;
   onError?: (err: unknown, attempt: number) => void;
+  /** Return false to stop the supervisor (auth / link_disabled). */
+  shouldRetry?: (err: unknown) => boolean;
 }
 
 export async function runReconnectSupervisor(
@@ -64,6 +66,10 @@ export async function runReconnectSupervisor(
         if (signal.aborted) return;
         logger.warn("connection dropped", { attempt, err: String(err) });
         opts.onError?.(err, attempt);
+        if (opts.shouldRetry && !opts.shouldRetry(err)) {
+          logger.error("reconnect stopped", { err: String(err) });
+          return;
+        }
       }
       if (signal.aborted) return;
       const exp = minMs * factor ** Math.max(0, attempt - 1);

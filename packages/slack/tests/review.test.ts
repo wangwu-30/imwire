@@ -138,7 +138,7 @@ test("auth.test on connect sets botUserId used by the self-filter", async () => 
 });
 
 // https://docs.slack.dev/apis/events-api/using-socket-mode#disconnect
-test("disconnect: warning stays up, refresh closes, link_disabled stays pending", async () => {
+test("disconnect: warning stays up, refresh closes, link_disabled closes and stops", async () => {
   const web: SlackWeb = {
     async call() {
       return { url: "wss://mock" };
@@ -155,8 +155,8 @@ test("disconnect: warning stays up, refresh closes, link_disabled stays pending"
   expect(sock.isAlive()).toBe(true);
 
   ws.push({ type: "disconnect", reason: "link_disabled" });
-  await sleep(10);
-  expect(ws.closed).toBe(false);
+  await expect(started).rejects.toThrow(/link_disabled/);
+  expect(ws.closed).toBe(true);
   expect(sock.isAlive()).toBe(false);
 
   const sock2 = createRawSlackSocket({ web, WebSocketImpl: MockWs });
@@ -168,5 +168,4 @@ test("disconnect: warning stays up, refresh closes, link_disabled stays pending"
   expect(MockWs.last!.closed).toBe(true);
   ac.abort();
   ac2.abort();
-  await Promise.race([started, sleep(20)]);
 });

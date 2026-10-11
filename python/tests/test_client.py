@@ -43,6 +43,11 @@ class ClientTransportTest(unittest.IsolatedAsyncioTestCase):
         result = await self._case("stderr", lambda c: c.request("hello"))
         self.assertEqual(result, {"ok": True})
 
+    async def test_stderr_is_forwarded_to_logging(self):
+        with self.assertLogs("imwire.serve", level="INFO") as cm:
+            await self._case("stderr", lambda c: c.request("hello"))
+        self.assertTrue(any("log line" in rec for rec in cm.output))
+
     async def test_events_stop_after_aclose(self):
         client = await ImwireClient.connect_stdio([PY, FAKE, "junk"])
         await client.aclose()
