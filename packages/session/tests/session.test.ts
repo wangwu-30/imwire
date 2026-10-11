@@ -228,6 +228,8 @@ describe("restart persistence", () => {
       allowlist: [owner("telegram", "ada")],
     });
     expect(third.store.getCallback("h:deadbeefdeadbeef")).toEqual({ id: "allow_once", value: "a_1" });
+    third.store.setCallback("h:old", { id: "x" }, Date.now() - 48 * 60 * 60 * 1000);
+    expect(third.store.getCallback("h:old")).toBeUndefined();
     third.close();
   });
 
@@ -244,7 +246,36 @@ describe("restart persistence", () => {
     await tg.ingest(cmd({ platform: "telegram", userId: "ada", name: "stop" }));
     await gw.waitForIdle();
     expect(markdownCalls(tg).some((t) => t === "Stopped.")).toBe(true);
+    expect(markdownCalls(tg).some((t) => /stopped/i.test(t))).toBe(true);
     expect(markdownCalls(tg).join(" ")).not.toMatch(/should-not-appear/);
+    const personId = gw.store.findIdentity("telegram", "bot", "ada")!.personId;
+    const conv = gw.store.activeConversation(personId, Date.now());
+    expect(conv.messages.some((m) => m.role === "assistant" && /partial|stopped/i.test(m.text))).toBe(false);
+    gw.close();
+  });
+
+  it("stops a group turn as a command and drops the queued follow-ups", async () => {
+    let n = 0;
+    const driver = new ScriptedDriver(async (sink, ctl) => {
+      n += 1;
+      sink.text("g" + n);
+      if (n === 1) await ctl.wait("mid");
+    });
+    const { gw, tg } = openGateway({ driver });
+    await tg.ingest(dm({ platform: "telegram", userId: "ada", text: "hello" }));
+    await tg.ingest(groupMsg({ platform: "telegram", chatId: "-100", userId: "ada", text: "@bot go" }));
+    await waitFor(() => n === 1);
+    await tg.ingest(groupMsg({ platform: "telegram", chatId: "-100", userId: "ada", text: "@bot later" }));
+    await tg.ingest(cmd({ platform: "telegram", userId: "ada", name: "stop", chatId: "-100", kind: "group" }));
+    await gw.waitForIdle();
+    expect(markdownCalls(tg).some((t) => /Stopped\./.test(t))).toBe(true);
+    expect(markdownCalls(tg).some((t) => /Dropped 1 queued message/.test(t))).toBe(true);
+    const group = gw.store.groupConversation(
+      { platform: "telegram", accountId: "bot", chatId: "-100", kind: "group" },
+      Date.now(),
+    );
+    expect(group.messages.some((m) => m.text.includes("later"))).toBe(false);
+    expect(group.messages.some((m) => m.role === "assistant" && m.text.startsWith("g"))).toBe(false);
     gw.close();
   });
 });

@@ -115,7 +115,7 @@ describe("R2 turn pipeline", () => {
     await tick(50);
     const notices = markdownCalls(b.tg).filter((t) => /interrupted/.test(t)).length;
     console.log(`R4 restart: interrupt notices sent=${notices} (Q2 was in flight)`);
-    expect(notices).toBeGreaterThanOrEqual(1);
+    expect(notices).toBe(1);
     b.gw.close();
   });
 

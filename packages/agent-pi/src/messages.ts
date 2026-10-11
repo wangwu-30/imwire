@@ -75,29 +75,58 @@ function truncateToolResult<T extends { role?: string; content?: unknown; toolCa
   return { ...msg, content: [{ type: "text", text: marker }] };
 }
 
-/** Group assistant(toolCall) with the following toolResult row(s) so they are never split. */
-function groupTurns<T extends { role?: string; content?: unknown; toolCallId?: string }>(messages: T[]): T[][] {
-  const groups: T[][] = [];
-  for (let i = 0; i < messages.length; i += 1) {
+function pushToolPair<T extends { role?: string; content?: unknown }>(
+  messages: T[],
+  start: number,
+): { group: T[]; next: number } {
+  const group = [messages[start]!];
+  let i = start;
+  while (i + 1 < messages.length && messages[i + 1]?.role === "toolResult") {
+    i += 1;
+    group.push(messages[i]!);
+  }
+  return { group, next: i + 1 };
+}
+
+/**
+ * Split into a leading system prefix plus whole turns (user + following
+ * assistant / tool_call+tool_result / mid-transcript system until the next user).
+ */
+function groupWholeTurns<T extends { role?: string; content?: unknown }>(
+  messages: T[],
+): { prefix: T[]; turns: T[][] } {
+  const prefix: T[] = [];
+  let i = 0;
+  while (i < messages.length && messages[i]?.role === "system") {
+    prefix.push(messages[i]!);
+    i += 1;
+  }
+  const turns: T[][] = [];
+  let current: T[] = [];
+  while (i < messages.length) {
     const msg = messages[i]!;
+    if (msg.role === "user" && current.length > 0) {
+      turns.push(current);
+      current = [];
+    }
     if (hasToolCall(msg)) {
-      const group = [msg];
-      while (i + 1 < messages.length && messages[i + 1]?.role === "toolResult") {
-        i += 1;
-        group.push(messages[i]!);
-      }
-      groups.push(group);
+      const pair = pushToolPair(messages, i);
+      current.push(...pair.group);
+      i = pair.next;
       continue;
     }
-    groups.push([msg]);
+    current.push(msg);
+    i += 1;
   }
-  return groups;
+  if (current.length) turns.push(current);
+  return { prefix, turns };
 }
 
 /**
  * Bound context by character budget:
  * - never drop the latest user message
  * - keep tool_call + tool_result pairs together (truncate oversized tool results)
+ * - drop oldest whole turns (never a middle reply while keeping an older one)
  * - leave system messages in their original positions (do not hoist)
  */
 export function windowMessages<T extends { role?: string; content?: unknown; toolCallId?: string }>(
@@ -108,32 +137,26 @@ export function windowMessages<T extends { role?: string; content?: unknown; too
   const prepared = messages.map((m) =>
     m.role === "toolResult" ? truncateToolResult(m, Math.max(256, Math.floor(maxChars / 2))) : m,
   );
-  const groups = groupTurns(prepared);
-  const sizes = groups.map((g) => g.reduce((n, m) => n + messageSize(m), 0));
+  const { prefix, turns } = groupWholeTurns(prepared);
+  const prefixSize = prefix.reduce((n, m) => n + messageSize(m), 0);
+  const sizes = turns.map((t) => t.reduce((n, m) => n + messageSize(m), 0));
 
-  let lastUser = -1;
-  for (let i = groups.length - 1; i >= 0; i -= 1) {
-    if (groups[i]!.some((m) => m.role === "user")) {
-      lastUser = i;
-      break;
-    }
-  }
-
-  const keep = new Array<boolean>(groups.length).fill(false);
+  const keep = new Array<boolean>(turns.length).fill(false);
   let used = 0;
-  if (lastUser >= 0) {
-    keep[lastUser] = true;
-    used += sizes[lastUser]!;
+  if (turns.length > 0) {
+    keep[turns.length - 1] = true;
+    used += sizes[turns.length - 1]!;
   }
+  const keepPrefix = prefixSize === 0 || used + prefixSize <= maxChars;
+  if (keepPrefix) used += prefixSize;
 
-  for (let i = groups.length - 1; i >= 0; i -= 1) {
-    if (keep[i]) continue;
-    if (used + sizes[i]! > maxChars) continue;
+  for (let i = turns.length - 2; i >= 0; i -= 1) {
+    if (used + sizes[i]! > maxChars) break;
     keep[i] = true;
     used += sizes[i]!;
   }
 
-  return groups.flatMap((g, i) => (keep[i] ? g : []));
+  return [...(keepPrefix ? prefix : []), ...turns.flatMap((t, i) => (keep[i] ? t : []))];
 }
 
 export function snapshotToPi(

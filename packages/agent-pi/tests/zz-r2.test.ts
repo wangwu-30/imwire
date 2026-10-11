@@ -156,6 +156,15 @@ describe("R2 pi driver", () => {
     const reordered = windowMessages(mixed, 1000).map((m) => m.content);
     console.log(`Q5 system reorder: ${JSON.stringify(reordered)}`);
     expect(reordered).toEqual(["S", "aaaaaaaaaa", "mid-transcript tool-set change", "b"]);
+    const turns = [
+      { role: "system", content: "S" },
+      { role: "user", content: "old-q" },
+      { role: "assistant", content: "tiny" },
+      { role: "user", content: "new-q" },
+    ];
+    const dropped = windowMessages(turns, 10);
+    expect(dropped.map((m) => m.content)).toEqual(["S", "new-q"]);
+    expect(dropped.some((m) => m.content === "tiny")).toBe(false);
   });
 
   it("Q6: bounded context over many turns (log window + char window)", async () => {

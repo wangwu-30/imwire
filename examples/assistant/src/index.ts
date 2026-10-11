@@ -65,9 +65,11 @@ function driver(): PiAgentDriver {
 function installProcessSafety(): void {
   process.on("unhandledRejection", (err) => {
     console.error("unhandledRejection", err);
+    process.exit(1);
   });
   process.on("uncaughtException", (err) => {
     console.error("uncaughtException", err);
+    process.exit(1);
   });
 }
 

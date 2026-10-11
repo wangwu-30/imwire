@@ -30,7 +30,6 @@ const PAIR_TTL_MS = 10 * 60 * 1000;
 const PAIR_RATE = 5;
 const PAIR_WINDOW_MS = 10 * 60 * 1000;
 const DEFAULT_APPROVAL_TTL_MS = 10 * 60 * 1000;
-const CODE_BURNED = "Your pairing code was burned after too many wrong guesses. Send /pair for a new one.";
 
 export interface SessionGatewayOptions {
   dbPath: string;
@@ -58,6 +57,7 @@ interface ActiveTurn {
   phase: TurnPhase;
   /** True only while `driver.prompt` is in flight (not typing / hand-off). */
   streaming: boolean;
+  stopped?: boolean;
 }
 
 interface ApprovalWaiter {
@@ -83,6 +83,7 @@ export class SessionGateway {
   private readonly turns = new Map<string, Promise<void>>();
   private readonly expiredOnBoot: PendingApproval[] = [];
   private closed = false;
+  private recoverChain: Promise<void> = Promise.resolve();
 
   constructor(opts: SessionGatewayOptions) {
     this.store = new SessionStore(opts.dbPath);
@@ -108,7 +109,12 @@ export class SessionGateway {
         this.logger.error("session handle failed", { err: String(err), type: event.type });
       }
     });
-    void this.recoverInterrupted();
+    this.recoverChain = this.recoverChain
+      .then(() => this.recoverInterrupted())
+      .catch((err: unknown) => {
+        this.logger.warn("interrupt recovery failed", { err: String(err) });
+      });
+    void this.recoverChain;
     void this.rewriteExpiredApprovals();
   }
 
@@ -144,6 +150,10 @@ export class SessionGateway {
         return;
       }
       const conv = this.store.groupConversation(chat, this.clock.now());
+      if (event.type === "command" && (event.name === "stop" || event.name === "cancel")) {
+        await this.handleStop(adapter, chat, conv.id);
+        return;
+      }
       await this.acceptTurn(adapter, conv.id, identity.personId, chat, from, text, replyTo);
       return;
     }
@@ -197,17 +207,18 @@ export class SessionGateway {
         if (this.closed) return;
         const surfaces = this.surfacesForTail(tail);
         let sent = false;
-        for (const surface of surfaces) {
-          const adapter = this.adapterFor(surface);
-          if (!adapter) continue;
-          try {
-            await adapter.send(surface, { blocks: [{ kind: "markdown", text: INTERRUPTED }] });
-            sent = true;
-          } catch (err) {
-            this.logger.warn("interrupt notice failed", { err: String(err) });
-          }
+      for (const surface of surfaces) {
+        const adapter = this.adapterFor(surface);
+        if (!adapter) continue;
+        try {
+          await adapter.send(surface, { blocks: [{ kind: "markdown", text: INTERRUPTED }] });
+          sent = true;
+          break;
+        } catch (err) {
+          this.logger.warn("interrupt notice failed", { err: String(err) });
         }
-        if (sent && !this.closed) this.store.markInterruptNotified(tail.conversationId, tail.seq);
+      }
+      if (sent && !this.closed) this.store.markInterruptNotified(tail.conversationId, tail.seq);
       }
     } catch (err) {
       if (this.closed) return;
@@ -297,8 +308,6 @@ export class SessionGateway {
         return;
       }
       this.store.recordPairAttempt(sender, now, false);
-      const burned = this.store.recordCodeMiss(code, now);
-      if (burned) await this.notifyCodeBurned(burned.personId);
       if (this.store.pairLocked(sender, now)) {
         if (this.store.shouldTellLockout(sender, now)) {
           await adapter.send(chat, { blocks: [{ kind: "markdown", text: "Too many pairing attempts. Try again later." }] });
@@ -484,26 +493,36 @@ export class SessionGateway {
       turn.streaming = true;
       const result = await this.driver.prompt(ensured.agentSessionId, input, sink);
       turn.streaming = false;
-      turn.phase = "finalizing";
-      const finalText = turn.generated || result.text;
-      const refs = await turn.draft.finalize({
-        blocks: [{ kind: "markdown", text: finalText || "…" }],
-      });
-      const msg = this.store.appendMessage({
-        conversationId,
-        role: "assistant",
-        text: finalText,
-        surface: turn.surface,
-        now: this.clock.now(),
-      });
-      for (const ref of refs) this.store.addDelivery(msg.id, ref.chat, ref.messageId);
+      if (turn.stopped) {
+        try {
+          await turn.draft.abort("stopped");
+        } catch {
+          // ignore
+        }
+      } else {
+        turn.phase = "finalizing";
+        const finalText = turn.generated || result.text;
+        const refs = await turn.draft.finalize({
+          blocks: [{ kind: "markdown", text: finalText || "…" }],
+        });
+        const msg = this.store.appendMessage({
+          conversationId,
+          role: "assistant",
+          text: finalText,
+          surface: turn.surface,
+          now: this.clock.now(),
+        });
+        for (const ref of refs) this.store.addDelivery(msg.id, ref.chat, ref.messageId);
+      }
     } catch (err) {
       turn.streaming = false;
-      this.logger.error("turn failed", { conversationId, err: String(err) });
-      try {
-        await turn.draft.abort(err instanceof Error ? err.message : "turn failed");
-      } catch {
-        // ignore
+      if (!turn.stopped) {
+        this.logger.error("turn failed", { conversationId, err: String(err) });
+        try {
+          await turn.draft.abort(err instanceof Error ? err.message : "turn failed");
+        } catch {
+          // ignore
+        }
       }
     }
 
@@ -675,6 +694,13 @@ export class SessionGateway {
   }
 
   private async handleStop(adapter: Adapter, chat: ChatRef, conversationId: string): Promise<void> {
+    const turn = this.active.get(conversationId);
+    if (turn) {
+      turn.stopped = true;
+      turn.streaming = false;
+    }
+    const dropped = this.followups.get(conversationId)?.length ?? 0;
+    this.followups.delete(conversationId);
     const session = this.agentSessions.get(conversationId);
     if (session) await this.driver.cancel(session).catch(() => undefined);
     for (const [id, waiter] of [...this.approvalWaiters.entries()]) {
@@ -682,24 +708,16 @@ export class SessionGateway {
       if (approval?.conversationId !== conversationId) continue;
       waiter.abort();
     }
-    const turn = this.active.get(conversationId);
     if (turn) {
-      turn.streaming = false;
       try {
         await turn.draft.abort("stopped");
       } catch {
         // ignore
       }
     }
-    await adapter.send(chat, { blocks: [{ kind: "markdown", text: "Stopped." }] });
-  }
-
-  private async notifyCodeBurned(personId: string): Promise<void> {
-    const surface = this.store.lastSurface(personId);
-    if (!surface) return;
-    const dest = this.adapterFor(surface);
-    if (!dest) return;
-    await dest.send(surface, { blocks: [{ kind: "markdown", text: CODE_BURNED }] }).catch(() => undefined);
+    const extra =
+      dropped > 0 ? ` Dropped ${dropped} queued message${dropped === 1 ? "" : "s"}.` : "";
+    await adapter.send(chat, { blocks: [{ kind: "markdown", text: `Stopped.${extra}` }] });
   }
 
   private async renderApproval(approval: PendingApproval, adapter: Adapter, chat: ChatRef): Promise<void> {

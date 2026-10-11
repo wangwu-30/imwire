@@ -11,10 +11,10 @@ import type {
 } from "./types.js";
 
 export const PAIR_ATTEMPT_LIMIT = 5;
-export const PAIR_CODE_ATTEMPT_LIMIT = 5;
 export const PAIR_WINDOW_MS = 10 * 60 * 1000;
 export const GROUP_NOTICE_WINDOW_MS = 24 * 60 * 60 * 1000;
 export const DEFAULT_LOG_WINDOW = 40;
+export const CALLBACK_TTL_MS = 24 * 60 * 60 * 1000;
 
 const SCHEMA = `
 PRAGMA foreign_keys = ON;
@@ -131,6 +131,7 @@ export class SessionStore {
     }
     this.db.exec(SCHEMA);
     this.migrate();
+    this.purgeCallbacks();
   }
 
   private migrate(): void {
@@ -276,24 +277,6 @@ export class SessionStore {
       .run(now, hashed, now);
     if (updated.changes !== 1) return undefined;
     return row.person_id;
-  }
-
-  /** Increment the per-code counter for a live hash. Burns only that row at the limit. */
-  recordCodeMiss(code: string, now: number): { burned: true; personId: string } | undefined {
-    const hashed = hashPairCode(code);
-    const row = this.db
-      .prepare<{ person_id: string; used_at: number | null; expires_at: number; attempts: number }>(
-        "SELECT person_id, used_at, expires_at, attempts FROM pairing WHERE code = ?",
-      )
-      .get(hashed);
-    if (!row || row.used_at !== null || row.expires_at <= now) return undefined;
-    const next = row.attempts + 1;
-    if (next >= PAIR_CODE_ATTEMPT_LIMIT) {
-      this.db.prepare("UPDATE pairing SET used_at = ?, attempts = ? WHERE code = ? AND used_at IS NULL").run(now, next, hashed);
-      return { burned: true, personId: row.person_id };
-    }
-    this.db.prepare("UPDATE pairing SET attempts = ? WHERE code = ?").run(next, hashed);
-    return undefined;
   }
 
   recordPairAttempt(sender: string, now: number, ok: boolean): void {
@@ -553,7 +536,12 @@ export class SessionStore {
       .map((r) => ({ platform: r.platform, accountId: r.account_id, userId: r.user_id, personId: r.person_id }));
   }
 
+  purgeCallbacks(now = Date.now(), ttlMs = CALLBACK_TTL_MS): void {
+    this.db.prepare("DELETE FROM telegram_callback WHERE updated_at < ?").run(now - ttlMs);
+  }
+
   getCallback(hash: string): { id: string; value?: string } | undefined {
+    this.purgeCallbacks();
     const row = this.db
       .prepare<{ action_id: string; value: string | null }>(
         "SELECT action_id, value FROM telegram_callback WHERE hash = ?",
@@ -564,6 +552,7 @@ export class SessionStore {
   }
 
   setCallback(hash: string, entry: { id: string; value?: string }, now = Date.now()): void {
+    this.purgeCallbacks(now);
     this.db
       .prepare("INSERT OR REPLACE INTO telegram_callback(hash, action_id, value, updated_at) VALUES (?, ?, ?, ?)")
       .run(hash, entry.id, entry.value ?? null, now);
