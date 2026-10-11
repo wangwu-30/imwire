@@ -2,7 +2,7 @@ import { FeishuAdapter } from "@imwire/feishu";
 import { TelegramAdapter } from "@imwire/telegram";
 import { PiAgentDriver, createFakePiProvider } from "@imwire/agent-pi";
 import { SessionGateway, type OwnerAllowlistEntry } from "@imwire/session";
-import type { Adapter } from "@imwire/core";
+import { onShutdownSignal, type Adapter } from "@imwire/core";
 
 function env(name: string): string | undefined {
   const value = process.env[name];
@@ -127,12 +127,10 @@ Set env vars (see .env.example):
   for (const adapter of adapters) gw.attach(adapter);
 
   const ac = new AbortController();
-  const stop = (): void => {
+  onShutdownSignal(() => {
     ac.abort();
     gw.close();
-  };
-  process.on("SIGINT", stop);
-  process.on("SIGTERM", stop);
+  });
   await Promise.all(adapters.map((a) => a.start(ac.signal)));
 }
 

@@ -58,3 +58,4 @@ export {
 } from "./draft.js";
 export { AdapterRuntime, assertChatPlatform, type AdapterRuntimeOptions } from "./runtime.js";
 export { inboundSchema, outboundSchema } from "./schema.js";
+export { onShutdownSignal, type ShutdownOptions } from "./shutdown.js";

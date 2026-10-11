@@ -3,7 +3,7 @@ import { FeishuAdapter } from "@imwire/feishu";
 import { SlackAdapter } from "@imwire/slack";
 import { TelegramAdapter } from "@imwire/telegram";
 import { WecomAdapter } from "@imwire/wecom";
-import type { Adapter, Inbound } from "@imwire/core";
+import { onShutdownSignal, type Adapter, type Inbound } from "@imwire/core";
 
 function env(name: string): string | undefined {
   const value = process.env[name];
@@ -185,9 +185,7 @@ You can enable any combination. They share the same handler.`);
   }
 
   const ac = new AbortController();
-  const stop = (): void => ac.abort();
-  process.on("SIGINT", stop);
-  process.on("SIGTERM", stop);
+  onShutdownSignal(() => ac.abort());
 
   await Promise.all(adapters.map((adapter) => adapter.start(ac.signal)));
 }

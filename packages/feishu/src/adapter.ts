@@ -46,6 +46,8 @@ export interface FeishuAdapterOptions {
   realtime?: FeishuRealtime;
   draftThrottleMs?: number;
   logger?: Logger;
+  /** WS liveness watchdog, seconds without inbound after a ping. Default 30; 0 disables. */
+  pingTimeoutSec?: number;
 }
 
 interface CreatedMessage {
@@ -94,6 +96,7 @@ export class FeishuAdapter implements Adapter, Connectable {
         appId: opts.appId,
         appSecret: opts.appSecret,
         domain: opts.domain,
+        pingTimeoutSec: opts.pingTimeoutSec,
       }));
     this.runtime = new AdapterRuntime({
       platform: this.platform,

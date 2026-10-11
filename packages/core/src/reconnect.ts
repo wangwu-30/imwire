@@ -86,10 +86,18 @@ export async function runReconnectSupervisor(
 
 async function abortableSleep(clock: Clock, ms: number, signal: AbortSignal): Promise<void> {
   if (signal.aborted || ms <= 0) return;
-  await Promise.race([
-    clock.sleep(ms),
-    new Promise<void>((resolve) => {
-      signal.addEventListener("abort", () => resolve(), { once: true });
-    }),
-  ]);
+  // Remove the abort listener afterwards: the supervisor polls isAlive() every
+  // 250 ms for the life of the process, so a leaked listener per sleep adds up.
+  let onAbort: (() => void) | undefined;
+  try {
+    await Promise.race([
+      clock.sleep(ms),
+      new Promise<void>((resolve) => {
+        onAbort = resolve;
+        signal.addEventListener("abort", onAbort, { once: true });
+      }),
+    ]);
+  } finally {
+    if (onAbort) signal.removeEventListener("abort", onAbort);
+  }
 }

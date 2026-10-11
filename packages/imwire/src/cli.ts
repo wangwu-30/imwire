@@ -1,3 +1,4 @@
+import { onShutdownSignal } from "@imwire/core";
 import { loadAdaptersFromEnv, parseAdapterList, type AdapterName } from "./env.js";
 import { stderrLogger } from "./logger.js";
 import { serveStdio } from "./stdio.js";
@@ -84,9 +85,7 @@ See docs/protocol.md.`);
   }
 
   const ac = new AbortController();
-  const stop = (): void => ac.abort();
-  process.on("SIGINT", stop);
-  process.on("SIGTERM", stop);
+  onShutdownSignal(() => ac.abort(), { log: (msg) => process.stderr.write(`imwire serve: ${msg}\n`) });
 
   const { host } = serveStdio(adapters, process.stdin, process.stdout, () => {
     process.stderr.write("imwire serve: stdin closed, exiting\n");
