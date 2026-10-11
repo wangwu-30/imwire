@@ -210,6 +210,8 @@ IMWIRE_PI_ALLOW_UNLISTED_MODEL=1   # 默认关。provider 必须认识；借用�
 
 打开后启动日志会打一行 `pi: <provider>/<id> is not in the built-in catalog; using <base>'s settings`。这类模型不强制关 thinking（有些预览模型会拒绝 `thinking.type=disabled`），由 provider 默认决定。模型 id 拼错时，报错会变成 provider 返回的 4xx，而不是 `Unknown model`。
 
+走真 pi 时，发给模型的每条用户消息前面会加来源标记（如 `[via Telegram] `、`[via Feishu] `），系统提示词（`IMWIRE_SYSTEM_PROMPT` 或默认值）后面会自动追加一段说明：这是同一个人跨多个 IM 的同一段对话。这样在飞书里问“我刚才在 Telegram 说了什么”，模型能按历史回答。数据库里存的原文不带标记。
+
 否则用内置 fake provider，回复会带 `(offline demo)`。
 
 ### 4.3 启动与验证
