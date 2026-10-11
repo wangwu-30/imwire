@@ -1,0 +1,24 @@
+{
+  "name": "@imwire/e2e",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "End-to-end tests against local HTTP/WS platform mocks.",
+  "license": "MIT",
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "@imwire/core": "workspace:*",
+    "@imwire/dingtalk": "workspace:*",
+    "@imwire/feishu": "workspace:*",
+    "@imwire/session": "workspace:*",
+    "@imwire/slack": "workspace:*",
+    "@imwire/telegram": "workspace:*",
+    "@imwire/wecom": "workspace:*",
+    "ws": "^8.18.3"
+  },
+  "devDependencies": {
+    "@types/ws": "^8.18.1"
+  }
+}

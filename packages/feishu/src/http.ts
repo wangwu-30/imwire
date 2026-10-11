@@ -36,6 +36,8 @@ export interface FeishuHttpOptions {
   appId: string;
   appSecret: string;
   domain?: "feishu" | "lark";
+  /** Override Open API host (tests / reverse proxies). Default: open.feishu.cn or open.larksuite.com. */
+  apiBase?: string;
   fetch?: FeishuFetch;
   now?: () => number;
 }
@@ -45,9 +47,14 @@ const HOSTS = {
   lark: "https://open.larksuite.com",
 } as const;
 
+function resolveApiBase(opts: FeishuHttpOptions): string {
+  const raw = opts.apiBase?.trim();
+  return (raw || HOSTS[opts.domain ?? "feishu"]).replace(/\/$/, "");
+}
+
 export function createFeishuHttp(opts: FeishuHttpOptions): FeishuHttp {
   const fetchFn = opts.fetch ?? fetch;
-  const base = HOSTS[opts.domain ?? "feishu"];
+  const base = resolveApiBase(opts);
   let token: { value: string; expiresAt: number } | undefined;
   const now = opts.now ?? Date.now;
 

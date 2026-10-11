@@ -6,6 +6,38 @@ L1 (`@imwire/core` + platform adapters) does not know about people or sessions a
 
 Packages are **ESM-only** (Node 20+). The npm name `imwire` is the `imwire serve` CLI (JSON-RPC over stdio / WebSocket). Import the SDK as `@imwire/core`. A thin PyPI client (`imwire`) talks to that process.
 
+Wiring a real bot to pi: follow [`INSTALL.md`](INSTALL.md) (credentials, env, verify, errors).
+
+## 30 秒看懂 imwire
+
+三层，从上到下互不倒依赖：L1 只说话，L2 认得「人」，L3 才是模型。
+
+```mermaid
+flowchart TB
+  subgraph L1["L1 · Adapter（@imwire/core + 各 IM）"]
+    direction LR
+    TG[Telegram]
+    FS[飞书]
+    DT[钉钉]
+    WC[企微]
+    SL[Slack]
+  end
+  subgraph L2["L2 · Session（@imwire/session）"]
+    Person["person + topics<br/>/pair · follow-the-user"]
+  end
+  subgraph L3["L3 · Agent（@imwire/agent-pi）"]
+    PI[pi driver]
+  end
+  TG --> Person
+  FS --> Person
+  DT --> Person
+  WC --> Person
+  SL --> Person
+  Person --> PI
+```
+
+和 OpenClaw 这类「一个 IM 频道一段会话」的模型不同：imwire **不强制**把 Telegram / 飞书 / 钉钉拆成互不相干的 context。`/pair` 把同一人的多个账号链到一个 person 上，默认话题和 `/topic name` 在所有已绑定 IM 上共享；群聊仍然隔离。L1 可以单独引用，不依赖 L2/L3。
+
 ## Quickstart
 
 ```bash
@@ -21,7 +53,7 @@ The echo script is `node --env-file=../../.env dist/index.js` (Node ≥ 20.6). C
 The echo example starts every adapter you configured, prints normalized inbound events, streams the reply back, and attaches Approve / Deny buttons. The assistant example wires Telegram + Feishu through `@imwire/session` and `@imwire/agent-pi` (env-config only):
 
 ```bash
-# same .env; add IMWIRE_ALLOWLIST=telegram:telegram:<your user id>,Owner
+# same .env; TELEGRAM_ACCOUNT_ID=mybot and IMWIRE_ALLOWLIST=telegram:mybot:<your user id>,Owner
 pnpm --filter @imwire/example-assistant start
 ```
 
@@ -121,7 +153,7 @@ Replies go to the IM that triggered the turn. Proactive messages go to the perso
 
 ## 中文
 
-imwire 是给 agent 用的独立 IM SDK：一套 Adapter 接口接飞书 / 钉钉 / 企微 / Telegram / Slack，默认长连接，不需要公网 IP。面向 agent 的能力（流式回复、审批按钮、配对）是一等公民。L2 `@imwire/session` 让一个人在所有 IM 上共享一段对话；IM 层不依赖它，可以单独引用。`/pair` 出 8 位码，在新 IM 发给 bot 即完成绑定。群聊单独成会话，不会并进个人对话。中途换 IM 时，原侧草稿会标「continued in …」，已生成的文字在新侧续上。
+imwire 是给 agent 用的独立 IM SDK：一套 Adapter 接口接飞书 / 钉钉 / 企微 / Telegram / Slack，默认长连接，不需要公网 IP。面向 agent 的能力（流式回复、审批按钮、配对）是一等公民。L2 `@imwire/session` 让一个人在所有 IM 上共享一段对话；IM 层不依赖它，可以单独引用。`/pair` 出 8 位码，在新 IM 发给 bot 即完成绑定。群聊单独成会话，不会并进个人对话。中途换 IM 时，原侧草稿会标「continued in …」，已生成的文字在新侧续上。和 OpenClaw 的差别见上文「30 秒看懂 imwire」：会话按人合并，而不是按 IM 强制拆开。把机器人接到 pi 的逐步说明在 [`INSTALL.md`](INSTALL.md)。
 
 核心包名是 `@imwire/core`。`imwire` 是 CLI（`imwire serve`，JSON-RPC，见 `docs/protocol.md`）；PyPI 上也有同名的薄客户端。包是 ESM-only。
 
@@ -150,4 +182,6 @@ CI (GitHub Actions) runs the same three commands on Node 20 and Node 22. Adapter
 ```bash
 # acceptance demo (fake adapters): ask on TG, switch to Feishu mid-stream, approve on Feishu
 pnpm exec vitest run packages/session/tests/demo.test.ts
+# e2e against local HTTP/WS platform mocks (pairing, cross-IM context, approvals, streaming)
+pnpm exec vitest run packages/e2e/tests
 ```
