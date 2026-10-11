@@ -22,6 +22,12 @@ export interface PiAgentDriverOptions {
   models?: Models;
   contextChars?: number;
   tools?: AgentTool[];
+  /**
+   * Accept a model id that pi's catalog doesn't list yet (new or preview
+   * releases) by borrowing a sibling model's settings from the same provider.
+   * Default: `IMWIRE_PI_ALLOW_UNLISTED_MODEL=1`.
+   */
+  allowUnlistedModel?: boolean;
 }
 
 type LiveAgent = {
@@ -45,6 +51,7 @@ export class PiAgentDriver implements AgentDriver {
   private readonly models?: Models;
   private readonly contextChars: number;
   private readonly tools: AgentTool[];
+  private readonly allowUnlistedModel: boolean;
   private readonly agents = new Map<string, LiveAgent>();
   private readonly snaps = new Map<string, ConversationSnapshot>();
   private readonly legacy = new Map<string, Array<{ role: string; content: string }>>();
@@ -59,6 +66,7 @@ export class PiAgentDriver implements AgentDriver {
     this.models = opts.models;
     this.contextChars = opts.contextChars ?? 32_000;
     this.tools = opts.tools ?? [];
+    this.allowUnlistedModel = opts.allowUnlistedModel ?? process.env.IMWIRE_PI_ALLOW_UNLISTED_MODEL === "1";
     if (!this.usePi) this.source = opts.source ?? createFakePiProvider([{ type: "text", delta: "…" }]);
   }
 
@@ -107,9 +115,11 @@ export class PiAgentDriver implements AgentDriver {
       return existing;
     }
     const models = this.models ?? (await loadModels());
-    const model = models.getModel(this.modelProvider, this.modelId);
+    const model = resolveModel(models, this.modelProvider, this.modelId, {
+      allowUnlisted: this.allowUnlistedModel,
+    });
     if (!model) {
-      throw new Error(`Unknown model ${this.modelProvider}/${this.modelId}. Set IMWIRE_PI_PROVIDER / IMWIRE_PI_MODEL.`);
+      throw new Error(`Unknown model ${this.modelProvider}/${this.modelId}. Set IMWIRE_PI_PROVIDER / IMWIRE_PI_MODEL (or IMWIRE_PI_ALLOW_UNLISTED_MODEL=1 for ids newer than pi's catalog).`);
     }
     const messages = snapshotToPi(conv, {
       systemPrompt: this.systemPrompt,
@@ -272,6 +282,33 @@ function abortDecision(signal?: AbortSignal): Promise<ApprovalDecision> {
     }
     signal.addEventListener("abort", () => resolve("deny"), { once: true });
   });
+}
+
+/**
+ * Look up a model; if the provider is known but this id isn't in pi's catalog yet
+ * (new or preview releases), reuse a sibling model's transport config under the
+ * requested id so the provider's API decides whether the id is valid.
+ * Off by default: an unknown id is usually a typo, which should surface as an error.
+ */
+export function resolveModel(
+  models: Pick<Models, "getModel"> & { getModels?: (provider: never) => readonly unknown[] },
+  provider: string,
+  id: string,
+  opts: { allowUnlisted?: boolean; warn?: (msg: string) => void } = {},
+): Model<Api> | undefined {
+  const exact = models.getModel(provider as never, id as never) as Model<Api> | undefined;
+  if (exact) return exact;
+  if (!opts.allowUnlisted) return undefined;
+  const siblings = (models.getModels?.(provider as never) ?? []) as Model<Api>[];
+  const base = siblings[0];
+  if (!base) return undefined;
+  (opts.warn ?? console.warn)(
+    `pi: ${provider}/${id} is not in the built-in catalog; using ${base.id}'s settings with id ${id}`,
+  );
+  // Don't force thinking off on a model we know nothing about: some (e.g. MiniMax
+  // M3.1 previews) reject thinking.type="disabled". Omitting it uses the provider default.
+  const thinkingLevelMap = { ...(base as { thinkingLevelMap?: Record<string, unknown> }).thinkingLevelMap, off: null };
+  return { ...base, id, name: id, thinkingLevelMap } as Model<Api>;
 }
 
 async function loadModels(): Promise<Models> {

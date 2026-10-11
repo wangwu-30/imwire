@@ -17,7 +17,7 @@
 ## 1. 机器准备
 
 ```bash
-# Node >= 20（assistant 的 SQLite：Node 20 需要能编译 better-sqlite3，或装预编译包；Node 22+ 可用 node:sqlite）
+# Node >= 20（assistant 的 SQLite：Node 20 需要能编译 better-sqlite3，或装预编译包；Node 22+ 可用 node:sqlite。better-sqlite3 是可选依赖，装不上不会让 pnpm install 失败）
 pnpm install
 pnpm build
 cp .env.example .env
@@ -201,6 +201,14 @@ IMWIRE_PI_MODEL=gpt-4o-mini
 OPENAI_API_KEY=sk-...
 # 或 ANTHROPIC_API_KEY=
 ```
+
+`IMWIRE_PI_MODEL` 必须在 pi 内置模型清单里，否则回复 `Unknown model …`。新发布或预览版模型（例如 `minimax-cn` 的 `MiniMax-M3.1-Flash-Preview`）还没进清单时，可以打开：
+
+```bash
+IMWIRE_PI_ALLOW_UNLISTED_MODEL=1   # 默认关。provider 必须认识；借用同 provider 第一个模型的接口配置，只把模型 id 换掉
+```
+
+打开后启动日志会打一行 `pi: <provider>/<id> is not in the built-in catalog; using <base>'s settings`。这类模型不强制关 thinking（有些预览模型会拒绝 `thinking.type=disabled`），由 provider 默认决定。模型 id 拼错时，报错会变成 provider 返回的 4xx，而不是 `Unknown model`。
 
 否则用内置 fake provider，回复会带 `(offline demo)`。
 
