@@ -170,6 +170,9 @@ describe("e2e streaming + chunking + rate limit against platform mocks", () => {
       for (const chunk of streamed) {
         expect(Buffer.byteLength(chunk, "utf8")).toBeLessThanOrEqual(DINGTALK_STREAM_CONTENT_LIMIT);
       }
+      const { contents, lastButtonIds } = mock.delivered();
+      expect(contents.join("").replace(/[^D]/g, "").length).toBeGreaterThanOrEqual(2400);
+      expect(lastButtonIds).toEqual(["approve", "deny"]);
       expect(mock.requests.some((r) => r.path === "/v1.0/card/instances/createAndDeliver")).toBe(true);
     } finally {
       await mock.close();

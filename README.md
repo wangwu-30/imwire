@@ -53,7 +53,7 @@ The echo script is `node --env-file=../../.env dist/index.js` (Node ≥ 20.6). C
 The echo example starts every adapter you configured, prints normalized inbound events, streams the reply back, and attaches Approve / Deny buttons. The assistant example wires Telegram + Feishu through `@imwire/session` and `@imwire/agent-pi` (env-config only):
 
 ```bash
-# same .env; add IMWIRE_ALLOWLIST=telegram:telegram:<your user id>,Owner
+# same .env; TELEGRAM_ACCOUNT_ID=mybot and IMWIRE_ALLOWLIST=telegram:mybot:<your user id>,Owner
 pnpm --filter @imwire/example-assistant start
 ```
 

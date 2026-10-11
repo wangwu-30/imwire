@@ -7,7 +7,7 @@ import type { DraftHandle } from "@imwire/core";
 import { SessionGateway } from "../src/gateway.js";
 import { ScriptedDriver } from "../src/scripted-driver.js";
 import type { AgentDriver, ConversationSnapshot, TurnSink, UserTurn } from "../src/types.js";
-import { action, cmd, dm, extractPairCode, fakeAdapter, groupMsg, lastApprovalId, markdownCalls, openGateway, waitFor } from "./helpers.js";
+import { action, cmd, dm, extractPairCode, fakeAdapter, groupMsg, lastApprovalId, markdownCalls, openGateway, owner, waitFor } from "./helpers.js";
 
 const tick = () => new Promise((r) => setTimeout(r, 10));
 
@@ -93,6 +93,51 @@ describe("ADV approvals", () => {
     await tg.ingest(action({ platform: "telegram", userId: "ada", chatId: "g1", actionId: "deny", value: id }));
     await gw.waitForIdle();
     expect(gw.store.getApproval(id)!.state).toBe("denied");
+    gw.close();
+  });
+
+  it("A2b: a second linked person cannot approve another's tool call; owner can from a merged IM", async () => {
+    const driver = new ScriptedDriver(async (sink) => {
+      const d = await sink.requestApproval({
+        toolCallId: "rm",
+        title: "deploy production?",
+        options: ["approve", "deny"],
+      });
+      sink.text(`decision=${d}`);
+    });
+    const { gw, tg, fs } = openGateway({
+      driver,
+      allowlist: [owner("telegram", "ada"), owner("telegram", "bob")],
+    });
+    await tg.ingest(dm({ platform: "telegram", userId: "ada", text: "hello" }));
+    await tg.ingest(cmd({ platform: "telegram", userId: "ada", name: "pair" }));
+    const adaCode = extractPairCode(...markdownCalls(tg).filter((t) => t.includes("Pairing code")))!;
+    await fs.ingest(dm({ platform: "feishu", userId: "ou_ada", text: adaCode }));
+
+    await tg.ingest(dm({ platform: "telegram", userId: "bob", text: "hello" }));
+    await tg.ingest(cmd({ platform: "telegram", userId: "bob", name: "pair" }));
+    const bobCode = extractPairCode(...markdownCalls(tg).filter((t) => t.includes("Pairing code")))!;
+    await fs.ingest(dm({ platform: "feishu", userId: "ou_bob", text: bobCode }));
+
+    expect(gw.store.findIdentity("telegram", "bot", "bob")?.personId).toBeTruthy();
+    expect(gw.store.findIdentity("telegram", "bot", "bob")?.personId).not.toBe(
+      gw.store.findIdentity("telegram", "bot", "ada")?.personId,
+    );
+    expect(gw.store.findIdentity("feishu", "bot", "ou_ada")?.personId).toBe(
+      gw.store.findIdentity("telegram", "bot", "ada")?.personId,
+    );
+
+    await tg.ingest(dm({ platform: "telegram", userId: "ada", text: "deploy" }));
+    await waitFor(() => Boolean(lastApprovalId(tg)));
+    const id = lastApprovalId(tg)!;
+    expect(gw.store.getApproval(id)!.state).toBe("pending");
+
+    await tg.ingest(action({ platform: "telegram", userId: "bob", actionId: "approve", value: id }));
+    expect(gw.store.getApproval(id)!.state).toBe("pending");
+
+    await fs.ingest(action({ platform: "feishu", userId: "ou_ada", actionId: "approve", value: id }));
+    await gw.waitForIdle();
+    expect(gw.store.getApproval(id)!.state).toBe("approved");
     gw.close();
   });
 

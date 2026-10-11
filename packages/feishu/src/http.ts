@@ -47,9 +47,14 @@ const HOSTS = {
   lark: "https://open.larksuite.com",
 } as const;
 
+function resolveApiBase(opts: FeishuHttpOptions): string {
+  const raw = opts.apiBase?.trim();
+  return (raw || HOSTS[opts.domain ?? "feishu"]).replace(/\/$/, "");
+}
+
 export function createFeishuHttp(opts: FeishuHttpOptions): FeishuHttp {
   const fetchFn = opts.fetch ?? fetch;
-  const base = (opts.apiBase ?? HOSTS[opts.domain ?? "feishu"]).replace(/\/$/, "");
+  const base = resolveApiBase(opts);
   let token: { value: string; expiresAt: number } | undefined;
   const now = opts.now ?? Date.now;
 

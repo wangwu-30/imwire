@@ -9,6 +9,7 @@ export interface TelegramMock extends JsonServer {
 
 export async function startTelegramMock(token = "TEST:token"): Promise<TelegramMock> {
   let seq = 0;
+  const releaseUpdates: Array<() => void> = [];
   const server = await listenJson((req, res) => {
     const method = telegramMethod(req.path, token);
     if (method === "getMe") {
@@ -43,8 +44,13 @@ export async function startTelegramMock(token = "TEST:token"): Promise<TelegramM
       return;
     }
     if (method === "getUpdates") {
-      sendJson(res, { ok: true, result: [] });
-      return;
+      // Hang until close() so adapter.start() can call getMe without busy-looping.
+      return new Promise<void>((resolve) => {
+        releaseUpdates.push(() => {
+          if (!res.writableEnded) sendJson(res, { ok: true, result: [] });
+          resolve();
+        });
+      });
     }
     sendJson(res, { ok: true, result: {} });
   });
@@ -59,6 +65,10 @@ export async function startTelegramMock(token = "TEST:token"): Promise<TelegramM
       if (!data) return undefined;
       const idx = data.indexOf(":");
       return idx === -1 ? undefined : data.slice(idx + 1);
+    },
+    close: async () => {
+      for (const release of releaseUpdates.splice(0)) release();
+      await server.close();
     },
   };
 }

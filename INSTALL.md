@@ -45,9 +45,13 @@ node --env-file=../../.env dist/index.js
 
 ```bash
 TELEGRAM_BOT_TOKEN=123456:ABC...
-# 可选。不设时 accountId 先是 "telegram"，adapter.start() 里 getMe 成功后改成 bot 数字 id
-# TELEGRAM_ACCOUNT_ID=
+# 推荐显式设一个稳定 id。assistant 的 allowlist 必须写同一个值。
+TELEGRAM_ACCOUNT_ID=mybot
 ```
+
+不设、或设成 `telegram` 时，`adapter.start()` 里 `getMe` 成功后会把 `accountId` 改成 **bot 数字 id**（等于 token 冒号前那串，也等于 `getMe.id`）。已经设成别的值（例如 `mybot`）时 **不会**改。
+
+群里使用时注意 privacy mode：在 [@BotFather](https://t.me/BotFather) 对这个 bot 发 `/setprivacy`。默认开启时 bot 只能看到命令、@mention 和回复它的消息。
 
 echo / assistant **另外**接受 `IMWIRE_TELEGRAM_BOT_TOKEN`（与 `TELEGRAM_BOT_TOKEN` 二选一）。`imwire serve` **只认** `TELEGRAM_BOT_TOKEN`。
 
@@ -56,9 +60,10 @@ echo / assistant **另外**接受 `IMWIRE_TELEGRAM_BOT_TOKEN`（与 `TELEGRAM_BO
 ### 飞书 / Lark（官方 SDK WebSocket 长连接）
 
 1. [飞书开放平台](https://open.feishu.cn/app) 或 [Lark](https://open.larksuite.com/app) 创建企业自建应用。
-2. 打开「机器人」能力；订阅 `im.message.receive_v1`、`card.action.trigger`（以及你要用的 reaction 事件）。
-3. 拿到 App ID / App Secret。长连接不需要公网回调 URL。
-4. 写入 `.env`：
+2. 打开「机器人」能力；在权限管理里开通官方 scope：`im:message`、`im:message:send_as_bot`。
+3. 订阅事件 `im.message.receive_v1`、`card.action.trigger`（以及你要用的 reaction 事件）。
+4. 拿到 App ID / App Secret。长连接不需要公网回调 URL。
+5. 写入 `.env`：
 
 ```bash
 FEISHU_APP_ID=cli_xxx
@@ -88,7 +93,7 @@ DINGTALK_CLIENT_SECRET=  # 别名 DINGTALK_APP_SECRET
 
 ### 企业微信智能机器人（本仓库**没有**在真实企业上跑过）
 
-1. 在[企业微信开发者文档 · 智能机器人](https://developer.work.weixin.qq.com/document/path/101463) 创建机器人，拿到 bot id / secret。
+1. 在[企业微信开发者文档 · 智能机器人](https://developer.work.weixin.qq.com/document/path/101463) 创建机器人。必须先开启 **API 模式** 并选择 **长连接**，才能拿到 Secret。
 2. 写入 `.env`：
 
 ```bash
@@ -105,8 +110,9 @@ WECOM_SECRET=          # 别名 WECOM_AIBOT_SECRET
 ### Slack Socket Mode（本仓库**没有**在真实 workspace 上跑过）
 
 1. [Slack API](https://api.slack.com/apps) 创建应用。打开 Socket Mode。
-2. Bot Token（`xoxb-`）+ App-level Token（`xapp-`，scope 含 `connections:write`）。
-3. 写入 `.env`：
+2. Bot Token（`xoxb-`）需要 bot 权限 `chat:write`、`im:history`；并在 Event Subscriptions 订阅消息事件。
+3. App-level Token（`xapp-`，scope 含 `connections:write`）。
+4. 写入 `.env`：
 
 ```bash
 SLACK_BOT_TOKEN=xoxb-...
@@ -150,21 +156,27 @@ assistant **只接 Telegram 和飞书**（`examples/assistant/src/index.ts`）�
 
 ```bash
 TELEGRAM_BOT_TOKEN=123456:ABC...
+TELEGRAM_ACCOUNT_ID=mybot
 # 和/或
 FEISHU_APP_ID=cli_xxx
 FEISHU_APP_SECRET=xxx
 
-# accountId 必须和 adapter 一致：
-#   Telegram 默认 "telegram"（或你设的 TELEGRAM_ACCOUNT_ID；start 之后若仍是 "telegram" 会变成 getMe 的 bot id）
+# accountId 必须和 adapter 运行时的值完全一致（gateway 三段全等）：
+#   推荐：TELEGRAM_ACCOUNT_ID=mybot，allowlist 写 telegram:mybot:<uid>
+#   另一种：不设 TELEGRAM_ACCOUNT_ID（或设成 telegram）。start()/getMe 后
+#   accountId 变成 bot 数字 id，allowlist 写 telegram:<botId>:<uid>。
+#   botId 就是 token 冒号前那串数字（也等于 getMe 的 id）。
 #   飞书默认等于 FEISHU_APP_ID
 # 格式：platform:accountId:userId 或 platform:accountId:userId,Name
 # 分隔符：逗号 / 分号 / 换行。下一项若不含冒号，当作 Name。
-IMWIRE_ALLOWLIST=telegram:telegram:111111111,Owner
+IMWIRE_ALLOWLIST=telegram:mybot:111111111,Owner
 
 # 可选
 # IMWIRE_DB=./imwire.sqlite
 # IMWIRE_SYSTEM_PROMPT=You are a helpful assistant.
 ```
+
+不要写 `IMWIRE_ALLOWLIST=telegram:telegram:111111111,Owner`。真实 Telegram 上 `start()` 会把 `"telegram"` 改成 bot 数字 id，三段对不上，主人会一直收到 `This bot is private…`。
 
 Telegram 的 user id 必须是 Bot API 里的数字 id（`from.id`），不是 @username。飞书是 `open_id`。
 
@@ -279,7 +291,7 @@ imwire serve --adapter telegram --ws
 - 不要给 `imwire serve` 只塞 token、不写 `IMWIRE_ADAPTERS` / `--adapter`。
 - 不要假设 echo 的 `IMWIRE_TELEGRAM_BOT_TOKEN` 对 serve 生效。
 - 不要假设 assistant 会启动钉钉 / 企微 / Slack。
-- 不要把 allowlist 的 `accountId` 写成平台名以外的值，却又让 Telegram `getMe` 把 `accountId` 改成 bot id——两边对不上就永远匹配不到 owner。需要稳定 id 时，显式设 `TELEGRAM_ACCOUNT_ID`，allowlist 用同一个值。
+- 不要把 allowlist 写成 `telegram:telegram:<uid>`。`TELEGRAM_ACCOUNT_ID` 不设或等于 `telegram` 时，`start()` 里 `getMe` 会把适配器的 `accountId` 改成 bot 数字 id，三段对不上就永远匹配不到主人。推荐 `TELEGRAM_ACCOUNT_ID=mybot` + `telegram:mybot:<uid>`；或者 allowlist 用 token 冒号前那串数字作 accountId。
 - 不要在飞书卡片里用 `tag:action` 或 `wide_screen_mode`（本仓库的卡片构造器也不会这么发）。
 
 ## 9. 做完怎么自检（给 agent 的验收清单）

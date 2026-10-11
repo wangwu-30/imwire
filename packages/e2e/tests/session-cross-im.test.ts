@@ -1,17 +1,76 @@
 import { describe, expect, it } from "vitest";
-import { ScriptedDriver } from "@imwire/session";
+import { FeishuAdapter } from "@imwire/feishu";
+import { SessionGateway, ScriptedDriver } from "@imwire/session";
+import { TelegramAdapter } from "@imwire/telegram";
 import {
   bootstrapAndPair,
   extractPairCode,
   fsAction,
   fsMessage,
+  noopRealtime,
   openPlatformSession,
   tgCallback,
   tgMessage,
   waitFor,
 } from "./helpers.js";
+import { startFeishuMock } from "./mocks/feishu.js";
+import { startTelegramMock } from "./mocks/telegram.js";
 
 describe("e2e session against local Telegram HTTP + Feishu HTTP mocks", () => {
+  it("after start()/getMe, TELEGRAM_ACCOUNT_ID=mybot matches telegram:mybot:<uid>", async () => {
+    const tgMock = await startTelegramMock();
+    const fsMock = await startFeishuMock();
+    const gw = new SessionGateway({
+      dbPath: ":memory:",
+      driver: new ScriptedDriver(),
+      allowlist: [{ platform: "telegram", accountId: "mybot", userId: "111", name: "Owner" }],
+    });
+    const tg = new TelegramAdapter({
+      token: tgMock.token,
+      accountId: "mybot",
+      baseUrl: tgMock.url,
+      draftThrottleMs: 0,
+      pollTimeoutSec: 1,
+    });
+    const fs = new FeishuAdapter({
+      appId: "cli_e2e",
+      appSecret: "secret",
+      accountId: "cli_e2e",
+      apiBase: fsMock.url,
+      realtime: noopRealtime(),
+      draftThrottleMs: 0,
+    });
+    gw.attach(tg);
+    gw.attach(fs);
+    const ac = new AbortController();
+    const started = tg.start(ac.signal);
+    try {
+      await waitFor(() => tgMock.requests.some((r) => r.path.endsWith("/getMe")));
+      expect(tg.accountId).toBe("mybot");
+
+      await tg.ingest(tgMessage({ text: "hello" }));
+      await waitFor(() => tgMock.texts().some((t) => /Welcome/.test(t)));
+      expect(tgMock.texts().join(" ")).toMatch(/Welcome/);
+      expect(tgMock.texts().join(" ")).not.toMatch(/private/i);
+      expect(gw.store.findIdentity("telegram", "mybot", "111")?.personId).toBeTruthy();
+
+      await tg.ingest(tgMessage({ text: "/pair" }));
+      await waitFor(() => Boolean(extractPairCode(...tgMock.texts())));
+      const code = extractPairCode(...tgMock.texts());
+      expect(code).toHaveLength(8);
+      await fs.ingest(fsMessage({ text: code ?? "" }));
+      await waitFor(() => fsMock.texts().some((t) => /Linked/.test(t)));
+      expect(gw.store.findIdentity("feishu", "cli_e2e", "ou_ada")?.personId).toBe(
+        gw.store.findIdentity("telegram", "mybot", "111")?.personId,
+      );
+    } finally {
+      ac.abort();
+      await started;
+      gw.close();
+      await Promise.all([tgMock.close(), fsMock.close()]);
+    }
+  });
+
   it("pairs Telegram to Feishu with an 8-digit code", async () => {
     const { gw, tg, fs, tgMock, fsMock, close } = await openPlatformSession();
     try {
