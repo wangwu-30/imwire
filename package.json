@@ -12,10 +12,11 @@
     "lint": "eslint .",
     "test": "vitest run",
     "test:watch": "vitest",
-    "example:echo": "pnpm --filter @imwire/example-echo start"
+    "example:echo": "pnpm --filter @imwire/example-echo start",
+    "example:assistant": "pnpm --filter @imwire/example-assistant start"
   },
   "pnpm": {
-    "onlyBuiltDependencies": ["esbuild", "protobufjs"]
+    "onlyBuiltDependencies": ["esbuild", "protobufjs", "better-sqlite3"]
   },
   "devDependencies": {
     "@eslint/js": "^9.36.0",

@@ -9,23 +9,36 @@ export interface CallbackEntry {
   value?: string;
 }
 
+export interface CallbackPersist {
+  get(key: string): CallbackEntry | undefined;
+  set(key: string, value: CallbackEntry): void;
+}
+
 /**
- * Bounded LRU for Telegram callback_data hashes.
- * After a process restart the table is empty: inbound `h:<hash>` clicks
- * cannot be resolved and arrive as `actionId: "h:<hash>"` with no value.
+ * Bounded in-memory LRU for Telegram callback_data hashes.
+ * Optional `persist` (typically SQLite via the session store) survives restarts
+ * so inbound `h:<hash>` clicks still resolve to the original id/value.
  */
 export class BoundedLru<V> {
   private readonly map = new Map<string, V>();
 
-  constructor(readonly max: number) {}
+  constructor(
+    readonly max: number,
+    private readonly persist?: { get(key: string): V | undefined; set(key: string, value: V): void },
+  ) {}
 
   get size(): number {
     return this.map.size;
   }
 
   get(key: string): V | undefined {
-    const value = this.map.get(key);
-    if (value === undefined) return undefined;
+    let value = this.map.get(key);
+    if (value === undefined && this.persist) {
+      value = this.persist.get(key);
+      if (value === undefined) return undefined;
+    } else if (value === undefined) {
+      return undefined;
+    }
     this.map.delete(key);
     this.map.set(key, value);
     return value;
@@ -34,6 +47,7 @@ export class BoundedLru<V> {
   set(key: string, value: V): void {
     if (this.map.has(key)) this.map.delete(key);
     this.map.set(key, value);
+    this.persist?.set(key, value);
     while (this.map.size > this.max) {
       const oldest = this.map.keys().next().value;
       if (oldest === undefined) break;
@@ -42,8 +56,11 @@ export class BoundedLru<V> {
   }
 }
 
-export function createCallbackTable(max = CALLBACK_TABLE_LIMIT): BoundedLru<CallbackEntry> {
-  return new BoundedLru(max);
+export function createCallbackTable(
+  max = CALLBACK_TABLE_LIMIT,
+  persist?: CallbackPersist,
+): BoundedLru<CallbackEntry> {
+  return new BoundedLru(max, persist);
 }
 
 export function encodeCallbackData(

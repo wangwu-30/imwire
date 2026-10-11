@@ -18,7 +18,7 @@ import {
   type OutMessage,
 } from "@imwire/core";
 import { TelegramApi, type TelegramFetch, type TelegramMessage, type TelegramUser } from "./api.js";
-import { createCallbackTable, decodeCallbackData, inlineKeyboard } from "./buttons.js";
+import { createCallbackTable, decodeCallbackData, inlineKeyboard, type CallbackPersist } from "./buttons.js";
 import { telegramCapabilities } from "./capabilities.js";
 import { mapTelegramUpdate } from "./map.js";
 import { asNumber, asRecord, asString } from "./util.js";
@@ -33,6 +33,8 @@ export interface TelegramAdapterOptions {
   logger?: Logger;
   /** Test hook: skip getMe / polling and only use ingest(). */
   api?: TelegramApi;
+  /** Durable store for hashed callback_data (SQLite via session). Survives restarts. */
+  callbackStore?: CallbackPersist;
 }
 
 const ALLOWED_UPDATES = ["message", "edited_message", "callback_query", "message_reaction"];
@@ -49,12 +51,13 @@ export class TelegramAdapter implements Adapter, Connectable {
   private botUsername?: string;
   private offset = 0;
   private alive = false;
-  private readonly callbackTable = createCallbackTable();
+  private readonly callbackTable: ReturnType<typeof createCallbackTable>;
   private webhookCleared = false;
 
   constructor(opts: TelegramAdapterOptions) {
     this.accountId = opts.accountId ?? "telegram";
     this.api = opts.api ?? new TelegramApi({ token: opts.token, fetch: opts.fetch, baseUrl: opts.baseUrl });
+    this.callbackTable = createCallbackTable(undefined, opts.callbackStore);
     this.pollTimeoutSec = opts.pollTimeoutSec ?? 30;
     this.draftThrottleMs = opts.draftThrottleMs ?? 800;
     this.runtime = new AdapterRuntime({

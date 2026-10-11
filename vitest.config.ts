@@ -29,6 +29,14 @@ export default defineConfig({
         find: /^@imwire\/feishu$/,
         replacement: `${root}packages/feishu/src/index.ts`,
       },
+      {
+        find: /^@imwire\/session$/,
+        replacement: `${root}packages/session/src/index.ts`,
+      },
+      {
+        find: /^@imwire\/agent-pi$/,
+        replacement: `${root}packages/agent-pi/src/index.ts`,
+      },
     ],
   },
 });

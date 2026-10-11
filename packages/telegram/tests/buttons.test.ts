@@ -43,4 +43,20 @@ describe("telegram callback_data", () => {
       actionId: "h:deadbeefdeadbeef",
     });
   });
+
+  it("resolves hashed callbacks after a restart when persist (SQLite) is wired", () => {
+    const durable = new Map<string, { id: string; value?: string }>();
+    const persist = {
+      get: (k: string) => durable.get(k),
+      set: (k: string, v: { id: string; value?: string }) => {
+        durable.set(k, v);
+      },
+    };
+    const first = createCallbackTable(2, persist);
+    const id = "审批通过请确认这是一个很长的按钮标识需要超过六十四字节";
+    const data = encodeCallbackData({ id, label: "OK", value: "call_99" }, first);
+    expect(data.startsWith("h:")).toBe(true);
+    const restarted = createCallbackTable(2, persist);
+    expect(decodeCallbackData(data, restarted)).toEqual({ actionId: id, value: "call_99" });
+  });
 });
