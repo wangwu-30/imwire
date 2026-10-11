@@ -15,6 +15,8 @@ function summarize(event: Inbound): unknown {
   return rest;
 }
 
+const handledActions = new Set<string>();
+
 async function handle(adapter: Adapter, event: Inbound): Promise<void> {
   console.log(
     JSON.stringify(
@@ -26,9 +28,14 @@ async function handle(adapter: Adapter, event: Inbound): Promise<void> {
 
   if (event.type === "action") {
     const verdict = event.actionId === "approve" ? "Approved." : `Recorded: ${event.actionId}`;
-    await adapter.send(event.target.chat, {
-      blocks: [{ kind: "markdown", text: verdict }],
-    });
+    // Replace the card so its buttons disappear and a second click has nothing to hit.
+    if (handledActions.has(event.target.messageId)) return;
+    handledActions.add(event.target.messageId);
+    try {
+      await adapter.edit(event.target, { blocks: [{ kind: "markdown", text: `_handled: ${verdict}_` }] });
+    } catch {
+      await adapter.send(event.target.chat, { blocks: [{ kind: "markdown", text: verdict }] });
+    }
     return;
   }
 
