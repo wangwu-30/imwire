@@ -1,0 +1,18 @@
+{
+  "update_id": 1002,
+  "edited_message": {
+    "message_id": 42,
+    "from": {
+      "id": 111,
+      "is_bot": false,
+      "first_name": "Ada"
+    },
+    "chat": {
+      "id": 111,
+      "type": "private"
+    },
+    "date": 1710000000,
+    "edit_date": 1710000060,
+    "text": "hello, edited"
+  }
+}

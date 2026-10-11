@@ -1,0 +1,152 @@
+{
+  "$id": "https://imwire.dev/schema/inbound.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Inbound",
+  "description": "Normalized inbound IM event. TypeScript types in @imwire/core are the source of truth; this schema is the wire copy for later imwire serve / Python clients.",
+  "oneOf": [
+    { "$ref": "#/$defs/message" },
+    { "$ref": "#/$defs/edit" },
+    { "$ref": "#/$defs/reaction" },
+    { "$ref": "#/$defs/action" },
+    { "$ref": "#/$defs/command" }
+  ],
+  "$defs": {
+    "platform": { "type": "string", "minLength": 1 },
+    "chatRef": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["platform", "accountId", "chatId", "kind"],
+      "properties": {
+        "platform": { "$ref": "#/$defs/platform" },
+        "accountId": { "type": "string" },
+        "chatId": { "type": "string" },
+        "kind": { "enum": ["dm", "group"] },
+        "threadId": { "type": "string" }
+      }
+    },
+    "userRef": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["platform", "accountId", "userId"],
+      "properties": {
+        "platform": { "$ref": "#/$defs/platform" },
+        "accountId": { "type": "string" },
+        "userId": { "type": "string" },
+        "displayName": { "type": "string" }
+      }
+    },
+    "msgRef": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["chat", "messageId"],
+      "properties": {
+        "chat": { "$ref": "#/$defs/chatRef" },
+        "messageId": { "type": "string" }
+      }
+    },
+    "mediaRef": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "kind"],
+      "properties": {
+        "id": { "type": "string" },
+        "kind": { "enum": ["image", "file", "audio", "video", "sticker", "other"] },
+        "mime": { "type": "string" },
+        "name": { "type": "string" },
+        "size": { "type": "integer" }
+      }
+    },
+    "inboundBase": {
+      "type": "object",
+      "required": ["id", "ts"],
+      "properties": {
+        "id": { "type": "string" },
+        "ts": { "type": "number" },
+        "raw": true
+      }
+    },
+    "message": {
+      "allOf": [
+        { "$ref": "#/$defs/inboundBase" },
+        {
+          "type": "object",
+          "required": ["type", "chat", "from", "messageId", "text", "mentionsBot"],
+          "properties": {
+            "type": { "const": "message" },
+            "chat": { "$ref": "#/$defs/chatRef" },
+            "from": { "$ref": "#/$defs/userRef" },
+            "messageId": { "type": "string" },
+            "text": { "type": "string" },
+            "mentionsBot": { "type": "boolean" },
+            "replyTo": { "$ref": "#/$defs/msgRef" },
+            "media": { "type": "array", "items": { "$ref": "#/$defs/mediaRef" } }
+          }
+        }
+      ]
+    },
+    "edit": {
+      "allOf": [
+        { "$ref": "#/$defs/inboundBase" },
+        {
+          "type": "object",
+          "required": ["type", "target", "from", "text"],
+          "properties": {
+            "type": { "const": "edit" },
+            "target": { "$ref": "#/$defs/msgRef" },
+            "from": { "$ref": "#/$defs/userRef" },
+            "text": { "type": "string" }
+          }
+        }
+      ]
+    },
+    "reaction": {
+      "allOf": [
+        { "$ref": "#/$defs/inboundBase" },
+        {
+          "type": "object",
+          "required": ["type", "target", "from", "emoji", "added"],
+          "properties": {
+            "type": { "const": "reaction" },
+            "target": { "$ref": "#/$defs/msgRef" },
+            "from": { "$ref": "#/$defs/userRef" },
+            "emoji": { "type": "string" },
+            "added": { "type": "boolean" }
+          }
+        }
+      ]
+    },
+    "action": {
+      "allOf": [
+        { "$ref": "#/$defs/inboundBase" },
+        {
+          "type": "object",
+          "required": ["type", "target", "from", "actionId"],
+          "properties": {
+            "type": { "const": "action" },
+            "target": { "$ref": "#/$defs/msgRef" },
+            "from": { "$ref": "#/$defs/userRef" },
+            "actionId": { "type": "string" },
+            "value": { "type": "string" }
+          }
+        }
+      ]
+    },
+    "command": {
+      "allOf": [
+        { "$ref": "#/$defs/inboundBase" },
+        {
+          "type": "object",
+          "required": ["type", "chat", "from", "name", "args"],
+          "properties": {
+            "type": { "const": "command" },
+            "chat": { "$ref": "#/$defs/chatRef" },
+            "from": { "$ref": "#/$defs/userRef" },
+            "messageId": { "type": "string" },
+            "name": { "type": "string" },
+            "args": { "type": "string" }
+          }
+        }
+      ]
+    }
+  }
+}

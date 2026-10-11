@@ -1,0 +1,32 @@
+{
+  "schema": "2.0",
+  "header": {
+    "event_id": "img-event-1",
+    "event_type": "im.message.receive_v1",
+    "create_time": "1608725989000",
+    "app_id": "cli_test"
+  },
+  "event": {
+    "sender": {
+      "sender_id": { "open_id": "ou_sender" },
+      "sender_type": "user"
+    },
+    "message": {
+      "message_id": "om_img",
+      "create_time": "1609073151345",
+      "chat_id": "oc_group_1",
+      "thread_id": "omt_thread",
+      "chat_type": "group",
+      "message_type": "image",
+      "content": "{\"image_key\":\"img_xxx\"}",
+      "mentions": [
+        {
+          "key": "@_user_1",
+          "id": { "open_id": "ou_bot" },
+          "mentioned_type": "bot",
+          "name": "imwire"
+        }
+      ]
+    }
+  }
+}

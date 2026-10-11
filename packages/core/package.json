@@ -1,0 +1,37 @@
+{
+  "name": "@imwire/core",
+  "version": "0.1.0",
+  "description": "Normalized IM adapter SDK for agents. One interface for Feishu, Telegram, and more.",
+  "type": "module",
+  "license": "MIT",
+  "engines": {
+    "node": ">=20"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "default": "./dist/index.js"
+    },
+    "./testing": {
+      "types": "./dist/testing/index.d.ts",
+      "import": "./dist/testing/index.js",
+      "default": "./dist/testing/index.js"
+    },
+    "./schema/inbound.json": "./schema/inbound.schema.json",
+    "./schema/outbound.json": "./schema/outbound.schema.json"
+  },
+  "files": ["dist", "schema", "src"],
+  "scripts": {
+    "build": "tsc -b",
+    "typecheck": "tsc -b --pretty false"
+  },
+  "peerDependencies": {
+    "vitest": "^3.0.0"
+  },
+  "peerDependenciesMeta": {
+    "vitest": {
+      "optional": true
+    }
+  }
+}

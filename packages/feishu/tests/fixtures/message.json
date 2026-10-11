@@ -1,0 +1,32 @@
+{
+  "schema": "2.0",
+  "header": {
+    "event_id": "5e3702a84e847582be8db7fb73283c02",
+    "event_type": "im.message.receive_v1",
+    "create_time": "1608725989000",
+    "token": "test-token",
+    "app_id": "cli_test",
+    "tenant_key": "tenant"
+  },
+  "event": {
+    "sender": {
+      "sender_id": {
+        "union_id": "on_user",
+        "user_id": "e33ggbyz",
+        "open_id": "ou_sender"
+      },
+      "sender_type": "user",
+      "tenant_key": "tenant"
+    },
+    "message": {
+      "message_id": "om_5ce6d572455d361153b7cb51da133945",
+      "parent_id": "om_parent",
+      "create_time": "1609073151345",
+      "update_time": "1609073151345",
+      "chat_id": "oc_dm_1",
+      "chat_type": "p2p",
+      "message_type": "text",
+      "content": "{\"text\":\"hello\"}"
+    }
+  }
+}

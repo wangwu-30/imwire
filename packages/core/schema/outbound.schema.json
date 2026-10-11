@@ -1,0 +1,67 @@
+{
+  "$id": "https://imwire.dev/schema/outbound.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "OutMessage",
+  "description": "Normalized outbound message. See @imwire/core TypeScript types for the full definition.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["blocks"],
+  "properties": {
+    "blocks": {
+      "type": "array",
+      "items": {
+        "oneOf": [
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["kind", "text"],
+            "properties": { "kind": { "const": "markdown" }, "text": { "type": "string" } }
+          },
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["kind", "buttons"],
+            "properties": {
+              "kind": { "const": "buttons" },
+              "buttons": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": ["id", "label"],
+                  "properties": {
+                    "id": { "type": "string" },
+                    "label": { "type": "string" },
+                    "style": { "enum": ["primary", "danger", "default"] },
+                    "value": { "type": "string" }
+                  }
+                }
+              }
+            }
+          },
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["kind", "text"],
+            "properties": { "kind": { "const": "status" }, "text": { "type": "string" } }
+          }
+        ]
+      }
+    },
+    "replyTo": { "$ref": "https://imwire.dev/schema/inbound.json#/$defs/msgRef" },
+    "media": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["kind", "bytes"],
+        "properties": {
+          "kind": { "enum": ["image", "file"] },
+          "name": { "type": "string" },
+          "mime": { "type": "string" },
+          "bytes": { "type": "object" }
+        }
+      }
+    }
+  }
+}
