@@ -22,11 +22,24 @@ export interface SdkRealtimeOptions {
   };
   /** SDK numeric `LoggerLevel` (string values silence every WSClient log). */
   loggerLevel?: number;
+  /**
+   * Seconds to wait for any inbound frame after each ping before the socket is
+   * presumed dead and torn down (the SDK then reconnects). Default 30; 0 disables.
+   * Feishu pings every ~120 s; the SDK re-arms this watchdog on every ping, so it
+   * only fires when it is shorter than the server ping interval.
+   */
+  pingTimeoutSec?: number;
+  /** Abort a WebSocket handshake that hangs this long (ms). Default 15000; 0 disables. */
+  handshakeTimeoutMs?: number;
+  /** Override the endpoint host the SDK pulls the WS URL from (tests / private deployments). */
+  wsDomain?: string;
+  /** Load the SDK module (tests). Default: `import("@larksuiteoapi/node-sdk")`. */
+  loadSdk?: () => Promise<unknown>;
 }
 
 type WsLike = {
   start: (opts: { eventDispatcher: unknown }) => Promise<void> | void;
-  close?: () => void;
+  close?: (params?: { force?: boolean }) => void;
   getConnectionStatus?: () => unknown;
 };
 
@@ -65,7 +78,7 @@ export function isWsConnectionAlive(status: unknown, closed: boolean): boolean {
  * - acks card callbacks without awaiting user handlers (3 s deadline)
  */
 export async function createSdkRealtime(opts: SdkRealtimeOptions): Promise<FeishuRealtime> {
-  const mod = (await import("@larksuiteoapi/node-sdk")) as unknown as {
+  const mod = (await (opts.loadSdk ?? (() => import("@larksuiteoapi/node-sdk")))()) as unknown as {
     default?: unknown;
     EventDispatcher: new (opts: {
       logger?: unknown;
@@ -78,15 +91,21 @@ export async function createSdkRealtime(opts: SdkRealtimeOptions): Promise<Feish
       appSecret: string;
       domain?: unknown;
       onError?: (err: Error) => void;
+      onReconnecting?: () => void;
+      onReconnected?: () => void;
       logger?: unknown;
       loggerLevel?: unknown;
+      wsConfig?: { pingTimeout?: number };
+      handshakeTimeoutMs?: number;
     }) => WsLike;
     Domain?: { Lark?: unknown; Feishu?: unknown };
     LoggerLevel?: { fatal: number; error: number; warn: number; info: number };
   };
   const Lark = (mod.default ?? mod) as typeof mod;
   const LoggerLevel = Lark.LoggerLevel ?? (mod as typeof mod).LoggerLevel;
-  const domain = opts.domain === "lark" ? Lark.Domain?.Lark : Lark.Domain?.Feishu;
+  const domain = opts.wsDomain ?? (opts.domain === "lark" ? Lark.Domain?.Lark : Lark.Domain?.Feishu);
+  const pingTimeoutSec = opts.pingTimeoutSec ?? 30;
+  const handshakeTimeoutMs = opts.handshakeTimeoutMs ?? 15_000;
 
   let client: WsLike | undefined;
   let closed = true;
@@ -96,7 +115,10 @@ export async function createSdkRealtime(opts: SdkRealtimeOptions): Promise<Feish
     const current = client;
     client = undefined;
     try {
-      current?.close?.();
+      // force: terminate the socket. A polite close() waits up to 30 s for the
+      // peer's close frame, which never comes on a dead link and holds the
+      // process open after SIGTERM.
+      current?.close?.({ force: true });
     } catch {
       // ignore
     }
@@ -143,14 +165,26 @@ export async function createSdkRealtime(opts: SdkRealtimeOptions): Promise<Feish
         appSecret: string;
         domain?: unknown;
         onError?: (err: Error) => void;
+        onReconnecting?: () => void;
+        onReconnected?: () => void;
         logger?: unknown;
         loggerLevel?: unknown;
+        wsConfig?: { pingTimeout?: number };
+        handshakeTimeoutMs?: number;
       } = {
         appId: opts.appId,
         appSecret: opts.appSecret,
         logger: sdkLogger,
         loggerLevel,
+        // Without a liveness watchdog the SDK only reconnects on a socket
+        // 'close'. Behind a TUN / transparent proxy a dead upstream leaves the
+        // local TCP leg ESTABLISHED (pings pile up in Send-Q) and 'close' never
+        // fires, so events silently stop.
+        onReconnecting: () => sdkLogger.warn?.("[imwire/feishu]", "websocket lost, reconnecting"),
+        onReconnected: () => sdkLogger.warn?.("[imwire/feishu]", "websocket reconnected"),
       };
+      if (pingTimeoutSec > 0) wsOpts.wsConfig = { pingTimeout: pingTimeoutSec };
+      if (handshakeTimeoutMs > 0) wsOpts.handshakeTimeoutMs = handshakeTimeoutMs;
       if (domain !== undefined) wsOpts.domain = domain;
 
       closeClient();

@@ -21,6 +21,6 @@
   },
   "dependencies": {
     "@imwire/core": "workspace:*",
-    "@larksuiteoapi/node-sdk": "^1.55.0"
+    "@larksuiteoapi/node-sdk": "^1.74.0"
   }
 }

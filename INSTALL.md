@@ -291,6 +291,8 @@ imwire serve --adapter telegram --ws
 | `This bot is private. Ask someone already linked to send /pair, then send the 8-digit code here.` | 发送者不在 allowlist，也不是有效配对码 |
 | `Too many pairing codes. Try again later.` | 同一 identity 10 分钟内 `/pair` 超过 5 次 |
 | `Too many pairing attempts. Try again later.` | 同一发送者 10 分钟内错码 5 次 |
+| stderr 出现 `no pong/inbound within 30s of last ping` 或 `[imwire/feishu] websocket lost, reconnecting` | 飞书长连接没心跳了（常见于 TUN / 透明代理后上游断开，本地 TCP 仍是 ESTAB），适配器会自动断开重连，一般不用管。频繁出现就查代理 |
+| `SIGTERM: shutting down` 后 5 秒 `forcing exit` | 有连接或定时器没关干净，进程已自动强退；再按一次 Ctrl-C 可立即退出 |
 | `Welcome. You are the owner. Send /pair to link another IM.` | 正常。allowlist 命中，还没 `/pair` |
 | `feishu websocket failed (bad credentials or exhausted reconnect)` | App ID / Secret / 域名不对，或长连接一直失败 |
 | Telegram HTTP 409（webhook 冲突） | 适配器会 `deleteWebhook` 一次再重试 `getUpdates`。不要同时开 Bot API webhook |

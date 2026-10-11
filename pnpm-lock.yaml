@@ -134,7 +134,7 @@ importers:
         specifier: workspace:*
         version: link:../core
       '@larksuiteoapi/node-sdk':
-        specifier: ^1.55.0
+        specifier: ^1.74.0
         version: 1.74.0
 
   packages/imwire:
