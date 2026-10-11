@@ -9,7 +9,13 @@ import { action, cmd, dm, lastApprovalId, markdownCalls, openGateway, waitFor } 
 describe("acceptance demo (fake adapters)", () => {
   it("follows the user from Telegram onto Feishu", async () => {
     const log: string[] = [];
+    let turns = 0;
     const driver = new ScriptedDriver(async (sink, ctl) => {
+      turns += 1;
+      if (turns > 1) {
+        sink.text("ok");
+        return;
+      }
       sink.text("Once upon a time ");
       log.push("streamed first tokens on the active IM");
       await ctl.wait("mid");

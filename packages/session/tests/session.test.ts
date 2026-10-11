@@ -153,7 +153,13 @@ describe("group isolation", () => {
 
 describe("mid-stream switch and approvals", () => {
   it("moves an in-flight reply and first-click-wins approvals to the new IM", async () => {
+    let turns = 0;
     const driver = new ScriptedDriver(async (sink, ctl) => {
+      turns += 1;
+      if (turns > 1) {
+        sink.text("ok");
+        return;
+      }
       sink.text("Hello ");
       await ctl.wait("mid");
       sink.text("world");

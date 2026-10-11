@@ -146,7 +146,12 @@ export function owner(platform: string, userId: string): OwnerAllowlistEntry {
   return { platform, accountId: "bot", userId, name: "Owner" };
 }
 
-export function openGateway(opts?: { driver?: AgentDriver; dbPath?: string; allowlist?: OwnerAllowlistEntry[] }): {
+export function openGateway(opts?: {
+  driver?: AgentDriver;
+  dbPath?: string;
+  allowlist?: OwnerAllowlistEntry[];
+  approvalTimeoutMs?: number;
+}): {
   gw: SessionGateway;
   driver: ScriptedDriver;
   tg: FakeAdapter;
@@ -157,6 +162,7 @@ export function openGateway(opts?: { driver?: AgentDriver; dbPath?: string; allo
     dbPath: opts?.dbPath ?? ":memory:",
     driver: opts?.driver ?? driver,
     allowlist: opts?.allowlist ?? [owner("telegram", "ada")],
+    approvalTimeoutMs: opts?.approvalTimeoutMs,
   });
   const tg = fakeAdapter("telegram");
   const fs = fakeAdapter("feishu");

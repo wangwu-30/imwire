@@ -1,13 +1,20 @@
 import type { ChatRef } from "@imwire/core";
-import { groupKey, identityKey, newId, pairCode } from "./ids.js";
+import { groupKey, hashPairCode, identityKey, newId, pairCode } from "./ids.js";
 import { openSqlite, type SqlDatabase } from "./sqlite.js";
 import type {
+  ConversationMeta,
   ConversationSnapshot,
   IdentityRecord,
   LogMessage,
   PendingApproval,
   PersonRecord,
 } from "./types.js";
+
+export const PAIR_ATTEMPT_LIMIT = 5;
+export const PAIR_GLOBAL_LIMIT = 50;
+export const PAIR_WINDOW_MS = 10 * 60 * 1000;
+export const GROUP_NOTICE_WINDOW_MS = 24 * 60 * 60 * 1000;
+export const DEFAULT_LOG_WINDOW = 40;
 
 const SCHEMA = `
 PRAGMA foreign_keys = ON;
@@ -31,6 +38,16 @@ CREATE TABLE IF NOT EXISTS pairing (
   created_at INTEGER NOT NULL,
   created_by TEXT NOT NULL,
   used_at INTEGER
+);
+CREATE TABLE IF NOT EXISTS pair_attempt (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  sender TEXT NOT NULL,
+  at INTEGER NOT NULL,
+  ok INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS pair_lock_notice (
+  sender TEXT PRIMARY KEY,
+  at INTEGER NOT NULL
 );
 CREATE TABLE IF NOT EXISTS conversation (
   id TEXT PRIMARY KEY,
@@ -75,12 +92,22 @@ CREATE TABLE IF NOT EXISTS approval (
   version INTEGER NOT NULL DEFAULT 1,
   decided_by TEXT,
   decided_at INTEGER,
-  cards TEXT
+  cards TEXT,
+  requested_by TEXT,
+  chosen TEXT,
+  created_at INTEGER
 );
 CREATE TABLE IF NOT EXISTS presence (
   person_id TEXT PRIMARY KEY REFERENCES person(id),
   last_surface TEXT NOT NULL,
   last_seen_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS group_notice (
+  group_key TEXT PRIMARY KEY,
+  last_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS interrupt_notice (
+  conversation_id TEXT PRIMARY KEY
 );
 `;
 
@@ -92,9 +119,25 @@ export class SessionStore {
     try {
       this.db.exec("PRAGMA journal_mode = WAL");
     } catch {
-      // :memory: or node:sqlite without file
+      // :memory:
     }
     this.db.exec(SCHEMA);
+    this.migrate();
+  }
+
+  private migrate(): void {
+    const alters = [
+      "ALTER TABLE approval ADD COLUMN requested_by TEXT",
+      "ALTER TABLE approval ADD COLUMN chosen TEXT",
+      "ALTER TABLE approval ADD COLUMN created_at INTEGER",
+    ];
+    for (const sql of alters) {
+      try {
+        this.db.exec(sql);
+      } catch {
+        // column exists
+      }
+    }
   }
 
   close(): void {
@@ -122,12 +165,46 @@ export class SessionStore {
     return { platform: row.platform, accountId: row.account_id, userId: row.user_id, personId: row.person_id };
   }
 
-  linkIdentity(personId: string, platform: string, accountId: string, userId: string, now: number): void {
+  /** Insert-only. Refuses to re-point an existing identity to another person. */
+  linkIdentity(personId: string, platform: string, accountId: string, userId: string, now: number): boolean {
+    const existing = this.findIdentity(platform, accountId, userId);
+    if (existing) return existing.personId === personId;
+    try {
+      this.db
+        .prepare("INSERT INTO identity(platform, account_id, user_id, person_id, linked_at) VALUES (?, ?, ?, ?, ?)")
+        .run(platform, accountId, userId, personId, now);
+      return true;
+    } catch {
+      const again = this.findIdentity(platform, accountId, userId);
+      return again?.personId === personId;
+    }
+  }
+
+  bootstrapOwner(
+    platform: string,
+    accountId: string,
+    userId: string,
+    name: string | undefined,
+    now: number,
+  ): { person: PersonRecord; created: boolean } {
+    return this.db.transaction(() => {
+      const existing = this.findIdentity(platform, accountId, userId);
+      if (existing) {
+        const person = this.getPerson(existing.personId) ?? { id: existing.personId, name };
+        return { person, created: false };
+      }
+      const person = this.createPerson(name, now);
+      this.linkIdentity(person.id, platform, accountId, userId, now);
+      this.defaultConversation(person.id, now);
+      return { person, created: true };
+    });
+  }
+
+  purgePairing(now: number, windowMs = PAIR_WINDOW_MS): void {
     this.db
-      .prepare(
-        "INSERT OR REPLACE INTO identity(platform, account_id, user_id, person_id, linked_at) VALUES (?, ?, ?, ?, ?)",
-      )
-      .run(platform, accountId, userId, personId, now);
+      .prepare("DELETE FROM pairing WHERE expires_at <= ? OR (used_at IS NOT NULL AND created_at < ?)")
+      .run(now, now - windowMs);
+    this.db.prepare("DELETE FROM pair_attempt WHERE at < ?").run(now - windowMs * 2);
   }
 
   createPairCode(
@@ -138,18 +215,21 @@ export class SessionStore {
     maxPerWindow: number,
     windowMs: number,
   ): string | "rate_limited" {
+    this.purgePairing(now);
     const created = this.db
-      .prepare<{ n: number }>(
-        "SELECT COUNT(*) AS n FROM pairing WHERE created_by = ? AND created_at >= ?",
-      )
+      .prepare<{ n: number }>("SELECT COUNT(*) AS n FROM pairing WHERE created_by = ? AND created_at >= ?")
       .get(createdBy, now - windowMs);
     if ((created?.n ?? 0) >= maxPerWindow) return "rate_limited";
+    // max 1 live code per identity: revoke previous unused
+    this.db
+      .prepare("UPDATE pairing SET used_at = ? WHERE created_by = ? AND used_at IS NULL")
+      .run(now, createdBy);
     for (let i = 0; i < 20; i += 1) {
       const code = pairCode();
       try {
         this.db
           .prepare("INSERT INTO pairing(code, person_id, expires_at, created_at, created_by) VALUES (?, ?, ?, ?, ?)")
-          .run(code, personId, expiresAt, now, createdBy);
+          .run(hashPairCode(code), personId, expiresAt, now, createdBy);
         return code;
       } catch {
         // collision
@@ -159,24 +239,89 @@ export class SessionStore {
   }
 
   consumePairCode(code: string, now: number): string | undefined {
+    this.purgePairing(now);
+    const hashed = hashPairCode(code);
     const row = this.db
       .prepare<{ person_id: string; expires_at: number; used_at: number | null }>(
         "SELECT person_id, expires_at, used_at FROM pairing WHERE code = ?",
       )
-      .get(code);
+      .get(hashed);
     if (!row || row.used_at !== null || row.expires_at <= now) return undefined;
     const updated = this.db
       .prepare("UPDATE pairing SET used_at = ? WHERE code = ? AND used_at IS NULL AND expires_at > ?")
-      .run(now, code, now);
+      .run(now, hashed, now);
     if (updated.changes !== 1) return undefined;
     return row.person_id;
   }
 
+  recordPairAttempt(sender: string, now: number, ok: boolean): void {
+    this.db.prepare("INSERT INTO pair_attempt(sender, at, ok) VALUES (?, ?, ?)").run(sender, now, ok ? 1 : 0);
+    if (!ok) {
+      const fails = this.failedPairAttempts(sender, now);
+      if (fails >= PAIR_ATTEMPT_LIMIT) {
+        this.db.prepare("UPDATE pairing SET used_at = ? WHERE used_at IS NULL").run(now);
+      }
+    }
+  }
+
+  failedPairAttempts(sender: string, now: number, windowMs = PAIR_WINDOW_MS): number {
+    return (
+      this.db
+        .prepare<{ n: number }>(
+          "SELECT COUNT(*) AS n FROM pair_attempt WHERE sender = ? AND ok = 0 AND at >= ?",
+        )
+        .get(sender, now - windowMs)?.n ?? 0
+    );
+  }
+
+  failedPairAttemptsGlobal(now: number, windowMs = PAIR_WINDOW_MS): number {
+    return (
+      this.db
+        .prepare<{ n: number }>("SELECT COUNT(*) AS n FROM pair_attempt WHERE ok = 0 AND at >= ?")
+        .get(now - windowMs)?.n ?? 0
+    );
+  }
+
+  pairLocked(sender: string, now: number): boolean {
+    return (
+      this.failedPairAttempts(sender, now) >= PAIR_ATTEMPT_LIMIT ||
+      this.failedPairAttemptsGlobal(now) >= PAIR_GLOBAL_LIMIT
+    );
+  }
+
+  shouldTellLockout(sender: string, now: number): boolean {
+    const row = this.db.prepare<{ at: number }>("SELECT at FROM pair_lock_notice WHERE sender = ?").get(sender);
+    if (row && now - row.at < PAIR_WINDOW_MS) return false;
+    this.db.prepare("INSERT OR REPLACE INTO pair_lock_notice(sender, at) VALUES (?, ?)").run(sender, now);
+    return true;
+  }
+
+  shouldSendGroupNotice(key: string, now: number, windowMs = GROUP_NOTICE_WINDOW_MS): boolean {
+    const row = this.db.prepare<{ last_at: number }>("SELECT last_at FROM group_notice WHERE group_key = ?").get(key);
+    if (row && now - row.last_at < windowMs) return false;
+    this.db.prepare("INSERT OR REPLACE INTO group_notice(group_key, last_at) VALUES (?, ?)").run(key, now);
+    return true;
+  }
+
+  conversationMeta(id: string): ConversationMeta | undefined {
+    const conv = this.db
+      .prepare<{ id: string; person_id: string | null; group_key: string | null; title: string; is_default: number }>(
+        "SELECT id, person_id, group_key, title, is_default FROM conversation WHERE id = ?",
+      )
+      .get(id);
+    if (!conv) return undefined;
+    return {
+      id: conv.id,
+      personId: conv.person_id ?? undefined,
+      groupKey: conv.group_key ?? undefined,
+      title: conv.title,
+      isDefault: conv.is_default === 1,
+    };
+  }
+
   defaultConversation(personId: string, now: number): ConversationSnapshot {
     const existing = this.db
-      .prepare<{ id: string; title: string }>(
-        "SELECT id, title FROM conversation WHERE person_id = ? AND is_default = 1",
-      )
+      .prepare<{ id: string }>("SELECT id FROM conversation WHERE person_id = ? AND is_default = 1")
       .get(personId);
     if (existing) return this.snapshot(existing.id);
     const id = newId("c");
@@ -249,37 +394,34 @@ export class SessionStore {
     return this.snapshot(id);
   }
 
-  snapshot(conversationId: string): ConversationSnapshot {
-    const conv = this.db
-      .prepare<{ id: string; person_id: string | null; group_key: string | null; title: string; is_default: number }>(
-        "SELECT id, person_id, group_key, title, is_default FROM conversation WHERE id = ?",
-      )
-      .get(conversationId);
+  snapshot(conversationId: string, opts?: { maxMessages?: number }): ConversationSnapshot {
+    const conv = this.conversationMeta(conversationId);
     if (!conv) throw new Error(`unknown conversation ${conversationId}`);
-    const messages = this.db
-      .prepare<{ id: string; seq: number; role: string; surface: string | null; content: string; created_at: number }>(
-        "SELECT id, seq, role, surface, content, created_at FROM message WHERE conversation_id = ? ORDER BY seq",
-      )
-      .all(conversationId)
-      .map((m) => {
-        const content = JSON.parse(m.content) as { text?: string };
-        return {
-          id: m.id,
-          seq: m.seq,
-          role: m.role as LogMessage["role"],
-          text: content.text ?? "",
-          surface: m.surface ? (JSON.parse(m.surface) as ChatRef) : undefined,
-          createdAt: m.created_at,
-        };
-      });
-    return {
-      id: conv.id,
-      personId: conv.person_id ?? undefined,
-      groupKey: conv.group_key ?? undefined,
-      title: conv.title,
-      isDefault: conv.is_default === 1,
-      messages,
-    };
+    const limit = opts?.maxMessages;
+    const rows = limit
+      ? this.db
+          .prepare<{ id: string; seq: number; role: string; surface: string | null; content: string; created_at: number }>(
+            "SELECT id, seq, role, surface, content, created_at FROM message WHERE conversation_id = ? ORDER BY seq DESC LIMIT ?",
+          )
+          .all(conversationId, limit)
+          .reverse()
+      : this.db
+          .prepare<{ id: string; seq: number; role: string; surface: string | null; content: string; created_at: number }>(
+            "SELECT id, seq, role, surface, content, created_at FROM message WHERE conversation_id = ? ORDER BY seq",
+          )
+          .all(conversationId);
+    const messages = rows.map((m) => {
+      const content = JSON.parse(m.content) as { text?: string };
+      return {
+        id: m.id,
+        seq: m.seq,
+        role: m.role as LogMessage["role"],
+        text: content.text ?? "",
+        surface: m.surface ? (JSON.parse(m.surface) as ChatRef) : undefined,
+        createdAt: m.created_at,
+      };
+    });
+    return { ...conv, messages };
   }
 
   appendMessage(opts: {
@@ -289,25 +431,27 @@ export class SessionStore {
     surface?: ChatRef;
     now: number;
   }): LogMessage {
-    const seqRow = this.db
-      .prepare<{ n: number }>("SELECT COALESCE(MAX(seq), 0) AS n FROM message WHERE conversation_id = ?")
-      .get(opts.conversationId);
-    const seq = (seqRow?.n ?? 0) + 1;
-    const id = newId("m");
-    this.db
-      .prepare(
-        "INSERT INTO message(id, conversation_id, seq, role, surface, content, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
-      )
-      .run(
-        id,
-        opts.conversationId,
-        seq,
-        opts.role,
-        opts.surface ? JSON.stringify(opts.surface) : null,
-        JSON.stringify({ text: opts.text }),
-        opts.now,
-      );
-    return { id, seq, role: opts.role, text: opts.text, surface: opts.surface, createdAt: opts.now };
+    return this.db.transaction(() => {
+      const seqRow = this.db
+        .prepare<{ n: number }>("SELECT COALESCE(MAX(seq), 0) AS n FROM message WHERE conversation_id = ?")
+        .get(opts.conversationId);
+      const seq = (seqRow?.n ?? 0) + 1;
+      const id = newId("m");
+      this.db
+        .prepare(
+          "INSERT INTO message(id, conversation_id, seq, role, surface, content, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        )
+        .run(
+          id,
+          opts.conversationId,
+          seq,
+          opts.role,
+          opts.surface ? JSON.stringify(opts.surface) : null,
+          JSON.stringify({ text: opts.text }),
+          opts.now,
+        );
+      return { id, seq, role: opts.role, text: opts.text, surface: opts.surface, createdAt: opts.now };
+    });
   }
 
   addDelivery(messageId: string, chat: ChatRef, platformMsgId: string, state = "sent"): void {
@@ -329,7 +473,44 @@ export class SessionStore {
     return row ? (JSON.parse(row.last_surface) as ChatRef) : undefined;
   }
 
-  createApproval(conversationId: string, toolCallId: string, title: string, options: string[]): PendingApproval {
+  unansweredTails(): Array<{ conversationId: string; personId?: string; text: string; surface?: ChatRef }> {
+    const convs = this.db
+      .prepare<{ id: string; person_id: string | null }>("SELECT id, person_id FROM conversation")
+      .all();
+    const out: Array<{ conversationId: string; personId?: string; text: string; surface?: ChatRef }> = [];
+    for (const c of convs) {
+      if (this.db.prepare<{ n: number }>("SELECT 1 AS n FROM interrupt_notice WHERE conversation_id = ?").get(c.id)) {
+        continue;
+      }
+      const last = this.db
+        .prepare<{ role: string; content: string; surface: string | null }>(
+          "SELECT role, content, surface FROM message WHERE conversation_id = ? ORDER BY seq DESC LIMIT 1",
+        )
+        .get(c.id);
+      if (!last || last.role !== "user") continue;
+      const content = JSON.parse(last.content) as { text?: string };
+      out.push({
+        conversationId: c.id,
+        personId: c.person_id ?? undefined,
+        text: content.text ?? "",
+        surface: last.surface ? (JSON.parse(last.surface) as ChatRef) : undefined,
+      });
+    }
+    return out;
+  }
+
+  markInterruptNotified(conversationId: string): void {
+    this.db.prepare("INSERT OR REPLACE INTO interrupt_notice(conversation_id) VALUES (?)").run(conversationId);
+  }
+
+  createApproval(
+    conversationId: string,
+    toolCallId: string,
+    title: string,
+    options: string[],
+    requestedBy: string | undefined,
+    now: number,
+  ): PendingApproval {
     const id = newId("a");
     const rec: PendingApproval = {
       id,
@@ -339,11 +520,15 @@ export class SessionStore {
       options,
       version: 1,
       state: "pending",
+      requestedBy,
+      createdAt: now,
       cards: [],
     };
     this.db
-      .prepare("INSERT INTO approval(id, conversation_id, tool_call, state, version, cards) VALUES (?, ?, ?, 'pending', 1, ?)")
-      .run(id, conversationId, JSON.stringify({ toolCallId, title, options }), "[]");
+      .prepare(
+        "INSERT INTO approval(id, conversation_id, tool_call, state, version, cards, requested_by, created_at) VALUES (?, ?, ?, 'pending', 1, ?, ?, ?)",
+      )
+      .run(id, conversationId, JSON.stringify({ toolCallId, title, options }), "[]", requestedBy ?? null, now);
     return rec;
   }
 
@@ -356,7 +541,12 @@ export class SessionStore {
         state: string;
         version: number;
         cards: string | null;
-      }>("SELECT id, conversation_id, tool_call, state, version, cards FROM approval WHERE id = ?")
+        requested_by: string | null;
+        chosen: string | null;
+        created_at: number | null;
+      }>(
+        "SELECT id, conversation_id, tool_call, state, version, cards, requested_by, chosen, created_at FROM approval WHERE id = ?",
+      )
       .get(id);
     if (!row) return undefined;
     const tool = JSON.parse(row.tool_call) as { toolCallId: string; title: string; options: string[] };
@@ -368,6 +558,9 @@ export class SessionStore {
       options: tool.options,
       version: row.version,
       state: row.state as PendingApproval["state"],
+      requestedBy: row.requested_by ?? undefined,
+      chosen: row.chosen ?? undefined,
+      createdAt: row.created_at ?? undefined,
       cards: row.cards ? (JSON.parse(row.cards) as PendingApproval["cards"]) : [],
     };
   }
@@ -376,25 +569,43 @@ export class SessionStore {
     this.db.prepare("UPDATE approval SET cards = ? WHERE id = ?").run(JSON.stringify(cards), id);
   }
 
-  pendingApprovals(conversationId: string): PendingApproval[] {
-    return this.db
-      .prepare<{ id: string }>("SELECT id FROM approval WHERE conversation_id = ? AND state = 'pending'")
-      .all(conversationId)
-      .map((r) => this.getApproval(r.id))
-      .filter((a): a is PendingApproval => Boolean(a));
+  pendingApprovals(conversationId?: string): PendingApproval[] {
+    const rows = conversationId
+      ? this.db
+          .prepare<{ id: string }>("SELECT id FROM approval WHERE conversation_id = ? AND state = 'pending'")
+          .all(conversationId)
+      : this.db.prepare<{ id: string }>("SELECT id FROM approval WHERE state = 'pending'").all();
+    return rows.map((r) => this.getApproval(r.id)).filter((a): a is PendingApproval => Boolean(a));
   }
 
-  decideApproval(id: string, decision: "approved" | "denied", decidedBy: string, now: number): PendingApproval | undefined {
+  decideApproval(
+    id: string,
+    state: "approved" | "denied",
+    decidedBy: string,
+    now: number,
+    chosen?: string,
+  ): PendingApproval | undefined {
     const current = this.getApproval(id);
     if (!current || current.state !== "pending") return undefined;
     const updated = this.db
       .prepare(
-        "UPDATE approval SET state = ?, decided_by = ?, decided_at = ?, version = version + 1 WHERE id = ? AND state = 'pending' AND version = ?",
+        "UPDATE approval SET state = ?, decided_by = ?, decided_at = ?, chosen = ?, version = version + 1 WHERE id = ? AND state = 'pending' AND version = ?",
       )
-      .run(decision, decidedBy, now, id, current.version);
+      .run(state, decidedBy, now, chosen ?? state, id, current.version);
     if (updated.changes !== 1) return undefined;
     return this.getApproval(id);
   }
 
+  expirePendingApprovals(now: number, reason = "expired"): PendingApproval[] {
+    const pending = this.pendingApprovals();
+    const out: PendingApproval[] = [];
+    for (const a of pending) {
+      const decided = this.decideApproval(a.id, "denied", reason, now, "deny");
+      if (decided) out.push(decided);
+    }
+    return out;
+  }
+
   identityKey = identityKey;
+  groupKey = groupKey;
 }

@@ -10,15 +10,25 @@ import {
   type MsgRef,
   type UserRef,
 } from "@imwire/core";
-import { identityKey } from "./ids.js";
-import { SessionStore } from "./store.js";
-import type { AgentDriver, OwnerAllowlistEntry, PendingApproval, TurnSink, UserTurn } from "./types.js";
+import { groupKey, identityKey } from "./ids.js";
+import { DEFAULT_LOG_WINDOW, SessionStore } from "./store.js";
+import {
+  isExplicitApprove,
+  type AgentDriver,
+  type ApprovalDecision,
+  type OwnerAllowlistEntry,
+  type PendingApproval,
+  type TurnSink,
+  type UserTurn,
+} from "./types.js";
 
 const UNPAIRED =
   "This bot is private. Ask someone already linked to send /pair, then send the 6-digit code here.";
+const INTERRUPTED = "The previous reply was interrupted. Please resend.";
 const PAIR_TTL_MS = 10 * 60 * 1000;
 const PAIR_RATE = 5;
 const PAIR_WINDOW_MS = 10 * 60 * 1000;
+const DEFAULT_APPROVAL_TTL_MS = 10 * 60 * 1000;
 
 export interface SessionGatewayOptions {
   dbPath: string;
@@ -27,7 +37,12 @@ export interface SessionGatewayOptions {
   clock?: Clock;
   logger?: Logger;
   unpairedText?: string;
+  /** Approval wait TTL. Default 10 minutes. */
+  approvalTimeoutMs?: number;
+  logWindow?: number;
 }
+
+type TurnPhase = "running" | "finalizing" | "handoff";
 
 interface ActiveTurn {
   conversationId: string;
@@ -38,10 +53,11 @@ interface ActiveTurn {
   replyTo?: MsgRef;
   personId?: string;
   switchNote?: string;
+  phase: TurnPhase;
 }
 
 interface ApprovalWaiter {
-  resolve: (decision: string) => void;
+  resolve: (decision: ApprovalDecision) => void;
 }
 
 export class SessionGateway {
@@ -51,6 +67,8 @@ export class SessionGateway {
   private readonly clock: Clock;
   private readonly logger: Logger;
   private readonly unpairedText: string;
+  private readonly approvalTimeoutMs: number;
+  private readonly logWindow: number;
   private readonly adapters = new Map<string, Adapter>();
   private readonly lanes = new Map<string, Promise<void>>();
   private readonly active = new Map<string, ActiveTurn>();
@@ -58,6 +76,7 @@ export class SessionGateway {
   private readonly approvalWaiters = new Map<string, ApprovalWaiter>();
   private readonly agentSessions = new Map<string, string>();
   private readonly turns = new Map<string, Promise<void>>();
+  private recovered = false;
 
   constructor(opts: SessionGatewayOptions) {
     this.store = new SessionStore(opts.dbPath);
@@ -66,6 +85,11 @@ export class SessionGateway {
     this.clock = opts.clock ?? systemClock();
     this.logger = opts.logger ?? noopLogger;
     this.unpairedText = opts.unpairedText ?? UNPAIRED;
+    this.approvalTimeoutMs = opts.approvalTimeoutMs ?? DEFAULT_APPROVAL_TTL_MS;
+    this.logWindow = opts.logWindow ?? DEFAULT_LOG_WINDOW;
+    for (const expired of this.store.expirePendingApprovals(this.clock.now(), "expired")) {
+      this.logger.info("expired stale approval on boot", { id: expired.id });
+    }
   }
 
   attach(adapter: Adapter): void {
@@ -77,6 +101,7 @@ export class SessionGateway {
         this.logger.error("session handle failed", { err: String(err), type: event.type });
       }
     });
+    void this.recoverInterrupted();
   }
 
   adapterFor(chat: ChatRef): Adapter | undefined {
@@ -89,7 +114,7 @@ export class SessionGateway {
 
   async handle(adapter: Adapter, event: Inbound): Promise<void> {
     if (event.type === "action") {
-      await this.handleAction(adapter, event.from, event.actionId, event.value);
+      await this.handleAction(event.from, event.actionId, event.value);
       return;
     }
     if (event.type !== "message" && event.type !== "command") return;
@@ -103,7 +128,10 @@ export class SessionGateway {
       if (event.type === "message" && !event.mentionsBot) return;
       const identity = this.store.findIdentity(from.platform, from.accountId, from.userId);
       if (!identity) {
-        await adapter.send(chat, { blocks: [{ kind: "markdown", text: this.unpairedText }] });
+        const key = groupKey(chat.platform, chat.accountId, chat.chatId);
+        if (this.store.shouldSendGroupNotice(key, this.clock.now())) {
+          await adapter.send(chat, { blocks: [{ kind: "markdown", text: this.unpairedText }] });
+        }
         return;
       }
       const conv = this.store.groupConversation(chat, this.clock.now());
@@ -148,31 +176,86 @@ export class SessionGateway {
     for (const ref of refs) this.store.addDelivery(msg.id, ref.chat, ref.messageId);
   }
 
+  private async recoverInterrupted(): Promise<void> {
+    if (this.recovered) return;
+    this.recovered = true;
+    for (const tail of this.store.unansweredTails()) {
+      const surface = tail.surface ?? (tail.personId ? this.store.lastSurface(tail.personId) : undefined);
+      if (!surface) continue;
+      const adapter = this.adapterFor(surface);
+      if (!adapter) continue;
+      try {
+        await adapter.send(surface, { blocks: [{ kind: "markdown", text: INTERRUPTED }] });
+        this.store.markInterruptNotified(tail.conversationId);
+      } catch (err) {
+        this.logger.warn("interrupt notice failed", { err: String(err) });
+      }
+    }
+  }
+
   private async handleUnpaired(adapter: Adapter, chat: ChatRef, from: UserRef, text: string): Promise<void> {
+    const sender = identityKey(from.platform, from.accountId, from.userId);
+    const now = this.clock.now();
     const code = text.trim();
     if (/^\d{6}$/.test(code)) {
-      const personId = this.store.consumePairCode(code, this.clock.now());
+      if (this.store.pairLocked(sender, now)) {
+        if (this.store.shouldTellLockout(sender, now)) {
+          await adapter.send(chat, { blocks: [{ kind: "markdown", text: "Too many pairing attempts. Try again later." }] });
+        }
+        return;
+      }
+      const personId = this.store.consumePairCode(code, now);
       if (personId) {
-        this.store.linkIdentity(personId, from.platform, from.accountId, from.userId, this.clock.now());
-        this.store.touchPresence(personId, chat, this.clock.now());
+        this.store.recordPairAttempt(sender, now, true);
+        const linked = this.store.linkIdentity(personId, from.platform, from.accountId, from.userId, now);
+        if (!linked) {
+          await adapter.send(chat, { blocks: [{ kind: "markdown", text: this.unpairedText }] });
+          return;
+        }
+        this.store.touchPresence(personId, chat, now);
         await adapter.send(chat, {
           blocks: [{ kind: "markdown", text: "Linked. You share one conversation across IMs." }],
         });
+        const ownerSurface = this.store.lastSurface(personId);
+        if (ownerSurface && !sameSurface(ownerSurface, chat)) {
+          const dest = this.adapterFor(ownerSurface);
+          await dest
+            ?.send(ownerSurface, {
+              blocks: [{ kind: "markdown", text: `Linked ${from.platform} account ${from.userId}.` }],
+            })
+            .catch(() => undefined);
+        }
         return;
       }
+      this.store.recordPairAttempt(sender, now, false);
+      if (this.store.pairLocked(sender, now)) {
+        if (this.store.shouldTellLockout(sender, now)) {
+          await adapter.send(chat, { blocks: [{ kind: "markdown", text: "Too many pairing attempts. Try again later." }] });
+        }
+        return;
+      }
+      await adapter.send(chat, { blocks: [{ kind: "markdown", text: this.unpairedText }] });
+      return;
     }
 
     const owner = this.allowlist.find(
       (e) => e.platform === from.platform && e.accountId === from.accountId && e.userId === from.userId,
     );
     if (owner) {
-      const person = this.store.createPerson(owner.name ?? from.displayName, this.clock.now());
-      this.store.linkIdentity(person.id, from.platform, from.accountId, from.userId, this.clock.now());
-      this.store.defaultConversation(person.id, this.clock.now());
-      this.store.touchPresence(person.id, chat, this.clock.now());
-      await adapter.send(chat, {
-        blocks: [{ kind: "markdown", text: "Welcome. You are the owner. Send /pair to link another IM." }],
-      });
+      const { created } = this.store.bootstrapOwner(
+        from.platform,
+        from.accountId,
+        from.userId,
+        owner.name ?? from.displayName,
+        now,
+      );
+      const ident = this.store.findIdentity(from.platform, from.accountId, from.userId);
+      if (ident) this.store.touchPresence(ident.personId, chat, now);
+      if (created) {
+        await adapter.send(chat, {
+          blocks: [{ kind: "markdown", text: "Welcome. You are the owner. Send /pair to link another IM." }],
+        });
+      }
       return;
     }
 
@@ -234,16 +317,19 @@ export class SessionGateway {
       });
       const current = this.active.get(conversationId);
       if (current) {
-        if (!sameSurface(current.surface, chat)) {
+        const canSwitch = !sameSurface(current.surface, chat) && current.phase === "running";
+        if (canSwitch) {
           await this.switchSurface(current, adapter, chat, replyTo);
+          let steered = false;
           if (this.driver.steer && this.agentSessions.has(conversationId)) {
-            await this.driver.steer(this.agentSessions.get(conversationId) ?? "", { text, source: { chat, from } });
+            steered = Boolean(
+              await this.driver.steer(this.agentSessions.get(conversationId) ?? "", { text, source: { chat, from } }),
+            );
           }
+          if (!steered) this.enqueue(conversationId, { text, source: { chat, from } });
           return;
         }
-        const follow = this.followups.get(conversationId) ?? [];
-        follow.push({ text, source: { chat, from } });
-        this.followups.set(conversationId, follow);
+        this.enqueue(conversationId, { text, source: { chat, from } });
         return;
       }
       this.active.set(conversationId, {
@@ -254,16 +340,25 @@ export class SessionGateway {
         generated: "",
         replyTo,
         personId,
+        phase: "running",
       });
       start = true;
     });
-    if (start) {
-      const running = this.runTurn(conversationId, { text, source: { chat, from } });
-      this.turns.set(conversationId, running);
-      void running.finally(() => {
-        if (this.turns.get(conversationId) === running) this.turns.delete(conversationId);
-      });
-    }
+    if (start) this.launch(conversationId, { text, source: { chat, from } });
+  }
+
+  private enqueue(conversationId: string, turn: UserTurn): void {
+    const follow = this.followups.get(conversationId) ?? [];
+    follow.push(turn);
+    this.followups.set(conversationId, follow);
+  }
+
+  private launch(conversationId: string, input: UserTurn): void {
+    const running = this.runTurn(conversationId, input);
+    this.turns.set(conversationId, running);
+    void running.finally(() => {
+      if (this.turns.get(conversationId) === running) this.turns.delete(conversationId);
+    });
   }
 
   async waitForIdle(conversationId?: string): Promise<void> {
@@ -295,13 +390,15 @@ export class SessionGateway {
   private async runTurn(conversationId: string, input: UserTurn): Promise<void> {
     const turn = this.active.get(conversationId);
     if (!turn) return;
+    turn.phase = "running";
     try {
       await turn.adapter.typing(turn.surface).catch(() => undefined);
-      const snap = this.store.snapshot(conversationId);
+      const snap = this.store.snapshot(conversationId, { maxMessages: this.logWindow });
       const ensured = await this.driver.ensureSession(snap);
       this.agentSessions.set(conversationId, ensured.agentSessionId);
       const sink = this.makeSink(turn);
       const result = await this.driver.prompt(ensured.agentSessionId, input, sink);
+      turn.phase = "finalizing";
       const finalText = turn.generated || result.text;
       const refs = await turn.draft.finalize({
         blocks: [{ kind: "markdown", text: finalText || "…" }],
@@ -317,29 +414,41 @@ export class SessionGateway {
     } catch (err) {
       this.logger.error("turn failed", { conversationId, err: String(err) });
       try {
-        await turn.draft.abort("turn failed");
+        await turn.draft.abort(err instanceof Error ? err.message : "turn failed");
       } catch {
         // ignore
       }
-    } finally {
-      this.active.delete(conversationId);
     }
-    const queued = this.followups.get(conversationId) ?? [];
-    this.followups.delete(conversationId);
-    const next = queued.at(-1);
-    if (next) {
-      const adapter = this.adapterFor(next.source.chat);
-      if (adapter) {
-        this.active.set(conversationId, {
-          conversationId,
-          surface: next.source.chat,
-          adapter,
-          draft: await adapter.draft(next.source.chat),
-          generated: "",
-          personId: turn.personId,
-        });
-        await this.runTurn(conversationId, next);
+
+    let next: UserTurn | undefined;
+    let handoffAdapter: Adapter | undefined;
+    await this.lane(conversationId, async () => {
+      const queued = this.followups.get(conversationId) ?? [];
+      this.followups.delete(conversationId);
+      if (queued.length === 0) {
+        this.active.delete(conversationId);
+        return;
       }
+      next = {
+        text: queued.map((q) => q.text).join("\n"),
+        source: queued[queued.length - 1]!.source,
+      };
+      const live = this.active.get(conversationId) ?? turn;
+      live.phase = "handoff";
+      const adapter = this.adapterFor(next.source.chat) ?? live.adapter;
+      live.adapter = adapter;
+      live.surface = next.source.chat;
+      live.generated = "";
+      live.replyTo = undefined;
+      this.active.set(conversationId, live);
+      handoffAdapter = adapter;
+    });
+    if (next && handoffAdapter) {
+      const live = this.active.get(conversationId);
+      if (!live) return;
+      live.draft = await handoffAdapter.draft(next.source.chat);
+      live.phase = "running";
+      await this.runTurn(conversationId, next);
     }
   }
 
@@ -356,16 +465,30 @@ export class SessionGateway {
       },
       requestApproval: async (req) => {
         const live = this.active.get(turn.conversationId) ?? turn;
-        const approval = this.store.createApproval(live.conversationId, req.toolCallId, req.title, req.options);
+        const approval = this.store.createApproval(
+          live.conversationId,
+          req.toolCallId,
+          req.title,
+          req.options,
+          live.personId,
+          this.clock.now(),
+        );
         await this.renderApproval(approval, live.adapter, live.surface);
         return this.waitForApproval(approval.id);
       },
     };
   }
 
-  private waitForApproval(id: string): Promise<string> {
+  private waitForApproval(id: string): Promise<ApprovalDecision> {
     return new Promise((resolve) => {
       this.approvalWaiters.set(id, { resolve });
+      void this.clock.sleep(this.approvalTimeoutMs).then(() => {
+        if (!this.approvalWaiters.has(id)) return;
+        this.approvalWaiters.delete(id);
+        const decided = this.store.decideApproval(id, "denied", "timeout", this.clock.now(), "deny");
+        if (decided) void this.updateApprovalCards(decided, "denied");
+        resolve("deny");
+      });
     });
   }
 
@@ -373,7 +496,7 @@ export class SessionGateway {
     const buttons = (approval.options.length > 0 ? approval.options : ["approve", "deny"]).map((opt) => ({
       id: opt,
       label: opt === "deny" ? "Deny" : opt === "approve" ? "Approve" : opt,
-      style: opt === "deny" ? ("danger" as const) : ("primary" as const),
+      style: opt === "deny" || isDenyLike(opt) ? ("danger" as const) : ("primary" as const),
       value: approval.id,
     }));
     const refs = await adapter.send(chat, {
@@ -392,17 +515,45 @@ export class SessionGateway {
     }
   }
 
-  private async handleAction(_adapter: Adapter, from: UserRef, actionId: string, value?: string): Promise<void> {
+  private canDecide(approval: PendingApproval, from: UserRef): boolean {
+    const ident = this.store.findIdentity(from.platform, from.accountId, from.userId);
+    if (!ident) return false;
+    const conv = this.store.conversationMeta(approval.conversationId);
+    if (!conv) return false;
+    if (conv.personId) return ident.personId === conv.personId;
+    if (approval.requestedBy) return ident.personId === approval.requestedBy;
+    return true;
+  }
+
+  private interpretAction(approval: PendingApproval, actionId: string): { option: ApprovalDecision; approved: boolean } {
+    const options = approval.options.length > 0 ? approval.options : ["approve", "deny"];
+    if (!options.includes(actionId)) return { option: "deny", approved: false };
+    return { option: actionId, approved: isExplicitApprove(actionId) };
+  }
+
+  private async handleAction(from: UserRef, actionId: string, value?: string): Promise<void> {
     const approvalId = value && this.store.getApproval(value) ? value : actionId;
     const approval = this.store.getApproval(approvalId);
     if (!approval || approval.state !== "pending") return;
-    const decision = actionId === "deny" || actionId === "denied" ? "denied" : "approved";
-    const decided = this.store.decideApproval(approval.id, decision, identityKey(from.platform, from.accountId, from.userId), this.clock.now());
+    if (!this.canDecide(approval, from)) return;
+    const { option, approved } = this.interpretAction(approval, actionId);
+    const state = approved ? "approved" : "denied";
+    const decided = this.store.decideApproval(
+      approval.id,
+      state,
+      identityKey(from.platform, from.accountId, from.userId),
+      this.clock.now(),
+      option,
+    );
     if (!decided) return;
-    this.approvalWaiters.get(approval.id)?.resolve(decision);
+    this.approvalWaiters.get(approval.id)?.resolve(option);
     this.approvalWaiters.delete(approval.id);
-    const handled = `${approval.title}\n\n_handled (${decision})_`;
-    for (const card of decided.cards) {
+    await this.updateApprovalCards(decided, state);
+  }
+
+  private async updateApprovalCards(approval: PendingApproval, state: string): Promise<void> {
+    const handled = `${approval.title}\n\n_handled (${state})_`;
+    for (const card of approval.cards) {
       const dest = this.adapterFor(card.chat);
       if (!dest) continue;
       try {
@@ -428,4 +579,8 @@ export class SessionGateway {
 
 function sameSurface(a: ChatRef, b: ChatRef): boolean {
   return a.platform === b.platform && a.accountId === b.accountId && a.chatId === b.chatId;
+}
+
+function isDenyLike(opt: string): boolean {
+  return /^(deny|denied|reject|rejected|block|no)$/i.test(opt);
 }

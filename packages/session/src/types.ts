@@ -25,6 +25,17 @@ export interface ConversationSnapshot {
   messages: LogMessage[];
 }
 
+export interface ConversationMeta {
+  id: string;
+  personId?: string;
+  groupKey?: string;
+  title: string;
+  isDefault: boolean;
+}
+
+/** Chosen button id. Only `approve` / `approved` count as an explicit approve. */
+export type ApprovalDecision = string;
+
 export interface UserTurn {
   text: string;
   source: { chat: ChatRef; from: UserRef };
@@ -39,7 +50,7 @@ export interface ApprovalRequest {
 export interface TurnSink {
   text(delta: string): void;
   status(s: string): void;
-  requestApproval(req: ApprovalRequest): Promise<string>;
+  requestApproval(req: ApprovalRequest): Promise<ApprovalDecision>;
 }
 
 export interface TurnResult {
@@ -73,5 +84,16 @@ export interface PendingApproval {
   options: string[];
   version: number;
   state: "pending" | "approved" | "denied";
+  requestedBy?: string;
+  chosen?: string;
+  createdAt?: number;
   cards: Array<{ chat: ChatRef; messageId: string }>;
+}
+
+export function isExplicitApprove(option: string): boolean {
+  return /^(approve|approved)$/i.test(option.trim());
+}
+
+export function isDenyOption(option: string): boolean {
+  return /^(deny|denied|reject|rejected|block|no)$/i.test(option.trim());
 }

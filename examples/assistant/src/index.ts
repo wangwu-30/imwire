@@ -9,16 +9,38 @@ function env(name: string): string | undefined {
   return value && value.length > 0 ? value : undefined;
 }
 
+/** Entries are `platform:accountId:userId` or `platform:accountId:userId,Name`, separated by comma, semicolon, or newline. */
+export function parseAllowlist(raw: string): OwnerAllowlistEntry[] {
+  const tokens = raw.split(/[,;\n]+/).map((s) => s.trim()).filter(Boolean);
+  const out: OwnerAllowlistEntry[] = [];
+  for (let i = 0; i < tokens.length; ) {
+    const t = tokens[i] ?? "";
+    const parts = t.split(":");
+    if (parts.length >= 3) {
+      const platform = parts[0] ?? "";
+      const userId = parts[parts.length - 1] ?? "";
+      const accountId = parts.slice(1, -1).join(":");
+      const next = tokens[i + 1];
+      const named = next && !next.includes(":");
+      out.push({ platform, accountId, userId, name: named ? next : undefined });
+      i += named ? 2 : 1;
+    } else {
+      i += 1;
+    }
+  }
+  return out;
+}
+
 function allowlist(): OwnerAllowlistEntry[] {
   const raw = env("IMWIRE_ALLOWLIST");
-  if (!raw) return [];
-  // platform:accountId:userId[,name]
-  return raw.split(/[;\n]/).flatMap((part) => {
-    const [triple, name] = part.trim().split(",", 2);
-    const [platform, accountId, userId] = (triple ?? "").split(":");
-    if (!platform || !accountId || !userId) return [];
-    return [{ platform, accountId, userId, name }];
-  });
+  return raw ? parseAllowlist(raw) : [];
+}
+
+function inferProvider(): string {
+  if (env("IMWIRE_PI_PROVIDER")) return env("IMWIRE_PI_PROVIDER")!;
+  if (env("ANTHROPIC_API_KEY") && !env("OPENAI_API_KEY")) return "anthropic";
+  if (env("OPENAI_API_KEY")) return "openai";
+  return "openai";
 }
 
 function driver(): PiAgentDriver {
@@ -26,7 +48,7 @@ function driver(): PiAgentDriver {
   if (usePi) {
     return new PiAgentDriver({
       usePi: true,
-      modelProvider: env("IMWIRE_PI_PROVIDER"),
+      modelProvider: inferProvider(),
       modelId: env("IMWIRE_PI_MODEL"),
       systemPrompt: env("IMWIRE_SYSTEM_PROMPT"),
     });
@@ -73,7 +95,7 @@ Set env vars (see .env.example):
 
   TELEGRAM_BOT_TOKEN / IMWIRE_TELEGRAM_BOT_TOKEN
   FEISHU_APP_ID + FEISHU_APP_SECRET
-  IMWIRE_ALLOWLIST          platform:accountId:userId  (comma-separated)
+  IMWIRE_ALLOWLIST          platform:accountId:userId[,Name]  (comma or semicolon)
   IMWIRE_DB                 sqlite path (default ./imwire.sqlite)
   IMWIRE_USE_PI=1           + OPENAI_API_KEY or ANTHROPIC_API_KEY
 `);

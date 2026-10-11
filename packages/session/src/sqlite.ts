@@ -9,6 +9,7 @@ export interface SqlStatement<T = Record<string, unknown>> {
 export interface SqlDatabase {
   exec(sql: string): void;
   prepare<T = Record<string, unknown>>(sql: string): SqlStatement<T>;
+  transaction<T>(fn: () => T): T;
   close(): void;
 }
 
@@ -23,8 +24,8 @@ type RawDb = {
 };
 
 /**
- * Prefer better-sqlite3 (CI is Node 20). Fall back to `node:sqlite` on Node 22+
- * if the native module is unavailable.
+ * Prefer better-sqlite3 (CI includes a compiler). Fall back to `node:sqlite`
+ * on Node 22+. Both paths set WAL + busy_timeout.
  */
 export function openSqlite(path: string): SqlDatabase {
   const req = createRequire(import.meta.url);
@@ -35,20 +36,37 @@ export function openSqlite(path: string): SqlDatabase {
     const db = new Database(path);
     try {
       db.pragma("journal_mode = WAL");
+      db.pragma("busy_timeout = 5000");
+      db.pragma("foreign_keys = ON");
     } catch {
       // :memory:
     }
     return wrap(db);
-  } catch {
-    // native module missing — try node:sqlite
+  } catch (nativeErr) {
+    let nodeSqlite: { DatabaseSync?: new (filename: string) => RawDb };
+    try {
+      nodeSqlite = req("node:sqlite") as { DatabaseSync?: new (filename: string) => RawDb };
+    } catch (builtinErr) {
+      throw new Error(
+        `SQLite unavailable. Install better-sqlite3 (needs a compiler on Node 20) or use Node 22+ (node:sqlite). native=${String(nativeErr)} builtin=${String(builtinErr)}`,
+      );
+    }
+    if (!nodeSqlite.DatabaseSync) {
+      throw new Error(
+        `SQLite unavailable. Install better-sqlite3 (needs a compiler on Node 20) or use Node 22+. native=${String(nativeErr)}`,
+      );
+    }
+    const db = new nodeSqlite.DatabaseSync(path);
+    const wrapped = wrap(db);
+    try {
+      wrapped.exec("PRAGMA journal_mode = WAL");
+      wrapped.exec("PRAGMA busy_timeout = 5000");
+      wrapped.exec("PRAGMA foreign_keys = ON");
+    } catch {
+      // :memory:
+    }
+    return wrapped;
   }
-  const nodeSqlite = req("node:sqlite") as {
-    DatabaseSync?: new (filename: string) => RawDb;
-  };
-  if (!nodeSqlite.DatabaseSync) {
-    throw new Error("no SQLite backend: install better-sqlite3 or use Node 22+");
-  }
-  return wrap(new nodeSqlite.DatabaseSync(path));
 }
 
 function wrap(db: RawDb): SqlDatabase {
@@ -61,6 +79,21 @@ function wrap(db: RawDb): SqlDatabase {
         get: (...params) => stmt.get(...params) as T | undefined,
         all: (...params) => stmt.all(...params) as T[],
       };
+    },
+    transaction<T>(fn: () => T): T {
+      db.exec("BEGIN IMMEDIATE");
+      try {
+        const result = fn();
+        db.exec("COMMIT");
+        return result;
+      } catch (err) {
+        try {
+          db.exec("ROLLBACK");
+        } catch {
+          // already closed / no txn
+        }
+        throw err;
+      }
     },
     close: () => db.close(),
   };

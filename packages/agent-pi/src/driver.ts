@@ -1,108 +1,246 @@
-import type { AgentDriver, ConversationSnapshot, TurnResult, TurnSink, UserTurn } from "@imwire/session";
+import { Agent, type AgentTool } from "@earendil-works/pi-agent-core";
+import { createModels, type Api, type Model, type Models } from "@earendil-works/pi-ai";
+import type {
+  AgentDriver,
+  ApprovalDecision,
+  ConversationSnapshot,
+  TurnResult,
+  TurnSink,
+  UserTurn,
+} from "@imwire/session";
+import { isExplicitApprove } from "@imwire/session";
 import { createFakePiProvider, type PiTokenSource } from "./fake-provider.js";
+import { snapshotToPi, userTextOf, windowMessages } from "./messages.js";
 
 export interface PiAgentDriverOptions {
   source?: PiTokenSource;
   systemPrompt?: string;
-  /** When set, the real pi Agent is used (model/provider via env). */
   usePi?: boolean;
   modelProvider?: string;
   modelId?: string;
+  /** Injected Models (tests: createModels + fauxProvider). */
+  models?: Models;
+  contextChars?: number;
+  tools?: AgentTool[];
 }
 
+type LiveAgent = {
+  agent: Agent;
+  model: Model<Api>;
+  provider: string;
+  modelId: string;
+};
+
 /**
- * AgentDriver over `@earendil-works/pi-agent-core`.
- * Tests inject `source` (fake provider). Production can set `usePi: true`
- * and PI_* / provider API keys in the environment.
+ * AgentDriver over `@earendil-works/pi-agent-core` 1.1.0.
+ * One Agent per conversation so steer / abort work. History is rebuilt from
+ * the session log (pi message shapes) on ensureSession.
  */
 export class PiAgentDriver implements AgentDriver {
-  private readonly source: PiTokenSource;
+  private readonly source?: PiTokenSource;
   private readonly systemPrompt: string;
-  private readonly sessions = new Map<string, Array<{ role: string; content: string }>>();
+  private readonly usePi: boolean;
+  private readonly modelProvider: string;
+  private readonly modelId: string;
+  private readonly models?: Models;
+  private readonly contextChars: number;
+  private readonly tools: AgentTool[];
+  private readonly agents = new Map<string, LiveAgent>();
+  private readonly snaps = new Map<string, ConversationSnapshot>();
+  private readonly bootErrors = new Map<string, Error>();
+  private readonly legacy = new Map<string, Array<{ role: string; content: string }>>();
 
   constructor(opts: PiAgentDriverOptions = {}) {
-    this.source = opts.source ?? createFakePiProvider([{ type: "text", delta: "…" }]);
     this.systemPrompt = opts.systemPrompt ?? "You are a helpful assistant.";
-    if (opts.usePi) {
-      this.source = wrapRealPi(opts) ?? this.source;
-    }
+    this.usePi = Boolean(opts.usePi || opts.models);
+    this.modelProvider = opts.modelProvider ?? process.env.IMWIRE_PI_PROVIDER ?? "openai";
+    this.modelId = opts.modelId ?? process.env.IMWIRE_PI_MODEL ?? "gpt-4o-mini";
+    this.models = opts.models;
+    this.contextChars = opts.contextChars ?? 32_000;
+    this.tools = opts.tools ?? [];
+    if (!this.usePi) this.source = opts.source ?? createFakePiProvider([{ type: "text", delta: "…" }]);
   }
 
   async ensureSession(conv: ConversationSnapshot): Promise<{ agentSessionId: string }> {
     const id = `pi:${conv.id}`;
-    if (!this.sessions.has(id)) {
-      const history = conv.messages.map((m) => ({
-        role: m.role === "assistant" ? "assistant" : "user",
-        content: m.text,
-      }));
-      this.sessions.set(id, [{ role: "system", content: this.systemPrompt }, ...history]);
+    this.snaps.set(id, conv);
+    if (this.usePi) {
+      try {
+        await this.ensureAgent(id, conv);
+      } catch (err) {
+        this.bootErrors.set(id, err instanceof Error ? err : new Error(String(err)));
+      }
+    } else if (!this.legacy.has(id)) {
+      this.legacy.set(id, [{ role: "system", content: this.systemPrompt }]);
     }
     return { agentSessionId: id };
   }
 
   async prompt(sessionId: string, input: UserTurn, sink: TurnSink): Promise<TurnResult> {
-    const messages = this.sessions.get(sessionId) ?? [{ role: "system", content: this.systemPrompt }];
-    messages.push({ role: "user", content: input.text });
+    if (this.usePi) return this.promptPi(sessionId, input, sink);
+    return this.promptLegacy(sessionId, input, sink);
+  }
+
+  async steer(sessionId: string, input: UserTurn): Promise<boolean> {
+    const live = this.agents.get(sessionId);
+    if (!live) return false;
+    live.agent.steer({ role: "user", content: input.text, timestamp: Date.now() });
+    return true;
+  }
+
+  async cancel(sessionId: string): Promise<void> {
+    this.agents.get(sessionId)?.agent.abort();
+  }
+
+  private async ensureAgent(sessionId: string, conv: ConversationSnapshot): Promise<LiveAgent> {
+    const existing = this.agents.get(sessionId);
+    if (existing) {
+      existing.agent.state.messages = snapshotToPi(conv, {
+        systemPrompt: this.systemPrompt,
+        provider: existing.provider,
+        model: existing.modelId,
+        maxChars: this.contextChars,
+      });
+      return existing;
+    }
+    const models = this.models ?? (await loadModels());
+    const model = models.getModel(this.modelProvider, this.modelId);
+    if (!model) {
+      throw new Error(`Unknown model ${this.modelProvider}/${this.modelId}. Set IMWIRE_PI_PROVIDER / IMWIRE_PI_MODEL.`);
+    }
+    const messages = snapshotToPi(conv, {
+      systemPrompt: this.systemPrompt,
+      provider: this.modelProvider,
+      model: this.modelId,
+      maxChars: this.contextChars,
+    });
+    const agent = new Agent({
+      initialState: {
+        systemPrompt: this.systemPrompt,
+        model,
+        messages,
+        tools: this.tools,
+      },
+      streamFn: models.streamSimple.bind(models),
+      transformContext: async (msgs) => windowMessages(msgs, this.contextChars),
+      beforeToolCall: async (ctx) => {
+        const sink = this.activeSink.get(sessionId);
+        if (!sink) return { block: true, reason: "no active turn" };
+        const decision: ApprovalDecision = await sink.requestApproval({
+          toolCallId: ctx.toolCall.id,
+          title: `Run ${ctx.toolCall.name}?`,
+          options: ["approve", "deny"],
+        });
+        if (!isExplicitApprove(decision)) return { block: true, reason: `denied:${decision}`, terminate: true };
+        return undefined;
+      },
+    });
+    const live = { agent, model, provider: this.modelProvider, modelId: this.modelId };
+    this.agents.set(sessionId, live);
+    return live;
+  }
+
+  private readonly activeSink = new Map<string, TurnSink>();
+
+  private async promptPi(sessionId: string, input: UserTurn, sink: TurnSink): Promise<TurnResult> {
+    this.activeSink.set(sessionId, sink);
+    try {
+      const boot = this.bootErrors.get(sessionId);
+      if (boot) {
+        sink.text(boot.message);
+        return { text: boot.message };
+      }
+      const snap = this.snaps.get(sessionId);
+      let live: LiveAgent;
+      try {
+        live = await this.ensureAgent(sessionId, snap ?? { id: sessionId, title: "default", isDefault: true, messages: [] });
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        sink.text(msg);
+        return { text: msg };
+      }
+
+      if (snap) {
+        const mapped = snapshotToPi(snap, {
+          systemPrompt: this.systemPrompt,
+          provider: live.provider,
+          model: live.modelId,
+          maxChars: this.contextChars,
+        });
+        if (live.agent.state.messages.length <= mapped.length) {
+          live.agent.state.messages = mapped;
+        }
+      }
+
+      let text = "";
+      const unsub = live.agent.subscribe((event) => {
+        if (event.type !== "message_update") return;
+        const inner = event.assistantMessageEvent;
+        if (inner.type === "text_delta" && inner.delta) {
+          text += inner.delta;
+          sink.text(inner.delta);
+        }
+      });
+
+      const last = live.agent.state.messages.at(-1);
+      const already = last?.role === "user" && userTextOf(last) === input.text;
+      if (already) await live.agent.continue();
+      else await live.agent.prompt({ role: "user", content: input.text, timestamp: Date.now() });
+      unsub();
+
+      const err = live.agent.state.errorMessage;
+      const lastMsg = live.agent.state.messages.at(-1);
+      const stop =
+        lastMsg && lastMsg.role === "assistant" && "stopReason" in lastMsg
+          ? (lastMsg as { stopReason?: string; errorMessage?: string })
+          : undefined;
+      if (err || stop?.stopReason === "error") {
+        const msg = err ?? stop?.errorMessage ?? "model error";
+        if (!text) sink.text(msg);
+        return { text: text || msg };
+      }
+      return { text };
+    } finally {
+      this.activeSink.delete(sessionId);
+    }
+  }
+
+  private async promptLegacy(sessionId: string, input: UserTurn, sink: TurnSink): Promise<TurnResult> {
+    const snap = this.snaps.get(sessionId);
+    const history = this.legacy.get(sessionId) ?? [{ role: "system", content: this.systemPrompt }];
+    const last = history.at(-1);
+    if (!(last?.role === "user" && last.content === input.text) && !snapHasUser(snap, input.text)) {
+      history.push({ role: "user", content: input.text });
+    } else if (last?.role !== "user") {
+      // snapshot already has it; do not duplicate
+    }
     let text = "";
-    for await (const event of this.source(messages)) {
+    const source = this.source!;
+    for await (const event of source(history)) {
       if (event.type === "text") {
         text += event.delta;
         sink.text(event.delta);
       } else if (event.type === "approval") {
-        const decision = await sink.requestApproval(event.req);
-        messages.push({ role: "user", content: `approval:${event.req.toolCallId}=${decision}` });
+        await sink.requestApproval(event.req);
       }
     }
-    messages.push({ role: "assistant", content: text });
-    this.sessions.set(sessionId, messages);
+    history.push({ role: "assistant", content: text });
+    this.legacy.set(sessionId, history);
     return { text };
   }
+}
 
-  async cancel(): Promise<void> {
-    return;
+function snapHasUser(snap: ConversationSnapshot | undefined, text: string): boolean {
+  const last = snap?.messages.at(-1);
+  return last?.role === "user" && last.text === text;
+}
+
+async function loadModels(): Promise<Models> {
+  try {
+    const all = await import("@earendil-works/pi-ai/providers/all");
+    if (typeof all.builtinModels === "function") return all.builtinModels();
+  } catch {
+    // fall through
   }
-}
-
-function wrapRealPi(opts: PiAgentDriverOptions): PiTokenSource | undefined {
-  // Bound at runtime so tests never load provider SDKs.
-  return async function* (messages) {
-    const core = await import("@earendil-works/pi-agent-core");
-    const Agent = (core as unknown as { Agent?: new (o: Record<string, unknown>) => PiAgent }).Agent;
-    const all = await import("@earendil-works/pi-ai/providers/all" as string).catch(() => undefined);
-    const ai = await import("@earendil-works/pi-ai");
-    const builtinModels = (all as { builtinModels?: () => PiModels } | undefined)?.builtinModels;
-    const createModels = (ai as { createModels?: () => PiModels }).createModels;
-    const models = builtinModels?.() ?? createModels?.();
-    if (!Agent || !models) {
-      yield { type: "text", delta: "pi packages loaded but Agent / models were not found." };
-      return;
-    }
-    const provider = opts.modelProvider ?? process.env.IMWIRE_PI_PROVIDER ?? "openai";
-    const modelId = opts.modelId ?? process.env.IMWIRE_PI_MODEL ?? "gpt-4o-mini";
-    const model = models.getModel?.(provider, modelId);
-    const chunks: string[] = [];
-    const agent = new Agent({
-      initialState: { systemPrompt: opts.systemPrompt ?? "You are a helpful assistant.", model, messages },
-      streamFn: models.streamSimple?.bind(models),
-    });
-    agent.subscribe?.((event) => {
-      const inner = (event as { assistantMessageEvent?: { type?: string; delta?: string } }).assistantMessageEvent;
-      if ((event as { type?: string }).type === "message_update" && inner?.type === "text_delta" && inner.delta) {
-        chunks.push(inner.delta);
-      }
-    });
-    const last = messages.at(-1)?.content ?? "";
-    await agent.prompt?.(last);
-    for (const c of chunks) yield { type: "text", delta: c };
-  };
-}
-
-interface PiModels {
-  getModel?(provider: string, id: string): unknown;
-  streamSimple?: (...args: unknown[]) => unknown;
-}
-
-interface PiAgent {
-  subscribe?(fn: (event: unknown) => void): void;
-  prompt?(text: string): Promise<unknown>;
+  return createModels();
 }

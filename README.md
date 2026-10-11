@@ -66,8 +66,8 @@ Config is env vars only. Never commit tokens.
 | `@imwire/core` | Normalized events, `Adapter`, capability table, dedup, rate limit, retry, reconnect, chunking, streaming-draft degrade. The `imwire` name is reserved for the CLI. |
 | `@imwire/telegram` | Bot API long polling (`getUpdates`), edits, inline keyboards, typing, stream-via-`editMessageText` |
 | `@imwire/feishu` | Official `@larksuiteoapi/node-sdk` WebSocket long connection, Card JSON 2.0, CardKit streaming with patch fallback |
-| `@imwire/session` | Person identities, `/pair` codes, default + named topics, group isolation, follow-the-user routing, mid-stream switch, first-click-wins approvals. SQLite WAL (better-sqlite3, or `node:sqlite` on Node 22+). Depends only on `@imwire/core`. |
-| `@imwire/agent-pi` | `AgentDriver` over `@earendil-works/pi-agent-core` + `@earendil-works/pi-ai`. Tests inject `createFakePiProvider` (no network). |
+| `@imwire/session` | Person identities, hashed `/pair` codes (lockout + one live code), default + named topics, group isolation, follow-the-user routing, mid-stream switch, first-click-wins + authorized + TTL approvals. SQLite WAL + `busy_timeout` (better-sqlite3, or `node:sqlite` on Node 22+). Depends only on `@imwire/core`. |
+| `@imwire/agent-pi` | `AgentDriver` over `@earendil-works/pi-agent-core` + `@earendil-works/pi-ai` 1.1.0. One Agent per conversation; log → pi `Message` shapes; live `text_delta` streaming; `beforeToolCall` → imwire approvals. Tests use pi-ai `fauxProvider` (no network). |
 | `@imwire/example-echo` | Tiny dual-adapter demo |
 | `@imwire/example-assistant` | Telegram + Feishu + session + pi, env-config only |
 
@@ -136,7 +136,7 @@ pnpm lint
 pnpm test
 ```
 
-CI (GitHub Actions) runs the same three commands. Adapter tests use recorded fixtures and a fake transport. Session / pi tests use `FakeAdapter` plus a scripted / fake provider — no live Telegram, Feishu, or model network calls.
+CI (GitHub Actions) runs the same three commands on Node 20 and Node 22. Adapter tests use recorded fixtures and a fake transport. Session / pi tests use `FakeAdapter` plus pi-ai `fauxProvider` — no live Telegram, Feishu, or model network calls. On Node 20, `better-sqlite3` must compile (or install a prebuild); without a compiler the session package throws a clear error instead of `ERR_UNKNOWN_BUILTIN_MODULE`.
 
 ```bash
 # acceptance demo (fake adapters): ask on TG, switch to Feishu mid-stream, approve on Feishu
