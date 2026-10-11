@@ -1,0 +1,6 @@
+{
+  "$id": "https://imwire.dev/schema/outbound.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "OutMessage",
+  "description": "Normalized outbound message. See imwire TypeScript types for the full definition."
+}

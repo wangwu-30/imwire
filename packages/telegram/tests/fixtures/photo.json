@@ -1,0 +1,28 @@
+{
+  "update_id": 1004,
+  "message": {
+    "message_id": 50,
+    "from": {
+      "id": 111,
+      "is_bot": false,
+      "first_name": "Ada"
+    },
+    "chat": {
+      "id": -200,
+      "title": "Team",
+      "type": "supergroup"
+    },
+    "date": 1710000200,
+    "message_thread_id": 7,
+    "caption": "see this @imwirebot",
+    "photo": [
+      { "file_id": "small", "width": 90, "height": 90, "file_size": 100 },
+      { "file_id": "large", "width": 800, "height": 600, "file_size": 9000 }
+    ],
+    "reply_to_message": {
+      "message_id": 49,
+      "date": 1710000190,
+      "chat": { "id": -200, "type": "supergroup" }
+    }
+  }
+}

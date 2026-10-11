@@ -1,0 +1,30 @@
+{
+  "schema": "2.0",
+  "header": {
+    "event_id": "f7984f25108f8137722bb63cee111",
+    "token": "verify",
+    "create_time": "1603977298000000",
+    "event_type": "card.action.trigger",
+    "tenant_key": "tenant",
+    "app_id": "cli_test"
+  },
+  "event": {
+    "operator": {
+      "tenant_key": "tenant",
+      "user_id": "867",
+      "open_id": "ou_operator",
+      "union_id": "on_operator"
+    },
+    "token": "c-card-token",
+    "action": {
+      "value": { "actionId": "approve" },
+      "tag": "button",
+      "name": "Button_approve"
+    },
+    "host": "im_message",
+    "context": {
+      "open_message_id": "om_card_1",
+      "open_chat_id": "oc_dm_1"
+    }
+  }
+}

@@ -1,0 +1,25 @@
+{
+  "name": "@imwire/feishu",
+  "version": "0.1.0",
+  "description": "imwire Feishu / Lark adapter (WebSocket long connection).",
+  "type": "module",
+  "license": "MIT",
+  "engines": {
+    "node": ">=20"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": ["dist", "src"],
+  "scripts": {
+    "build": "tsc -b",
+    "typecheck": "tsc -b --pretty false"
+  },
+  "dependencies": {
+    "@larksuiteoapi/node-sdk": "^1.55.0",
+    "imwire": "workspace:*"
+  }
+}

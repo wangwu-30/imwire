@@ -1,0 +1,15 @@
+{
+  "$id": "https://imwire.dev/schema/inbound.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Inbound",
+  "description": "Normalized inbound IM event. TypeScript types in imwire are the source of truth; this schema is the wire copy for later imwire serve / Python clients.",
+  "oneOf": [
+    { "$ref": "#/$defs/message" },
+    { "$ref": "#/$defs/edit" },
+    { "$ref": "#/$defs/reaction" },
+    { "$ref": "#/$defs/action" },
+    { "$ref": "#/$defs/command" },
+    { "$ref": "#/$defs/typing" },
+    { "$ref": "#/$defs/draft" }
+  ]
+}
