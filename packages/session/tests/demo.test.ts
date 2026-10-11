@@ -48,7 +48,6 @@ describe("acceptance demo (fake adapters)", () => {
     expect(markdownCalls(fs).some((t) => t.includes("the story continued"))).toBe(true);
     expect(markdownCalls(fs).some((t) => /handled \(approved\)/.test(t))).toBe(true);
     log.push("approval first click on Feishu won");
-    // eslint-disable-next-line no-console
     console.log(log.map((l, i) => `${i + 1}. ${l}`).join("\n"));
     gw.close();
   });

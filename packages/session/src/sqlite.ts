@@ -1,14 +1,14 @@
 import { createRequire } from "node:module";
 
-export interface SqlStatement {
+export interface SqlStatement<T = Record<string, unknown>> {
   run(...params: unknown[]): { changes: number };
-  get<T = Record<string, unknown>>(...params: unknown[]): T | undefined;
-  all<T = Record<string, unknown>>(...params: unknown[]): T[];
+  get(...params: unknown[]): T | undefined;
+  all(...params: unknown[]): T[];
 }
 
 export interface SqlDatabase {
   exec(sql: string): void;
-  prepare(sql: string): SqlStatement;
+  prepare<T = Record<string, unknown>>(sql: string): SqlStatement<T>;
   close(): void;
 }
 
@@ -54,12 +54,12 @@ export function openSqlite(path: string): SqlDatabase {
 function wrap(db: RawDb): SqlDatabase {
   return {
     exec: (sql) => db.exec(sql),
-    prepare(sql) {
+    prepare<T = Record<string, unknown>>(sql: string): SqlStatement<T> {
       const stmt = db.prepare(sql);
       return {
         run: (...params) => ({ changes: Number(stmt.run(...params).changes) }),
-        get: <T>(...params: unknown[]) => stmt.get(...params) as T | undefined,
-        all: <T>(...params: unknown[]) => stmt.all(...params) as T[],
+        get: (...params) => stmt.get(...params) as T | undefined,
+        all: (...params) => stmt.all(...params) as T[],
       };
     },
     close: () => db.close(),

@@ -392,7 +392,7 @@ export class SessionGateway {
     }
   }
 
-  private async handleAction(adapter: Adapter, from: UserRef, actionId: string, value?: string): Promise<void> {
+  private async handleAction(_adapter: Adapter, from: UserRef, actionId: string, value?: string): Promise<void> {
     const approvalId = value && this.store.getApproval(value) ? value : actionId;
     const approval = this.store.getApproval(approvalId);
     if (!approval || approval.state !== "pending") return;

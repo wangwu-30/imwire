@@ -67,7 +67,7 @@ function wrapRealPi(opts: PiAgentDriverOptions): PiTokenSource | undefined {
   // Bound at runtime so tests never load provider SDKs.
   return async function* (messages) {
     const core = await import("@earendil-works/pi-agent-core");
-    const Agent = (core as { Agent?: new (o: Record<string, unknown>) => PiAgent }).Agent;
+    const Agent = (core as unknown as { Agent?: new (o: Record<string, unknown>) => PiAgent }).Agent;
     const all = await import("@earendil-works/pi-ai/providers/all" as string).catch(() => undefined);
     const ai = await import("@earendil-works/pi-ai");
     const builtinModels = (all as { builtinModels?: () => PiModels } | undefined)?.builtinModels;
