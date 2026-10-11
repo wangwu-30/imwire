@@ -185,6 +185,7 @@ test("oversized WS frame is rejected (maxPayload 1 MiB)", async () => {
   const { host } = hostOf();
   const ws = await listen(host);
   const b = await open(ws.url, { Authorization: `Bearer ${ws.token}` });
+  b.socket.on("error", () => undefined);
   const closed = new Promise<void>((resolve) => b.socket.on("close", () => resolve()));
   b.socket.send(
     JSON.stringify({ jsonrpc: "2.0", id: 12, method: "hello", pad: "z".repeat(2 * 1024 * 1024) }),

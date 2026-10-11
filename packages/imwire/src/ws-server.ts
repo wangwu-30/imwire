@@ -2,7 +2,7 @@ import { timingSafeEqual, randomBytes } from "node:crypto";
 import type { IncomingMessage } from "node:http";
 import { createServer } from "node:http";
 import type { WebSocket } from "ws";
-import { MAX_RPC_BYTES, type JsonRpcMessage } from "./protocol.js";
+import type { JsonRpcMessage } from "./protocol.js";
 import type { ServeHost } from "./server.js";
 
 export const WS_MAX_PAYLOAD = 1_048_576;
@@ -84,6 +84,7 @@ export async function attachWebSocket(
   });
 
   wss.on("connection", (socket: WebSocket, _req: IncomingMessage) => {
+    socket.on("error", () => undefined);
     const write = (msg: JsonRpcMessage): void => {
       if (socket.readyState === socket.OPEN) socket.send(JSON.stringify(msg));
     };

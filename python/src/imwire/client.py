@@ -92,7 +92,7 @@ class ImwireClient:
     @classmethod
     async def connect_ws(cls, url: str, token: str | None = None) -> ImwireClient:
         try:
-            import websockets
+            import websockets  # type: ignore[import-not-found]
         except ImportError as exc:
             raise ImwireError("WebSocket support requires `pip install imwire[ws]`") from exc
         headers: dict[str, str] = {}

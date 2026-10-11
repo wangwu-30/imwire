@@ -68,6 +68,7 @@ export class WecomAdapter implements Adapter, Connectable {
         botId: opts.botId,
         secret: opts.secret,
       });
+    this.transport = opts.transport;
     this.runtime = new AdapterRuntime({
       platform: this.platform,
       accountId: this.accountId,

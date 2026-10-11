@@ -170,7 +170,7 @@ test("DT4 / DT5 createAndDeliver openSpaceId + deliver models", async () => {
   const dm = calls.find((r) => r.path.includes("createAndDeliver"))?.body;
   expect(dm?.openSpaceId).toBe("dtv1.card//IM_ROBOT.staff_1");
   expect(dm?.imRobotOpenDeliverModel).toEqual({ spaceType: "IM_ROBOT", robotCode: "ROBOT" });
-  expect(String(dm?.openSpaceId)).not.toContain("ROBOT.staff_1");
+  expect(String(dm?.openSpaceId)).not.toContain("IM_ROBOT.ROBOT.");
 
   calls.length = 0;
   await ad.send(
