@@ -1794,6 +1794,7 @@ export class SessionGateway {
       now,
       idempotencyKey: opts.idempotencyKey,
     });
+    if (opts.grant === undefined) warnDefaultGrant(request.id, agent.name, agent.id);
     if (replayed) {
       // Same idempotency key must not re-bind a different object.
       const prior = this.store.a2hActionState(request.id);
@@ -2022,6 +2023,7 @@ export class SessionGateway {
       now,
       idempotencyKey: opts.idempotencyKey,
     });
+    if (opts.grant === undefined) warnDefaultGrant(request.id, agent.name, agent.id);
     if (replayed) return this.a2hView(request);
     const code = shortCode(request.id);
     const how = allowFreeText
@@ -2487,6 +2489,13 @@ export function validateGrant(g: GrantSpec, now: number): GrantSpec {
     return { kind: "until", until: g.until };
   }
   throw new A2hError("invalid", "grant must be once, task or until");
+}
+
+/** In-process callers that omit grant get once; say so loudly (the RPC requires it). */
+function warnDefaultGrant(requestId: string, agentName: string, agentId: string): void {
+  console.warn(
+    `[imwire/a2h] request ${requestId} from agent ${agentName} (${agentId}) has no grant; defaulted to once. Pass grant explicitly (once | task | until).`,
+  );
 }
 
 export function wireGrant(g: GrantSpec): Record<string, unknown> {

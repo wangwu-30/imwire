@@ -2,7 +2,7 @@ import { mkdtempSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { SessionStore, canonicalJson, type EventEnvelope } from "@imwire/session";
 import { action, cmd } from "../../session/tests/helpers.js";
 import { addAgent, client, dump, rpcError, world, type World } from "./hub-world.js";
@@ -146,6 +146,29 @@ describe("v0 grant", () => {
     const until = new Date(w.clock.now() + 3600_000).toISOString();
     const u = await c.call<Record<string, unknown>>("a2h.approve", { to: w.ownerId, title: "y", grant: { kind: "until", until }, wait_s: 0 });
     expect((u.grant as { kind: string }).kind).toBe("until");
+  });
+
+  it("in-process calls without grant warn with request id + agent and default to once", async () => {
+    const w = await world();
+    const { agentId } = addAgent(w, "inproc");
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const a = await w.hub.gw.createAgentApproval({ agentId, to: w.ownerId, title: "x" });
+    const q = await w.hub.gw.askPerson({ agentId, to: w.ownerId, question: "q?" });
+    expect(warn).toHaveBeenCalledTimes(2);
+    const [m1] = warn.mock.calls[0]! as [string];
+    const [m2] = warn.mock.calls[1]! as [string];
+    for (const [m, id] of [[m1, a.requestId], [m2, q.requestId]] as const) {
+      expect(m).toContain(id);
+      expect(m).toContain("inproc");
+      expect(m).toContain(agentId);
+      expect(m).toContain("defaulted to once");
+    }
+    expect(a.grant).toEqual({ kind: "once" });
+    expect(q.grant).toEqual({ kind: "once" });
+    warn.mockClear();
+    await w.hub.gw.createAgentApproval({ agentId, to: w.ownerId, title: "y", grant: { kind: "once" } });
+    expect(warn).not.toHaveBeenCalled();
+    warn.mockRestore();
   });
 
   it("migration: requests without a grant become once", async () => {
