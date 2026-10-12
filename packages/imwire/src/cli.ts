@@ -1,5 +1,6 @@
 import { onShutdownSignal } from "@imwire/core";
 import { loadAdaptersFromEnv, parseAdapterList, type AdapterName } from "./env.js";
+import { runHubCli } from "./hub/commands.js";
 import { stderrLogger } from "./logger.js";
 import { serveStdio } from "./stdio.js";
 import { attachWebSocket, generateWsToken, isLoopbackHost } from "./ws-server.js";
@@ -30,8 +31,13 @@ function collectAdapters(): AdapterName[] {
 
 async function main(): Promise<void> {
   const cmd = process.argv[2] ?? "serve";
+  if (cmd === "hub" || cmd === "owner" || cmd === "agent" || cmd === "audit") {
+    process.exitCode = await runHubCli(process.argv.slice(2));
+    return;
+  }
   if (cmd === "help" || cmd === "--help" || cmd === "-h") {
-    console.error(`imwire serve --adapter NAME ... [--ws [port]] [--ws-host host] [--ws-token TOKEN] [--ws-allow-remote]
+    console.error(`imwire hub|owner|agent|audit ...   (a2h hub; run: imwire help)
+imwire serve --adapter NAME ... [--ws [port]] [--ws-host host] [--ws-token TOKEN] [--ws-allow-remote]
 
 Runs named IM adapters and speaks JSON-RPC 2.0 over stdio (newline-delimited).
 Adapters are NEVER inferred from leftover tokens — pass --adapter / IMWIRE_ADAPTERS.
@@ -41,7 +47,7 @@ See docs/protocol.md.`);
     return;
   }
   if (cmd !== "serve") {
-    console.error(`unknown command ${cmd}. Try: imwire serve`);
+    console.error(`unknown command ${cmd}. Try: imwire serve | imwire hub`);
     process.exitCode = 1;
     return;
   }

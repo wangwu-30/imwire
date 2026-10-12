@@ -1,7 +1,7 @@
 {
   "name": "imwire",
   "version": "0.1.0",
-  "description": "imwire serve CLI — run adapters as a JSON-RPC process (stdio / WebSocket).",
+  "description": "imwire CLI — `serve` adapters as JSON-RPC, or run the a2h `hub` (agents ↔ humans) with agent/owner/audit admin.",
   "type": "module",
   "license": "MIT",
   "engines": {
@@ -17,16 +17,22 @@
       "default": "./dist/index.js"
     }
   },
-  "files": ["dist", "src", "bin"],
+  "files": [
+    "dist",
+    "src",
+    "bin"
+  ],
   "scripts": {
     "build": "tsc -b",
     "typecheck": "tsc -b --pretty false",
     "start": "node dist/cli.js serve"
   },
   "dependencies": {
+    "@imwire/agent-pi": "workspace:*",
     "@imwire/core": "workspace:*",
     "@imwire/dingtalk": "workspace:*",
     "@imwire/feishu": "workspace:*",
+    "@imwire/session": "workspace:*",
     "@imwire/slack": "workspace:*",
     "@imwire/telegram": "workspace:*",
     "@imwire/wecom": "workspace:*",

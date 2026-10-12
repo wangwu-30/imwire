@@ -13,6 +13,7 @@
     "@imwire/core": "workspace:*",
     "@imwire/feishu": "workspace:*",
     "@imwire/session": "workspace:*",
-    "@imwire/telegram": "workspace:*"
+    "@imwire/telegram": "workspace:*",
+    "imwire": "workspace:*"
   }
 }

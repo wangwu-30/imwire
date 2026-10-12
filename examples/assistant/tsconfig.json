@@ -5,12 +5,27 @@
     "outDir": "dist",
     "composite": true
   },
-  "include": ["src/**/*.ts"],
+  "include": [
+    "src/**/*.ts"
+  ],
   "references": [
-    { "path": "../../packages/core" },
-    { "path": "../../packages/telegram" },
-    { "path": "../../packages/feishu" },
-    { "path": "../../packages/session" },
-    { "path": "../../packages/agent-pi" }
+    {
+      "path": "../../packages/core"
+    },
+    {
+      "path": "../../packages/telegram"
+    },
+    {
+      "path": "../../packages/feishu"
+    },
+    {
+      "path": "../../packages/session"
+    },
+    {
+      "path": "../../packages/agent-pi"
+    },
+    {
+      "path": "../../packages/imwire"
+    }
   ]
 }

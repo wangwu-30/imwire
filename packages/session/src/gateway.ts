@@ -62,6 +62,7 @@ const PAIR_RATE = 5;
 const PAIR_WINDOW_MS = 10 * 60 * 1000;
 const DEFAULT_APPROVAL_TTL_MS = 10 * 60 * 1000;
 const DEFAULT_SWEEP_INTERVAL_MS = 15 * 1000;
+const RESTART_LABEL = "已失效（hub 重启）";
 
 export interface SessionGatewayOptions {
   dbPath: string;
@@ -95,6 +96,11 @@ export interface SessionGatewayOptions {
    *   surfaces get a cooling-off period. Requires a TotpVerifier.
    */
   identityMode?: "legacy" | "totp";
+  /**
+   * Run the boot-time "pending → expired" pass (default true). Admin tools
+   * (CLI) that open the same DB next to a running hub must pass false.
+   */
+  bootExpiry?: boolean;
   logWindow?: number;
 }
 
@@ -137,6 +143,7 @@ export class SessionGateway {
   private readonly agentSessions = new Map<string, string>();
   private readonly turns = new Map<string, Promise<void>>();
   private readonly expiredOnBoot: PendingApproval[] = [];
+  private readonly expiredAsksOnBoot: A2hRequest[] = [];
   private readonly quietHours: QuietHours | null;
   private readonly verifier: ApproverVerifier;
   private readonly identityMode: "legacy" | "totp";
@@ -161,9 +168,11 @@ export class SessionGateway {
       throw new Error('identityMode "totp" requires a TotpVerifier');
     }
     this.quietHours = opts.quietHours === undefined ? DEFAULT_QUIET_HOURS : opts.quietHours;
+    const boot = opts.bootExpiry !== false;
     // Q4: a hub restart fails every open agent request closed.
-    for (const req of this.store.expirePendingA2hRequests(this.clock.now(), "restart")) {
+    for (const req of !boot ? [] :  this.store.expirePendingA2hRequests(this.clock.now(), "restart")) {
       this.logger.info("expired a2h request on boot", { id: req.id });
+      if (req.kind === "ask") this.expiredAsksOnBoot.push(req);
       this.store.audit({
         at: this.clock.now(),
         action: "expire",
@@ -173,7 +182,7 @@ export class SessionGateway {
         requestId: req.id,
       });
     }
-    for (const expired of this.store.expirePendingApprovals(this.clock.now(), "expired")) {
+    for (const expired of !boot ? [] : this.store.expirePendingApprovals(this.clock.now(), "expired")) {
       this.logger.info("expired stale approval on boot", { id: expired.id });
       this.expiredOnBoot.push(expired);
       this.syncA2hFromApproval(expired);
@@ -523,7 +532,13 @@ export class SessionGateway {
     try {
       for (const approval of this.expiredOnBoot) {
         if (this.closed) return;
-        await this.updateApprovalCards(approval, "expired");
+        // Q4: agent cards say plainly that the request died with the hub.
+        if (approval.source === "agent") await this.updateApprovalCards(approval, "expired", RESTART_LABEL);
+        else await this.updateApprovalCards(approval, "expired");
+      }
+      for (const req of this.expiredAsksOnBoot) {
+        if (this.closed) return;
+        await this.closeAskCards(req, RESTART_LABEL);
       }
     } catch (err) {
       if (this.closed) return;
@@ -1121,8 +1136,8 @@ export class SessionGateway {
     await this.updateApprovalCards(decided, state);
   }
 
-  private async updateApprovalCards(approval: PendingApproval, state: string): Promise<void> {
-    const handled = `${approval.title}\n\n_handled (${state})_`;
+  private async updateApprovalCards(approval: PendingApproval, state: string, label?: string): Promise<void> {
+    const handled = `${approval.title}\n\n_${label ?? `handled (${state})`}_`;
     for (const card of approval.cards) {
       const dest = this.adapterFor(card.chat);
       if (!dest) continue;
@@ -1387,6 +1402,67 @@ export class SessionGateway {
     }
     this.store.audit({ at: now, action: "lockout", result: "locked", personId });
     await this.notifyAllSurfaces(personId, "验证码连续错误，已锁定 15 分钟，所有待审批已拒绝。不是你操作的话，请在 Mac mini 上执行 imwire owner reset。");
+  }
+
+  // ---- a2h: hub support (PR 3) ----------------------------------------------
+
+  /** Revocation: every open request of the agent becomes cancelled (approvals deny). */
+  async cancelAgentRequests(agentId: string, reason = "agent revoked"): Promise<number> {
+    const open = this.store.pendingA2hRequests().filter((r) => r.agentId === agentId);
+    for (const r of open) await this.cancelRequest({ agentId, requestId: r.id, reason });
+    return open.length;
+  }
+
+  /** People this agent may reach (grant + target gate). No raw IM ids are returned. */
+  findPeople(agentId: string, query?: string): Array<{
+    personId: string;
+    name?: string;
+    reachableVia: string[];
+    allowed: A2hScope[];
+  }> {
+    const agent = this.store.getAgent(agentId);
+    if (!agent || agent.revokedAt !== undefined) throw new A2hError("unknown_agent", "unknown agent");
+    const q = query?.trim().toLowerCase();
+    return this.store
+      .agentGrants(agentId)
+      .filter((g) => this.isA2hTargetAllowed(g.personId))
+      .map((g) => {
+        const person = this.store.getPerson(g.personId);
+        let via: string[] = [];
+        try {
+          via = [...new Set(this.a2hSurfaces(g.personId, "all").map((c) => c.platform))];
+        } catch {
+          via = [];
+        }
+        return { personId: g.personId, name: person?.name, reachableVia: via, allowed: g.scopes };
+      })
+      .filter((p) => !q || p.personId === query || (p.name ?? "").toLowerCase() === q);
+  }
+
+  /** Messages in the agent's own topic for a person. Human text is untrusted. */
+  readAgentContext(opts: { agentId: string; to: string; sinceSeq?: number; limit?: number }): {
+    conversationId: string;
+    messages: Array<{ seq: number; author: string; via?: string; at: string; text: string; requestId: string | null; untrusted: true }>;
+  } {
+    const { agent, personId } = this.a2hAuthorize(opts.agentId, opts.to, "read");
+    const conv = this.agentTopic(agent, personId);
+    const limit = Math.max(1, Math.min(opts.limit ?? 30, 50));
+    const msgs = this.store
+      .snapshot(conv.id)
+      .messages.filter((m) => m.seq > (opts.sinceSeq ?? 0))
+      .slice(-limit);
+    return {
+      conversationId: conv.id,
+      messages: msgs.map((m) => ({
+        seq: m.seq,
+        author: m.author ?? (m.role === "user" ? "human" : "assistant"),
+        via: m.surface?.platform,
+        at: isoLocal(m.createdAt),
+        text: m.text,
+        requestId: m.requestId ?? null,
+        untrusted: true as const,
+      })),
+    };
   }
 
   // ---- a2h: agent-facing API (PR 2) ---------------------------------------
