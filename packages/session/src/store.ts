@@ -172,6 +172,40 @@ CREATE TABLE IF NOT EXISTS audit_log (
   result TEXT NOT NULL,
   detail TEXT
 );
+CREATE TABLE IF NOT EXISTS person_credential (
+  id TEXT PRIMARY KEY,
+  person_id TEXT NOT NULL REFERENCES person(id),
+  kind TEXT NOT NULL,
+  secret_enc BLOB,
+  public_key BLOB,
+  code_hash TEXT,
+  last_step INTEGER,
+  created_at INTEGER NOT NULL,
+  revoked_at INTEGER
+);
+CREATE INDEX IF NOT EXISTS person_credential_person ON person_credential(person_id, kind);
+CREATE TABLE IF NOT EXISTS approval_stepup (
+  request_id TEXT PRIMARY KEY,
+  person_id TEXT NOT NULL,
+  method TEXT NOT NULL,
+  surface TEXT NOT NULL,
+  verified_at INTEGER NOT NULL,
+  consumed_at INTEGER
+);
+CREATE TABLE IF NOT EXISTS auth_failure (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  person_id TEXT,
+  at INTEGER NOT NULL,
+  kind TEXT
+);
+CREATE INDEX IF NOT EXISTS auth_failure_person ON auth_failure(person_id, at);
+CREATE TABLE IF NOT EXISTS owner_claim (
+  code_hash TEXT PRIMARY KEY,
+  person_id TEXT NOT NULL REFERENCES person(id),
+  expires_at INTEGER NOT NULL,
+  created_at INTEGER NOT NULL,
+  used_at INTEGER
+);
 CREATE TABLE IF NOT EXISTS telegram_callback (
   hash TEXT PRIMARY KEY,
   action_id TEXT NOT NULL,
@@ -209,6 +243,13 @@ export class SessionStore {
       "ALTER TABLE conversation ADD COLUMN agent_id TEXT",
       "ALTER TABLE message ADD COLUMN author TEXT",
       "ALTER TABLE message ADD COLUMN request_id TEXT",
+      // a2h identity (PR 2.5), additive only.
+      "ALTER TABLE identity ADD COLUMN linked_via TEXT",
+      "ALTER TABLE approval ADD COLUMN required_level TEXT",
+      "ALTER TABLE approval ADD COLUMN decided_level TEXT",
+      "ALTER TABLE a2h_request ADD COLUMN risk TEXT",
+      "ALTER TABLE a2h_request ADD COLUMN stepup_requested_at INTEGER",
+      "ALTER TABLE agent ADD COLUMN approval_level TEXT",
     ];
     for (const sql of alters) {
       try {
@@ -245,22 +286,45 @@ CREATE INDEX IF NOT EXISTS approval_pending_expiry
 
   findIdentity(platform: string, accountId: string, userId: string): IdentityRecord | undefined {
     const row = this.db
-      .prepare<{ platform: string; account_id: string; user_id: string; person_id: string }>(
-        "SELECT platform, account_id, user_id, person_id FROM identity WHERE platform = ? AND account_id = ? AND user_id = ?",
+      .prepare<{
+        platform: string;
+        account_id: string;
+        user_id: string;
+        person_id: string;
+        linked_at: number | null;
+        linked_via: string | null;
+      }>(
+        "SELECT platform, account_id, user_id, person_id, linked_at, linked_via FROM identity WHERE platform = ? AND account_id = ? AND user_id = ?",
       )
       .get(platform, accountId, userId);
     if (!row) return undefined;
-    return { platform: row.platform, accountId: row.account_id, userId: row.user_id, personId: row.person_id };
+    return {
+      platform: row.platform,
+      accountId: row.account_id,
+      userId: row.user_id,
+      personId: row.person_id,
+      linkedAt: row.linked_at ?? undefined,
+      linkedVia: row.linked_via ?? "legacy",
+    };
   }
 
   /** Insert-only. Refuses to re-point an existing identity to another person. */
-  linkIdentity(personId: string, platform: string, accountId: string, userId: string, now: number): boolean {
+  linkIdentity(
+    personId: string,
+    platform: string,
+    accountId: string,
+    userId: string,
+    now: number,
+    via = "pair",
+  ): boolean {
     const existing = this.findIdentity(platform, accountId, userId);
     if (existing) return existing.personId === personId;
     try {
       this.db
-        .prepare("INSERT INTO identity(platform, account_id, user_id, person_id, linked_at) VALUES (?, ?, ?, ?, ?)")
-        .run(platform, accountId, userId, personId, now);
+        .prepare(
+          "INSERT INTO identity(platform, account_id, user_id, person_id, linked_at, linked_via) VALUES (?, ?, ?, ?, ?, ?)",
+        )
+        .run(platform, accountId, userId, personId, now, via);
       return true;
     } catch {
       const again = this.findIdentity(platform, accountId, userId);
@@ -282,7 +346,7 @@ CREATE INDEX IF NOT EXISTS approval_pending_expiry
         return { person, created: false };
       }
       const person = this.createPerson(name, now);
-      this.linkIdentity(person.id, platform, accountId, userId, now);
+      this.linkIdentity(person.id, platform, accountId, userId, now, "legacy");
       this.defaultConversation(person.id, now);
       return { person, created: true };
     });
@@ -657,7 +721,7 @@ CREATE INDEX IF NOT EXISTS approval_pending_expiry
     options: string[],
     requestedBy: string | undefined,
     now: number,
-    extra: { targetPersonId?: string; expiresAt?: number; source?: "pi" | "agent" } = {},
+    extra: { targetPersonId?: string; expiresAt?: number; source?: "pi" | "agent"; requiredLevel?: string } = {},
   ): PendingApproval {
     const id = newId("a");
     const rec: PendingApproval = {
@@ -673,11 +737,12 @@ CREATE INDEX IF NOT EXISTS approval_pending_expiry
       targetPersonId: extra.targetPersonId,
       expiresAt: extra.expiresAt,
       source: extra.source,
+      requiredLevel: extra.requiredLevel,
       cards: [],
     };
     this.db
       .prepare(
-        "INSERT INTO approval(id, conversation_id, tool_call, state, version, cards, requested_by, created_at, target_person_id, expires_at, source) VALUES (?, ?, ?, 'pending', 1, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO approval(id, conversation_id, tool_call, state, version, cards, requested_by, created_at, target_person_id, expires_at, source, required_level) VALUES (?, ?, ?, 'pending', 1, ?, ?, ?, ?, ?, ?, ?)",
       )
       .run(
         id,
@@ -689,6 +754,7 @@ CREATE INDEX IF NOT EXISTS approval_pending_expiry
         extra.targetPersonId ?? null,
         extra.expiresAt ?? null,
         extra.source ?? null,
+        extra.requiredLevel ?? null,
       );
     return rec;
   }
@@ -710,8 +776,10 @@ CREATE INDEX IF NOT EXISTS approval_pending_expiry
         target_person_id: string | null;
         expires_at: number | null;
         source: string | null;
+        required_level: string | null;
+        decided_level: string | null;
       }>(
-        "SELECT id, conversation_id, tool_call, state, version, cards, requested_by, chosen, decided_by, decided_at, created_at, target_person_id, expires_at, source FROM approval WHERE id = ?",
+        "SELECT id, conversation_id, tool_call, state, version, cards, requested_by, chosen, decided_by, decided_at, created_at, target_person_id, expires_at, source, required_level, decided_level FROM approval WHERE id = ?",
       )
       .get(id);
     if (!row) return undefined;
@@ -732,6 +800,8 @@ CREATE INDEX IF NOT EXISTS approval_pending_expiry
       targetPersonId: row.target_person_id ?? undefined,
       expiresAt: row.expires_at ?? undefined,
       source: (row.source as PendingApproval["source"]) ?? undefined,
+      requiredLevel: row.required_level ?? undefined,
+      decidedLevel: row.decided_level ?? undefined,
       cards: row.cards ? (JSON.parse(row.cards) as PendingApproval["cards"]) : [],
     };
   }
@@ -755,14 +825,15 @@ CREATE INDEX IF NOT EXISTS approval_pending_expiry
     decidedBy: string,
     now: number,
     chosen?: string,
+    decidedLevel?: string,
   ): PendingApproval | undefined {
     const current = this.getApproval(id);
     if (!current || current.state !== "pending") return undefined;
     const updated = this.db
       .prepare(
-        "UPDATE approval SET state = ?, decided_by = ?, decided_at = ?, chosen = ?, version = version + 1 WHERE id = ? AND state = 'pending' AND version = ?",
+        "UPDATE approval SET state = ?, decided_by = ?, decided_at = ?, chosen = ?, decided_level = ?, version = version + 1 WHERE id = ? AND state = 'pending' AND version = ?",
       )
-      .run(state, decidedBy, now, chosen ?? state, id, current.version);
+      .run(state, decidedBy, now, chosen ?? state, decidedLevel ?? null, id, current.version);
     if (updated.changes !== 1) return undefined;
     return this.getApproval(id);
   }
@@ -1130,6 +1201,144 @@ CREATE INDEX IF NOT EXISTS approval_pending_expiry
           )
           .all(personId);
     return rows.map(({ id }) => this.getA2hRequest(id)).filter((r): r is A2hRequest => Boolean(r));
+  }
+
+  // ---- a2h identity (PR 2.5). Never log secrets or codes from here. -------
+
+  totpCredential(personId: string): { id: string; secretEnc: Uint8Array; lastStep?: number } | undefined {
+    const row = this.db
+      .prepare<{ id: string; secret_enc: Uint8Array; last_step: number | null }>(
+        "SELECT id, secret_enc, last_step FROM person_credential WHERE person_id = ? AND kind = 'totp' AND revoked_at IS NULL ORDER BY created_at DESC LIMIT 1",
+      )
+      .get(personId);
+    return row ? { id: row.id, secretEnc: row.secret_enc, lastStep: row.last_step ?? undefined } : undefined;
+  }
+
+  /** Revoke all TOTP + recovery credentials and store fresh ones (sealed secret, recovery hashes). */
+  replaceCredentials(personId: string, sealedSecret: Uint8Array, recoveryHashes: string[], now: number): void {
+    this.db.transaction(() => {
+      this.db
+        .prepare("UPDATE person_credential SET revoked_at = ? WHERE person_id = ? AND revoked_at IS NULL")
+        .run(now, personId);
+      this.db
+        .prepare("INSERT INTO person_credential(id, person_id, kind, secret_enc, created_at) VALUES (?, ?, 'totp', ?, ?)")
+        .run(newId("cr"), personId, sealedSecret, now);
+      const ins = this.db.prepare(
+        "INSERT INTO person_credential(id, person_id, kind, code_hash, created_at) VALUES (?, ?, 'recovery', ?, ?)",
+      );
+      for (const h of recoveryHashes) ins.run(newId("cr"), personId, h, now);
+    });
+  }
+
+  /** CAS: only move last_step forward. False means a concurrent/replayed use. */
+  advanceTotpStep(credentialId: string, step: number): boolean {
+    return (
+      this.db
+        .prepare(
+          "UPDATE person_credential SET last_step = ? WHERE id = ? AND revoked_at IS NULL AND (last_step IS NULL OR last_step < ?)",
+        )
+        .run(step, credentialId, step).changes === 1
+    );
+  }
+
+  consumeRecoveryCode(personId: string, codeHash: string, now: number): boolean {
+    return (
+      this.db
+        .prepare(
+          "UPDATE person_credential SET revoked_at = ? WHERE person_id = ? AND kind = 'recovery' AND code_hash = ? AND revoked_at IS NULL",
+        )
+        .run(now, personId, codeHash).changes === 1
+    );
+  }
+
+  recordAuthFailure(personId: string, now: number, kind: string): void {
+    this.db.prepare("INSERT INTO auth_failure(person_id, at, kind) VALUES (?, ?, ?)").run(personId, now, kind);
+  }
+
+  authFailures(personId: string, since: number): number {
+    return this.db
+      .prepare<{ n: number }>("SELECT COUNT(*) AS n FROM auth_failure WHERE person_id = ? AND at >= ?")
+      .get(personId, since)!.n;
+  }
+
+  recordStepUp(requestId: string, personId: string, method: string, surface: ChatRef, now: number): void {
+    this.db
+      .prepare(
+        "INSERT OR REPLACE INTO approval_stepup(request_id, person_id, method, surface, verified_at, consumed_at) VALUES (?, ?, ?, ?, ?, NULL)",
+      )
+      .run(requestId, personId, method, JSON.stringify(surface), now);
+  }
+
+  liveStepUp(requestId: string, personId: string): boolean {
+    return Boolean(
+      this.db
+        .prepare<{ n: number }>(
+          "SELECT 1 AS n FROM approval_stepup WHERE request_id = ? AND person_id = ? AND consumed_at IS NULL",
+        )
+        .get(requestId, personId),
+    );
+  }
+
+  consumeStepUp(requestId: string, now: number): void {
+    this.db
+      .prepare("UPDATE approval_stepup SET consumed_at = ? WHERE request_id = ? AND consumed_at IS NULL")
+      .run(now, requestId);
+  }
+
+  markStepUpRequested(requestId: string, now: number): void {
+    this.db
+      .prepare("UPDATE a2h_request SET stepup_requested_at = COALESCE(stepup_requested_at, ?) WHERE id = ?")
+      .run(now, requestId);
+  }
+
+  stepUpRequested(requestId: string): boolean {
+    return Boolean(
+      this.db
+        .prepare<{ t: number | null }>("SELECT stepup_requested_at AS t FROM a2h_request WHERE id = ?")
+        .get(requestId)?.t,
+    );
+  }
+
+  setA2hRisk(requestId: string, risk: string | undefined): void {
+    this.db.prepare("UPDATE a2h_request SET risk = ? WHERE id = ?").run(risk ?? null, requestId);
+  }
+
+  /** Per-agent downgrade ('im_account' = button only). NULL = default (verified under TOTP). */
+  setAgentApprovalLevel(agentId: string, level: "im_account" | "verified" | null): void {
+    this.db.prepare("UPDATE agent SET approval_level = ? WHERE id = ?").run(level, agentId);
+  }
+
+  agentApprovalLevel(agentId: string | undefined): "im_account" | "verified" | undefined {
+    if (!agentId) return undefined;
+    const v = this.db
+      .prepare<{ l: string | null }>("SELECT approval_level AS l FROM agent WHERE id = ?")
+      .get(agentId)?.l;
+    return v === "im_account" || v === "verified" ? v : undefined;
+  }
+
+  /** One-time first-bind code from `owner init` (stored hashed). */
+  createOwnerClaim(personId: string, code: string, now: number, ttlMs: number): void {
+    this.db
+      .prepare("INSERT INTO owner_claim(code_hash, person_id, expires_at, created_at) VALUES (?, ?, ?, ?)")
+      .run(hashPairCode(code), personId, now + ttlMs, now);
+  }
+
+  liveOwnerClaim(code: string, now: number): string | undefined {
+    return (
+      this.db
+        .prepare<{ person_id: string }>(
+          "SELECT person_id FROM owner_claim WHERE code_hash = ? AND used_at IS NULL AND expires_at > ?",
+        )
+        .get(hashPairCode(code), now)?.person_id ?? undefined
+    );
+  }
+
+  consumeOwnerClaim(code: string, now: number): boolean {
+    return (
+      this.db
+        .prepare("UPDATE owner_claim SET used_at = ? WHERE code_hash = ? AND used_at IS NULL AND expires_at > ?")
+        .run(now, hashPairCode(code), now).changes === 1
+    );
   }
 
   identityKey = identityKey;

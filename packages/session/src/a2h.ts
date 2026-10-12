@@ -164,6 +164,13 @@ export type AssuranceLevel = "none" | "im_account" | "verified";
 export interface ApproverContext {
   /** The person the request targets. */
   personId: string;
+  /** The agent that raised the request, if any. */
+  agentId?: string;
+  /** The chat the click/command came from (dm vs group matters). */
+  surface?: { platform: string; accountId: string; chatId: string; kind: "dm" | "group" };
+  /** Level fixed on the approval when it was created. */
+  requiredLevel?: AssuranceLevel;
+  risk?: string;
   /** The person the clicking IM account is linked to. */
   clickerPersonId: string;
   from: { platform: string; accountId: string; userId: string };
@@ -175,7 +182,12 @@ export interface ApproverContext {
 export interface ApproverVerdict {
   ok: boolean;
   level: AssuranceLevel;
-  reason?: string;
+  /**
+   * `step_up_required` is special: the click is not a decision, the request
+   * stays pending and the gateway asks for a second factor. Every other
+   * non-ok reason just refuses this click.
+   */
+  reason?: "step_up_required" | "not_target" | "group_click" | "cooling_off" | "locked" | (string & {});
 }
 
 /**
@@ -189,6 +201,8 @@ export interface ApproverVerifier {
   verifyApprover(ctx: ApproverContext): ApproverVerdict | Promise<ApproverVerdict>;
   /** Minimum level an approval needs. Default "im_account". */
   readonly requiredLevel?: AssuranceLevel;
+  /** Level to pin on a new agent approval. Default: `requiredLevel` ?? "im_account". */
+  requiredLevelFor?(ctx: { agentId?: string; risk?: string }): AssuranceLevel;
 }
 
 const LEVEL_RANK: Record<AssuranceLevel, number> = { none: 0, im_account: 1, verified: 2 };
@@ -208,4 +222,5 @@ export const imAccountVerifier: ApproverVerifier = {
       ? { ok: true, level: "im_account" }
       : { ok: false, level: "none", reason: "not_target" },
   requiredLevel: "im_account",
+  requiredLevelFor: () => "im_account",
 };
