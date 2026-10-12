@@ -198,6 +198,38 @@ export class TotpVerifier implements ApproverVerifier {
     return this.store.authFailures(personId, now - AUTH_FAIL_WINDOW_MS) >= AUTH_FAIL_LIMIT;
   }
 
+  /**
+   * Two-step enrolment for the CLI: prepare (nothing stored), let the human
+   * type one current code to prove the authenticator has it, then commit.
+   */
+  prepareEnrollment(account: string): TotpEnrollment & { secret: Buffer } {
+    const secret = randomBytes(TOTP_SECRET_BYTES);
+    const b32 = base32Encode(secret);
+    return {
+      secret,
+      secretBase32: b32,
+      otpauthUrl: otpauthUrl(b32, account),
+      recoveryCodes: Array.from({ length: RECOVERY_CODE_COUNT }, () => newRecoveryCode()),
+    };
+  }
+
+  confirmEnrollmentCode(prepared: { secret: Buffer }, code: string, now: number): boolean {
+    return matchTotpStep(prepared.secret, code.trim(), now) !== undefined;
+  }
+
+  /** Persist a confirmed enrolment. The confirming step is burnt (no replay). */
+  commitEnrollment(personId: string, prepared: { secret: Buffer; recoveryCodes: string[] }, now: number, confirmCode?: string): void {
+    this.store.replaceCredentials(
+      personId,
+      sealSecret(this.masterKey, prepared.secret),
+      prepared.recoveryCodes.map(hashRecoveryCode),
+      now,
+    );
+    const step = confirmCode ? matchTotpStep(prepared.secret, confirmCode.trim(), now) : undefined;
+    const cred = this.store.totpCredential(personId);
+    if (cred && step !== undefined) this.store.advanceTotpStep(cred.id, step);
+  }
+
   /** Enrol (or re-enrol) TOTP + recovery codes. Returns the only clear copies. */
   enroll(personId: string, account: string, now: number): TotpEnrollment {
     const secret = randomBytes(TOTP_SECRET_BYTES);

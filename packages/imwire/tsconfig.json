@@ -4,13 +4,33 @@
     "rootDir": "src",
     "outDir": "dist"
   },
-  "include": ["src/**/*.ts"],
+  "include": [
+    "src/**/*.ts"
+  ],
   "references": [
-    { "path": "../core" },
-    { "path": "../telegram" },
-    { "path": "../feishu" },
-    { "path": "../dingtalk" },
-    { "path": "../wecom" },
-    { "path": "../slack" }
+    {
+      "path": "../core"
+    },
+    {
+      "path": "../telegram"
+    },
+    {
+      "path": "../feishu"
+    },
+    {
+      "path": "../dingtalk"
+    },
+    {
+      "path": "../wecom"
+    },
+    {
+      "path": "../slack"
+    },
+    {
+      "path": "../session"
+    },
+    {
+      "path": "../agent-pi"
+    }
   ]
 }

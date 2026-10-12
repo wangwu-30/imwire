@@ -44,6 +44,9 @@ importers:
       '@imwire/telegram':
         specifier: workspace:*
         version: link:../../packages/telegram
+      imwire:
+        specifier: workspace:*
+        version: link:../../packages/imwire
 
   examples/echo:
     dependencies:
@@ -139,6 +142,9 @@ importers:
 
   packages/imwire:
     dependencies:
+      '@imwire/agent-pi':
+        specifier: workspace:*
+        version: link:../agent-pi
       '@imwire/core':
         specifier: workspace:*
         version: link:../core
@@ -148,6 +154,9 @@ importers:
       '@imwire/feishu':
         specifier: workspace:*
         version: link:../feishu
+      '@imwire/session':
+        specifier: workspace:*
+        version: link:../session
       '@imwire/slack':
         specifier: workspace:*
         version: link:../slack

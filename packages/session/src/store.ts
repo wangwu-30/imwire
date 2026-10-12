@@ -21,6 +21,38 @@ export const GROUP_NOTICE_WINDOW_MS = 24 * 60 * 60 * 1000;
 export const DEFAULT_LOG_WINDOW = 40;
 export const CALLBACK_TTL_MS = 24 * 60 * 60 * 1000;
 
+export const AUDIT_SCHEMA_VERSION = 1;
+
+/** One neutral a2h event (schema v1). Secrets are never written here. */
+export interface A2hEvent {
+  v: number;
+  /** Monotonic cursor. */
+  id: number;
+  at: number;
+  agentId?: string;
+  action: string;
+  personId?: string;
+  requestId?: string;
+  object?: string;
+  bindingHash?: string;
+  decision: string;
+  detail?: unknown;
+}
+
+type AuditRow = {
+  id: number;
+  at: number;
+  agent_id: string | null;
+  action: string;
+  person_id: string | null;
+  request_id: string | null;
+  result: string;
+  detail: string | null;
+  v: number | null;
+  object: string | null;
+  binding_hash: string | null;
+};
+
 type MessageRow = {
   id: string;
   seq: number;
@@ -249,7 +281,17 @@ export class SessionStore {
       "ALTER TABLE approval ADD COLUMN decided_level TEXT",
       "ALTER TABLE a2h_request ADD COLUMN risk TEXT",
       "ALTER TABLE a2h_request ADD COLUMN stepup_requested_at INTEGER",
+      "ALTER TABLE a2h_request ADD COLUMN action_hash TEXT",
       "ALTER TABLE agent ADD COLUMN approval_level TEXT",
+      // hub (PR 3): agent token lifecycle, additive only.
+      "ALTER TABLE agent ADD COLUMN expires_at INTEGER",
+      "ALTER TABLE agent ADD COLUMN prev_token_hash TEXT",
+      "ALTER TABLE agent ADD COLUMN prev_expires_at INTEGER",
+      "ALTER TABLE agent ADD COLUMN bind TEXT",
+      // Neutral, append-only a2h event log (schema v1).
+      "ALTER TABLE audit_log ADD COLUMN v INTEGER NOT NULL DEFAULT 1",
+      "ALTER TABLE audit_log ADD COLUMN object TEXT",
+      "ALTER TABLE audit_log ADD COLUMN binding_hash TEXT",
     ];
     for (const sql of alters) {
       try {
@@ -264,6 +306,11 @@ CREATE UNIQUE INDEX IF NOT EXISTS conv_person_agent
   ON conversation(person_id, agent_id) WHERE agent_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS delivery_platform_msg
   ON delivery(platform, account_id, chat_id, platform_msg_id);
+CREATE TRIGGER IF NOT EXISTS audit_log_no_update BEFORE UPDATE ON audit_log
+  BEGIN SELECT RAISE(ABORT, 'audit_log is append-only'); END;
+CREATE TRIGGER IF NOT EXISTS audit_log_no_delete BEFORE DELETE ON audit_log
+  BEGIN SELECT RAISE(ABORT, 'audit_log is append-only'); END;
+CREATE INDEX IF NOT EXISTS audit_log_agent ON audit_log(agent_id, id);
 CREATE INDEX IF NOT EXISTS approval_pending_expiry
   ON approval(state, expires_at);
 `);
@@ -886,6 +933,147 @@ CREATE INDEX IF NOT EXISTS approval_pending_expiry
     return { id: row.id, name: row.name, createdAt: row.created_at, revokedAt: row.revoked_at ?? undefined };
   }
 
+  /** Token material for auth. Hashes only; the clear token is never stored. */
+  agentAuth(id: string):
+    | {
+        id: string;
+        name: string;
+        tokenHash: string;
+        expiresAt?: number;
+        prevTokenHash?: string;
+        prevExpiresAt?: number;
+        revokedAt?: number;
+        bind?: string;
+      }
+    | undefined {
+    const r = this.db
+      .prepare<{
+        id: string;
+        name: string;
+        token_hash: string;
+        expires_at: number | null;
+        prev_token_hash: string | null;
+        prev_expires_at: number | null;
+        revoked_at: number | null;
+        bind: string | null;
+      }>(
+        "SELECT id, name, token_hash, expires_at, prev_token_hash, prev_expires_at, revoked_at, bind FROM agent WHERE id = ?",
+      )
+      .get(id);
+    if (!r) return undefined;
+    return {
+      id: r.id,
+      name: r.name,
+      tokenHash: r.token_hash,
+      expiresAt: r.expires_at ?? undefined,
+      prevTokenHash: r.prev_token_hash ?? undefined,
+      prevExpiresAt: r.prev_expires_at ?? undefined,
+      revokedAt: r.revoked_at ?? undefined,
+      bind: r.bind ?? undefined,
+    };
+  }
+
+  setAgentLifecycle(id: string, opts: { expiresAt?: number; bind?: string }): void {
+    this.db
+      .prepare("UPDATE agent SET expires_at = ?, bind = COALESCE(?, bind) WHERE id = ?")
+      .run(opts.expiresAt ?? null, opts.bind ?? null, id);
+  }
+
+  /** Rotate: new hash becomes current; the old one stays valid until `prevExpiresAt`. */
+  rotateAgentToken(id: string, newHash: string, expiresAt: number, prevExpiresAt: number): boolean {
+    return (
+      this.db
+        .prepare(
+          "UPDATE agent SET prev_token_hash = token_hash, prev_expires_at = ?, token_hash = ?, expires_at = ? WHERE id = ? AND revoked_at IS NULL",
+        )
+        .run(prevExpiresAt, newHash, expiresAt, id).changes === 1
+    );
+  }
+
+  listAgents(): Array<{
+    id: string;
+    name: string;
+    createdAt: number;
+    expiresAt?: number;
+    revokedAt?: number;
+    approvalLevel?: string;
+    bind?: string;
+  }> {
+    return this.db
+      .prepare<{
+        id: string;
+        name: string;
+        created_at: number;
+        expires_at: number | null;
+        revoked_at: number | null;
+        approval_level: string | null;
+        bind: string | null;
+      }>("SELECT id, name, created_at, expires_at, revoked_at, approval_level, bind FROM agent ORDER BY created_at")
+      .all()
+      .map((r) => ({
+        id: r.id,
+        name: r.name,
+        createdAt: r.created_at,
+        expiresAt: r.expires_at ?? undefined,
+        revokedAt: r.revoked_at ?? undefined,
+        approvalLevel: r.approval_level ?? undefined,
+        bind: r.bind ?? undefined,
+      }));
+  }
+
+  agentGrants(agentId: string): Array<{ personId: string; scopes: A2hScope[] }> {
+    return this.db
+      .prepare<{ person_id: string; scopes: string }>("SELECT person_id, scopes FROM agent_grant WHERE agent_id = ?")
+      .all(agentId)
+      .map((r) => ({ personId: r.person_id, scopes: JSON.parse(r.scopes) as A2hScope[] }));
+  }
+
+  /** Remove every IM binding of a person (owner reset). Returns how many were removed. */
+  unlinkAllIdentities(personId: string): number {
+    return this.db.transaction(() => {
+      this.db.prepare("DELETE FROM presence WHERE person_id = ?").run(personId);
+      return this.db.prepare("DELETE FROM identity WHERE person_id = ?").run(personId).changes;
+    });
+  }
+
+  auditSince(since: number): Array<{
+    at: number;
+    action: string;
+    result: string;
+    agentId?: string;
+    personId?: string;
+    requestId?: string;
+    detail?: string;
+  }> {
+    return this.db
+      .prepare<{
+        at: number;
+        action: string;
+        result: string;
+        agent_id: string | null;
+        person_id: string | null;
+        request_id: string | null;
+        detail: string | null;
+      }>("SELECT at, action, result, agent_id, person_id, request_id, detail FROM audit_log WHERE at >= ? ORDER BY id")
+      .all(since)
+      .map((r) => ({
+        at: r.at,
+        action: r.action,
+        result: r.result,
+        agentId: r.agent_id ?? undefined,
+        personId: r.person_id ?? undefined,
+        requestId: r.request_id ?? undefined,
+        detail: r.detail ?? undefined,
+      }));
+  }
+
+  /** Set the current token hash (initial mint). Clears any previous token. */
+  setAgentToken(id: string, tokenHash: string, expiresAt: number): void {
+    this.db
+      .prepare("UPDATE agent SET token_hash = ?, expires_at = ?, prev_token_hash = NULL, prev_expires_at = NULL WHERE id = ?")
+      .run(tokenHash, expiresAt, id);
+  }
+
   revokeAgent(id: string, now: number): void {
     this.db.prepare("UPDATE agent SET revoked_at = ? WHERE id = ? AND revoked_at IS NULL").run(now, id);
   }
@@ -1050,20 +1238,68 @@ CREATE INDEX IF NOT EXISTS approval_pending_expiry
     personId?: string;
     requestId?: string;
     detail?: unknown;
+    /** What the event is about (e.g. "approval", "ask", "agent:<name>", "identity"). */
+    object?: string;
+    /** sha256 of the bound action object, when there is one. Never the object itself if secret. */
+    bindingHash?: string;
   }): void {
+    let agentId = entry.agentId;
+    let object = entry.object;
+    let bindingHash = entry.bindingHash;
+    if (entry.requestId && (!agentId || !object || !bindingHash)) {
+      const r = this.db
+        .prepare<{ agent_id: string; kind: string; action_hash: string | null }>(
+          "SELECT agent_id, kind, action_hash FROM a2h_request WHERE id = ?",
+        )
+        .get(entry.requestId);
+      if (r) {
+        agentId ??= r.agent_id;
+        object ??= r.kind;
+        bindingHash ??= r.action_hash ?? undefined;
+      }
+    }
     this.db
       .prepare(
-        "INSERT INTO audit_log(at, agent_id, action, person_id, request_id, result, detail) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO audit_log(at, agent_id, action, person_id, request_id, result, detail, v, object, binding_hash) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
       )
       .run(
         entry.at,
-        entry.agentId ?? null,
+        agentId ?? null,
         entry.action,
         entry.personId ?? null,
         entry.requestId ?? null,
         entry.result,
         entry.detail === undefined ? null : JSON.stringify(entry.detail),
+        AUDIT_SCHEMA_VERSION,
+        object ?? null,
+        bindingHash ?? null,
       );
+  }
+
+  /**
+   * Cursor read of the neutral event log. `cursor` is the last id seen
+   * (0 = from the start). Optionally scoped to one agent.
+   */
+  eventsAfter(cursor: number, opts: { agentId?: string; limit?: number } = {}): A2hEvent[] {
+    const limit = Math.max(1, Math.min(opts.limit ?? 100, 500));
+    const rows = opts.agentId
+      ? this.db
+          .prepare<AuditRow>("SELECT * FROM audit_log WHERE id > ? AND agent_id = ? ORDER BY id LIMIT ?")
+          .all(cursor, opts.agentId, limit)
+      : this.db.prepare<AuditRow>("SELECT * FROM audit_log WHERE id > ? ORDER BY id LIMIT ?").all(cursor, limit);
+    return rows.map((r) => ({
+      v: r.v ?? 1,
+      id: r.id,
+      at: r.at,
+      agentId: r.agent_id ?? undefined,
+      action: r.action,
+      personId: r.person_id ?? undefined,
+      requestId: r.request_id ?? undefined,
+      object: r.object ?? undefined,
+      bindingHash: r.binding_hash ?? undefined,
+      decision: r.result,
+      detail: r.detail ? (JSON.parse(r.detail) as unknown) : undefined,
+    }));
   }
 
   auditEntries(): Array<{ action: string; result: string; agentId?: string; personId?: string; requestId?: string; detail?: string }> {
