@@ -92,6 +92,8 @@ const HELP = `imwire hub    [--preset assistant] [--identity totp|legacy] [--soc
 imwire owner  init --name NAME | enroll-totp [--person ID] | reset [--person ID] [--rotate-totp]
 imwire agent  add NAME [--scopes send,ask,approve,read] [--ttl 90d] [--bind-uid UID]
               list | revoke NAME | rotate NAME [--ttl 90d] | level NAME im_account|verified
+imwire policy allow AGENT TOOL... | remove AGENT TOOL | list AGENT
+              (exact read-only tool names only; everything else asks a human)
 imwire audit  [--since 24h] [--cursor N] [--agent NAME] [--json]
 
 Owner-gated commands ask for a current TOTP (or pass --code). Tokens are
@@ -115,6 +117,8 @@ export async function runHubCli(argv: string[], io: CliIo = processIo): Promise<
         return await cmdOwner(sub, a, p, io);
       case "agent":
         return await cmdAgent(sub, a, p, io);
+      case "policy":
+        return await cmdPolicy(sub, a, p, io);
       case "audit":
         return cmdAudit(a, p, io);
       default:
@@ -274,6 +278,33 @@ async function cmdAgent(sub: string | undefined, a: Args, p: Paths, io: CliIo): 
         }
         return 0;
       }
+      default:
+        io.err(HELP);
+        return 1;
+    }
+  } finally {
+    admin.store.close();
+  }
+}
+
+async function cmdPolicy(sub: string | undefined, a: Args, p: Paths, io: CliIo): Promise<number> {
+  const admin = openAdmin(a, p);
+  try {
+    const [agent, ...tools] = a.positional;
+    if (!agent) throw new Error("usage: imwire policy allow|remove|list AGENT [TOOL...]");
+    switch (sub) {
+      case "allow": {
+        if (tools.length === 0) throw new Error("usage: imwire policy allow AGENT TOOL...");
+        admin.allowReadOnlyTools(agent, tools, await proof(a, io));
+        io.out(`${agent}: auto-allow (read-only) ${tools.join(", ")}`);
+        return 0;
+      }
+      case "remove":
+        for (const t of tools) io.out(`${t}: ${admin.removeTool(agent, t) ? "removed" : "not in policy"}`);
+        return 0;
+      case "list":
+        for (const r of admin.toolPolicy(agent)) io.out(`${r.tool}\t${r.class}`);
+        return 0;
       default:
         io.err(HELP);
         return 1;

@@ -45,6 +45,8 @@ export function wireView(v: A2hView): Record<string, unknown> {
     required_level: v.requiredLevel,
     decided_level: v.decidedLevel,
     step_up_required: v.stepUpRequired,
+    risk: v.risk,
+    binding_hash: v.bindingHash,
     ...(v.status === "pending"
       ? { next: "NOT approved. Do not proceed. Call a2h.wait with this request_id until a final status." }
       : {}),
@@ -214,7 +216,9 @@ export class A2hRpc {
           to: str(p, "to")!,
           title: str(p, "title")!,
           details: str(p, "details", false),
-          risk: str(p, "risk", false) as "low" | "medium" | "high" | undefined,
+          risk: str(p, "risk", false) as "low" | "medium" | "high" | "critical" | undefined,
+          action: p.action,
+          actionDigest: str(p, "action_digest", false),
           expiresInS: num(p, "expires_in_s"),
           route: str(p, "route", false),
           idempotencyKey: str(p, "idempotency_key", false),
@@ -230,6 +234,17 @@ export class A2hRpc {
         this.handoff(agentId, views);
         return { results: views.map(wireView) };
       }
+      case "a2h.verifyAction": {
+        const r = gw.verifyApprovedAction({
+          agentId,
+          requestId: str(p, "request_id")!,
+          action: p.action,
+          actionDigest: str(p, "action_digest", false),
+        });
+        return { ok: r.ok, reason: r.reason ?? null, binding_hash: r.bindingHash ?? null };
+      }
+      case "a2h.checkTool":
+        return gw.checkTool(agentId, str(p, "tool")!);
       case "a2h.cancel":
         return wireView(
           await gw.cancelRequest({ agentId, requestId: str(p, "request_id")!, reason: str(p, "reason", false) }),

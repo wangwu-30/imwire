@@ -31,12 +31,12 @@ function collectAdapters(): AdapterName[] {
 
 async function main(): Promise<void> {
   const cmd = process.argv[2] ?? "serve";
-  if (cmd === "hub" || cmd === "owner" || cmd === "agent" || cmd === "audit") {
+  if (cmd === "hub" || cmd === "owner" || cmd === "agent" || cmd === "audit" || cmd === "policy") {
     process.exitCode = await runHubCli(process.argv.slice(2));
     return;
   }
   if (cmd === "help" || cmd === "--help" || cmd === "-h") {
-    console.error(`imwire hub|owner|agent|audit ...   (a2h hub; run: imwire help)
+    console.error(`imwire hub|owner|agent|policy|audit ...   (a2h hub; run: imwire help)
 imwire serve --adapter NAME ... [--ws [port]] [--ws-host host] [--ws-token TOKEN] [--ws-allow-remote]
 
 Runs named IM adapters and speaks JSON-RPC 2.0 over stdio (newline-delimited).
