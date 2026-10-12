@@ -1,6 +1,16 @@
 import type { ChatRef } from "@imwire/core";
 import { groupKey, hashPairCode, identityKey, newId, pairCode } from "./ids.js";
 import { openSqlite, type SqlDatabase } from "./sqlite.js";
+import { randomBytes } from "node:crypto";
+import {
+  dataDigest,
+  eventSource,
+  eventSubject,
+  eventType,
+  isoTime,
+  newEventId,
+  type EventEnvelope,
+} from "./envelope.js";
 import type {
   ConversationMeta,
   ConversationSnapshot,
@@ -51,7 +61,49 @@ type AuditRow = {
   v: number | null;
   object: string | null;
   binding_hash: string | null;
+  eid: string | null;
+  occurred_at: number | null;
+  source: string | null;
+  type: string | null;
+  subject: string | null;
+  correlation_id: string | null;
+  causation_id: string | null;
+  idempotency_key: string | null;
+  data: string | null;
+  digest: string | null;
 };
+
+/** Decision scope (v0 §3 Decision.grant). Old rows migrate to `once`. */
+export type GrantSpec = { kind: "once" } | { kind: "task"; taskId: string } | { kind: "until"; until: number };
+export type ReceiptLevel = "received" | "recorded" | "executed";
+export const RECEIPT_LEVELS: ReceiptLevel[] = ["received", "recorded", "executed"];
+/** Decided requests without an `executed` receipt after this become `unknown`. */
+export const EXECUTION_UNKNOWN_AFTER_MS = 24 * 3600_000;
+
+export interface A2hRequestMeta {
+  grant: GrantSpec;
+  quote?: string;
+  channel?: string;
+  objectRef?: string;
+  objectDigest?: string;
+  stateVersion?: string;
+  action?: string;
+  options?: Array<{ id: string; label: string; consequence: string }>;
+  decisionEvent?: string;
+  execution?: "executed" | "unknown";
+}
+
+export interface ReceiptRecord {
+  id: string;
+  requestId: string;
+  level: ReceiptLevel;
+  exitCode?: number;
+  externalId?: string;
+  note?: string;
+  occurredAt: number;
+  recordedAt: number;
+  eventId: string;
+}
 
 type MessageRow = {
   id: string;
@@ -301,6 +353,27 @@ export class SessionStore {
       "ALTER TABLE audit_log ADD COLUMN binding_hash TEXT",
       // critical actions + tool policy (PR 3b), additive only.
       "ALTER TABLE a2h_request ADD COLUMN action_consumed_at INTEGER",
+      // protocol v0 (PR 4), additive only.
+      "ALTER TABLE a2h_request ADD COLUMN grant_spec TEXT",
+      "ALTER TABLE a2h_request ADD COLUMN quote TEXT",
+      "ALTER TABLE a2h_request ADD COLUMN channel TEXT",
+      "ALTER TABLE a2h_request ADD COLUMN object_ref TEXT",
+      "ALTER TABLE a2h_request ADD COLUMN object_digest TEXT",
+      "ALTER TABLE a2h_request ADD COLUMN state_version TEXT",
+      "ALTER TABLE a2h_request ADD COLUMN action TEXT",
+      "ALTER TABLE a2h_request ADD COLUMN options TEXT",
+      "ALTER TABLE a2h_request ADD COLUMN decision_event TEXT",
+      "ALTER TABLE a2h_request ADD COLUMN execution TEXT",
+      "ALTER TABLE audit_log ADD COLUMN eid TEXT",
+      "ALTER TABLE audit_log ADD COLUMN occurred_at INTEGER",
+      "ALTER TABLE audit_log ADD COLUMN source TEXT",
+      "ALTER TABLE audit_log ADD COLUMN type TEXT",
+      "ALTER TABLE audit_log ADD COLUMN subject TEXT",
+      "ALTER TABLE audit_log ADD COLUMN correlation_id TEXT",
+      "ALTER TABLE audit_log ADD COLUMN causation_id TEXT",
+      "ALTER TABLE audit_log ADD COLUMN idempotency_key TEXT",
+      "ALTER TABLE audit_log ADD COLUMN data TEXT",
+      "ALTER TABLE audit_log ADD COLUMN digest TEXT",
     ];
     for (const sql of alters) {
       try {
@@ -322,8 +395,33 @@ CREATE TRIGGER IF NOT EXISTS audit_log_no_delete BEFORE DELETE ON audit_log
 CREATE INDEX IF NOT EXISTS audit_log_agent ON audit_log(agent_id, id);
 CREATE INDEX IF NOT EXISTS approval_pending_expiry
   ON approval(state, expires_at);
+CREATE UNIQUE INDEX IF NOT EXISTS audit_log_eid ON audit_log(eid) WHERE eid IS NOT NULL;
+CREATE INDEX IF NOT EXISTS audit_log_request ON audit_log(request_id, id);
+CREATE TABLE IF NOT EXISTS hub_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS a2h_receipt (
+  id TEXT PRIMARY KEY,
+  request_id TEXT NOT NULL REFERENCES a2h_request(id),
+  level TEXT NOT NULL,
+  exit_code INTEGER,
+  external_id TEXT,
+  note TEXT,
+  occurred_at INTEGER NOT NULL,
+  recorded_at INTEGER NOT NULL,
+  event_id TEXT NOT NULL,
+  UNIQUE(request_id, level)
+);
+CREATE INDEX IF NOT EXISTS a2h_request_execution ON a2h_request(state, decided_at) WHERE execution IS NULL;
 `);
+    // v0 grant is mandatory: every pre-v0 request was a one-shot decision.
+    this.db.exec(`UPDATE a2h_request SET grant_spec = '{"kind":"once"}' WHERE grant_spec IS NULL`);
+    this.db
+      .prepare("INSERT OR IGNORE INTO hub_meta(key, value) VALUES ('hub_id', ?)")
+      .run(randomBytes(8).toString("hex"));
+    this.hubId = this.db.prepare<{ value: string }>("SELECT value FROM hub_meta WHERE key = 'hub_id'").get()!.value;
   }
+
+  /** Stable per-database id, used in event sources and legacy event ids. */
+  hubId = "";
 
   close(): void {
     this.db.close();
@@ -1251,7 +1349,14 @@ CREATE INDEX IF NOT EXISTS approval_pending_expiry
     object?: string;
     /** sha256 of the bound action object, when there is one. Never the object itself if secret. */
     bindingHash?: string;
-  }): void {
+    /** v0 envelope: when it happened (default = recorded time). */
+    occurredAt?: number;
+    /** Extra fields merged into `data` (v0 §3 object). Must be secret-free. */
+    data?: Record<string, unknown>;
+    source?: string;
+    causationId?: string;
+    idempotencyKey?: string;
+  }): string {
     let agentId = entry.agentId;
     let object = entry.object;
     let bindingHash = entry.bindingHash;
@@ -1267,9 +1372,34 @@ CREATE INDEX IF NOT EXISTS approval_pending_expiry
         bindingHash ??= r.action_hash ?? undefined;
       }
     }
+    const eid = newEventId(entry.at);
+    const causation =
+      entry.causationId ??
+      (entry.requestId
+        ? (this.db
+            .prepare<{ eid: string | null; id: number }>(
+              "SELECT eid, id FROM audit_log WHERE request_id = ? ORDER BY id DESC LIMIT 1",
+            )
+            .get(entry.requestId) ?? undefined)
+        : undefined);
+    const causationId =
+      typeof causation === "string" ? causation : causation ? (causation.eid ?? this.legacyEventId(causation.id)) : undefined;
+    const base = { agentId, personId: entry.personId, requestId: entry.requestId, object, action: entry.action, source: entry.source };
+    const data = eventData({
+      action: entry.action,
+      decision: entry.result,
+      agentId,
+      personId: entry.personId,
+      requestId: entry.requestId,
+      object,
+      bindingHash,
+      detail: entry.detail,
+      extra: entry.data,
+    });
+    const t = eventType(entry.action);
     this.db
       .prepare(
-        "INSERT INTO audit_log(at, agent_id, action, person_id, request_id, result, detail, v, object, binding_hash) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO audit_log(at, agent_id, action, person_id, request_id, result, detail, v, object, binding_hash, eid, occurred_at, source, type, subject, correlation_id, causation_id, idempotency_key, data, digest) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
       )
       .run(
         entry.at,
@@ -1282,7 +1412,192 @@ CREATE INDEX IF NOT EXISTS approval_pending_expiry
         AUDIT_SCHEMA_VERSION,
         object ?? null,
         bindingHash ?? null,
+        eid,
+        entry.occurredAt ?? entry.at,
+        eventSource(this.hubId, base),
+        t.type,
+        eventSubject(base),
+        entry.requestId ? `req:${entry.requestId}` : null,
+        causationId ?? null,
+        entry.idempotencyKey ?? null,
+        JSON.stringify(data),
+        dataDigest(data),
       );
+    return eid;
+  }
+
+  /** Deterministic id for rows written before v0 envelopes existed. */
+  legacyEventId(seq: number): string {
+    return `evt_legacy_${this.hubId}_${seq}`;
+  }
+
+  /** v0 §4.1 envelope for one log row (legacy rows are filled in deterministically). */
+  envelope(r: AuditRow): EventEnvelope {
+    const t = r.type ? { type: r.type, schema: eventType(r.action).schema } : eventType(r.action);
+    const base = {
+      agentId: r.agent_id ?? undefined,
+      personId: r.person_id ?? undefined,
+      requestId: r.request_id ?? undefined,
+      object: r.object ?? undefined,
+      action: r.action,
+    };
+    const data =
+      r.data !== null
+        ? (JSON.parse(r.data) as Record<string, unknown>)
+        : eventData({
+            action: r.action,
+            decision: r.result,
+            agentId: base.agentId,
+            personId: base.personId,
+            requestId: base.requestId,
+            object: base.object,
+            bindingHash: r.binding_hash ?? undefined,
+            detail: r.detail ? (JSON.parse(r.detail) as unknown) : undefined,
+          });
+    return {
+      specversion: "1.0",
+      id: r.eid ?? this.legacyEventId(r.id),
+      source: r.source ?? eventSource(this.hubId, base),
+      type: t.type,
+      subject: r.subject ?? eventSubject(base),
+      time: isoTime(r.occurred_at ?? r.at),
+      recordedat: isoTime(r.at),
+      seq: r.id,
+      attempt: 1,
+      ...(r.idempotency_key ? { idempotencykey: r.idempotency_key } : {}),
+      ...(r.request_id ? { correlationid: r.correlation_id ?? `req:${r.request_id}` } : {}),
+      ...(r.causation_id ? { causationid: r.causation_id } : {}),
+      dataschema: t.schema,
+      datacontenttype: "application/json",
+      v: r.v ?? 1,
+      integrity: { digest: r.digest ?? dataDigest(data) },
+      data,
+    };
+  }
+
+  /** Cursor read of v0 envelopes (optionally one agent's events only). */
+  envelopesAfter(cursor: number, opts: { agentId?: string; limit?: number } = {}): EventEnvelope[] {
+    const limit = Math.max(1, Math.min(opts.limit ?? 100, 500));
+    const rows = opts.agentId
+      ? this.db
+          .prepare<AuditRow>("SELECT * FROM audit_log WHERE id > ? AND agent_id = ? ORDER BY id LIMIT ?")
+          .all(cursor, opts.agentId, limit)
+      : this.db.prepare<AuditRow>("SELECT * FROM audit_log WHERE id > ? ORDER BY id LIMIT ?").all(cursor, limit);
+    return rows.map((r) => this.envelope(r));
+  }
+
+  // ---- v0 request metadata, decisions and receipts (PR 4) ----------------
+
+  setA2hMeta(requestId: string, m: Partial<Omit<A2hRequestMeta, "decisionEvent" | "execution">>): void {
+    const sets: string[] = [];
+    const vals: unknown[] = [];
+    const put = (col: string, v: unknown) => {
+      sets.push(`${col} = ?`);
+      vals.push(v);
+    };
+    if (m.grant) put("grant_spec", JSON.stringify(m.grant));
+    if (m.quote !== undefined) put("quote", m.quote);
+    if (m.channel !== undefined) put("channel", m.channel);
+    if (m.objectRef !== undefined) put("object_ref", m.objectRef);
+    if (m.objectDigest !== undefined) put("object_digest", m.objectDigest);
+    if (m.stateVersion !== undefined) put("state_version", m.stateVersion);
+    if (m.action !== undefined) put("action", m.action);
+    if (m.options !== undefined) put("options", JSON.stringify(m.options));
+    if (sets.length === 0) return;
+    this.db.prepare(`UPDATE a2h_request SET ${sets.join(", ")} WHERE id = ?`).run(...(vals as never[]), requestId);
+  }
+
+  setA2hDecisionEvent(requestId: string, eid: string): void {
+    this.db.prepare("UPDATE a2h_request SET decision_event = ? WHERE id = ? AND decision_event IS NULL").run(eid, requestId);
+  }
+
+  a2hMeta(requestId: string): A2hRequestMeta | undefined {
+    const r = this.db
+      .prepare<{
+        grant_spec: string | null;
+        quote: string | null;
+        channel: string | null;
+        object_ref: string | null;
+        object_digest: string | null;
+        state_version: string | null;
+        action: string | null;
+        options: string | null;
+        decision_event: string | null;
+        execution: string | null;
+      }>(
+        "SELECT grant_spec, quote, channel, object_ref, object_digest, state_version, action, options, decision_event, execution FROM a2h_request WHERE id = ?",
+      )
+      .get(requestId);
+    if (!r) return undefined;
+    return {
+      grant: r.grant_spec ? (JSON.parse(r.grant_spec) as GrantSpec) : { kind: "once" },
+      quote: r.quote ?? undefined,
+      channel: r.channel ?? undefined,
+      objectRef: r.object_ref ?? undefined,
+      objectDigest: r.object_digest ?? undefined,
+      stateVersion: r.state_version ?? undefined,
+      action: r.action ?? undefined,
+      options: r.options ? (JSON.parse(r.options) as A2hRequestMeta["options"]) : undefined,
+      decisionEvent: r.decision_event ?? undefined,
+      execution: (r.execution as A2hRequestMeta["execution"]) ?? undefined,
+    };
+  }
+
+  /** Insert a receipt once per (request, level). Returns the existing one on replay. */
+  addReceipt(r: Omit<ReceiptRecord, "id">): { receipt: ReceiptRecord; replayed: boolean } {
+    const prior = this.receipts(r.requestId).find((x) => x.level === r.level);
+    if (prior) return { receipt: prior, replayed: true };
+    const id = newId("rc");
+    this.db
+      .prepare(
+        "INSERT INTO a2h_receipt(id, request_id, level, exit_code, external_id, note, occurred_at, recorded_at, event_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+      )
+      .run(id, r.requestId, r.level, r.exitCode ?? null, r.externalId ?? null, r.note ?? null, r.occurredAt, r.recordedAt, r.eventId);
+    if (r.level === "executed") this.db.prepare("UPDATE a2h_request SET execution = 'executed' WHERE id = ?").run(r.requestId);
+    return { receipt: { id, ...r }, replayed: false };
+  }
+
+  receipts(requestId: string): ReceiptRecord[] {
+    return this.db
+      .prepare<{
+        id: string;
+        request_id: string;
+        level: string;
+        exit_code: number | null;
+        external_id: string | null;
+        note: string | null;
+        occurred_at: number;
+        recorded_at: number;
+        event_id: string;
+      }>("SELECT * FROM a2h_receipt WHERE request_id = ? ORDER BY recorded_at, rowid")
+      .all(requestId)
+      .map((x) => ({
+        id: x.id,
+        requestId: x.request_id,
+        level: x.level as ReceiptLevel,
+        exitCode: x.exit_code ?? undefined,
+        externalId: x.external_id ?? undefined,
+        note: x.note ?? undefined,
+        occurredAt: x.occurred_at,
+        recordedAt: x.recorded_at,
+        eventId: x.event_id,
+      }));
+  }
+
+  /** Decided (approved/answered) before `cutoff` with no executed receipt and not yet marked. */
+  dueExecutionUnknown(cutoff: number): Array<{ id: string; agentId: string; personId: string }> {
+    return this.db
+      .prepare<{ id: string; agent_id: string; person_id: string }>(
+        "SELECT id, agent_id, person_id FROM a2h_request WHERE state IN ('approved','answered') AND execution IS NULL AND decided_at IS NOT NULL AND decided_at <= ?",
+      )
+      .all(cutoff)
+      .map((r) => ({ id: r.id, agentId: r.agent_id, personId: r.person_id }));
+  }
+
+  markExecutionUnknown(requestId: string): boolean {
+    return (
+      this.db.prepare("UPDATE a2h_request SET execution = 'unknown' WHERE id = ? AND execution IS NULL").run(requestId).changes === 1
+    );
   }
 
   /**
@@ -1637,4 +1952,27 @@ CREATE INDEX IF NOT EXISTS approval_pending_expiry
 
   identityKey = identityKey;
   groupKey = groupKey;
+}
+
+/** The v0 `data` object: neutral, secret-free fields of one event. */
+function eventData(e: {
+  action: string;
+  decision: string;
+  agentId?: string;
+  personId?: string;
+  requestId?: string;
+  object?: string;
+  bindingHash?: string;
+  detail?: unknown;
+  extra?: Record<string, unknown>;
+}): Record<string, unknown> {
+  const out: Record<string, unknown> = { action: e.action, decision: e.decision };
+  if (e.agentId) out.agent = `agent:${e.agentId}`;
+  if (e.personId) out.person = `person:${e.personId}`;
+  if (e.requestId) out.request = e.requestId;
+  if (e.object) out.object_kind = e.object;
+  if (e.bindingHash) out.binding_hash = e.bindingHash;
+  if (e.detail !== undefined && e.detail !== null) out.detail = e.detail;
+  if (e.extra) for (const [k, v] of Object.entries(e.extra)) if (v !== undefined) out[k] = v;
+  return out;
 }

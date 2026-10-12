@@ -173,6 +173,12 @@ export interface A2hView {
   decidedLevel: string | null;
   /** Approvals: the target clicked Approve and a second factor is awaited. */
   stepUpRequired: boolean;
+  /** v0 Decision.grant (wire shape). null for one-way messages. */
+  grant: Record<string, unknown> | null;
+  /** After a positive decision: pending → executed, or unknown after 24h without an executed receipt. */
+  execution: string | null;
+  /** Receipt levels recorded so far. */
+  receipts: string[];
   /** Approvals: risk as created ("critical" binds an action object). */
   risk: string | null;
   /** critical: hash of the bound action object. */

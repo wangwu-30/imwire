@@ -322,14 +322,23 @@ function cmdAudit(a: Args, p: Paths, io: CliIo): number {
     const since = a.str("since") ? Date.now() - parseDuration(a.str("since"), 0) : 0;
     let cursor = Number(a.str("cursor") ?? 0);
     for (;;) {
+      if (a.has("json")) {
+        // v0 envelopes, one per line
+        const env = store.envelopesAfter(cursor, { agentId, limit: 500 });
+        if (env.length === 0) break;
+        for (const e of env) {
+          cursor = e.seq;
+          if (Date.parse(e.recordedat) < since) continue;
+          io.out(redactText(JSON.stringify(e)));
+        }
+        continue;
+      }
       const batch = store.eventsAfter(cursor, { agentId, limit: 500 });
       if (batch.length === 0) break;
       for (const e of batch) {
         cursor = e.id;
         if (e.at < since) continue;
-        if (a.has("json")) io.out(redactText(JSON.stringify(e)));
-        else
-          io.out(
+        io.out(
             redactText(
               [e.id, new Date(e.at).toISOString(), e.action, e.decision, e.agentId ?? "-", e.personId ?? "-", e.requestId ?? "-", e.object ?? "-", e.bindingHash ?? "-"].join("\t"),
             ),

@@ -18,7 +18,7 @@ describe("risk: critical", () => {
     const w = await world();
     const { token } = addAgent(w);
     const c = await client(w, token);
-    const r = await c.call<Record<string, string>>("a2h.approve", { to: w.ownerId, title: "deploy", risk: "critical", action: DEPLOY, wait_s: 0 });
+    const r = await c.call<Record<string, string>>("a2h.approve", { grant: "once", to: w.ownerId, title: "deploy", risk: "critical", action: DEPLOY, wait_s: 0 });
     expect(r).toMatchObject({ status: "pending", required_level: "verified", risk: "critical" });
     expect(r.binding_hash).toMatch(/^sha256:[0-9a-f]{64}$/);
     await approveWithTotp(w, r.request_id!, r.code!);
@@ -37,7 +37,7 @@ describe("risk: critical", () => {
     const w = await world();
     const { token } = addAgent(w);
     const c = await client(w, token);
-    const r = await c.call<Record<string, string>>("a2h.approve", { to: w.ownerId, title: "deploy", risk: "critical", action: DEPLOY, wait_s: 0 });
+    const r = await c.call<Record<string, string>>("a2h.approve", { grant: "once", to: w.ownerId, title: "deploy", risk: "critical", action: DEPLOY, wait_s: 0 });
     await approveWithTotp(w, r.request_id!, r.code!);
     const bad = await c.call<Record<string, unknown>>("a2h.verifyAction", { request_id: r.request_id, action: { ...DEPLOY, commit: "deadbee" } });
     expect(bad).toMatchObject({ ok: false, reason: "mismatch" });
@@ -52,7 +52,7 @@ describe("risk: critical", () => {
     const { token } = addAgent(w);
     const c = await client(w, token);
     const sha = "3360b9a0c5e1f2d3a4b5c6d7e8f9a0b1c2d3e4f5";
-    const r = await c.call<Record<string, string>>("a2h.approve", { to: w.ownerId, title: "push", risk: "critical", action_digest: sha, wait_s: 0 });
+    const r = await c.call<Record<string, string>>("a2h.approve", { grant: "once", to: w.ownerId, title: "push", risk: "critical", action_digest: sha, wait_s: 0 });
     expect(r.binding_hash).toBe(`digest:${sha}`);
     await approveWithTotp(w, r.request_id!, r.code!);
     expect(await c.call("a2h.verifyAction", { request_id: r.request_id, action_digest: sha.replace("3360", "4460") })).toMatchObject({ ok: false, reason: "mismatch" });
@@ -65,9 +65,9 @@ describe("risk: critical", () => {
     w.admin.setAgentLevel("codex-mac", "im_account", w.code());
     w.next();
     const c = await client(w, token);
-    const normal = await c.call<Record<string, string>>("a2h.approve", { to: w.ownerId, title: "low", wait_s: 0 });
+    const normal = await c.call<Record<string, string>>("a2h.approve", { grant: "once", to: w.ownerId, title: "low", wait_s: 0 });
     expect(normal.required_level).toBe("im_account");
-    const r = await c.call<Record<string, string>>("a2h.approve", { to: w.ownerId, title: "deploy", risk: "critical", action: DEPLOY, wait_s: 0 });
+    const r = await c.call<Record<string, string>>("a2h.approve", { grant: "once", to: w.ownerId, title: "deploy", risk: "critical", action: DEPLOY, wait_s: 0 });
     expect(r.required_level).toBe("verified");
     const approvalId = w.hub.gw.store.getA2hRequest(r.request_id!)!.approvalId!;
     await w.tg.ingest(action({ platform: "telegram", userId: "ada", actionId: "approve", value: approvalId }));
@@ -80,10 +80,10 @@ describe("risk: critical", () => {
     const w = await world();
     const { token } = addAgent(w);
     const c = await client(w, token);
-    expect((await rpcError(c.call("a2h.approve", { to: w.ownerId, title: "x", risk: "critical", wait_s: 0 }))).data?.code).toBe("invalid");
-    expect((await rpcError(c.call("a2h.approve", { to: w.ownerId, title: "x", action: DEPLOY, wait_s: 0 }))).data?.code).toBe("invalid");
-    await c.call("a2h.approve", { to: w.ownerId, title: "x", risk: "critical", action: DEPLOY, idempotency_key: "k1", wait_s: 0 });
-    const e = await rpcError(c.call("a2h.approve", { to: w.ownerId, title: "x", risk: "critical", action: { ...DEPLOY, env: "dev" }, idempotency_key: "k1", wait_s: 0 }));
+    expect((await rpcError(c.call("a2h.approve", { grant: "once", to: w.ownerId, title: "x", risk: "critical", wait_s: 0 }))).data?.code).toBe("invalid");
+    expect((await rpcError(c.call("a2h.approve", { grant: "once", to: w.ownerId, title: "x", action: DEPLOY, wait_s: 0 }))).data?.code).toBe("invalid");
+    await c.call("a2h.approve", { grant: "once", to: w.ownerId, title: "x", risk: "critical", action: DEPLOY, idempotency_key: "k1", wait_s: 0 });
+    const e = await rpcError(c.call("a2h.approve", { grant: "once", to: w.ownerId, title: "x", risk: "critical", action: { ...DEPLOY, env: "dev" }, idempotency_key: "k1", wait_s: 0 }));
     expect(e.data?.code).toBe("conflict");
   });
 
@@ -91,7 +91,7 @@ describe("risk: critical", () => {
     const w = await world();
     const { token } = addAgent(w);
     const c = await client(w, token);
-    const r = await c.call<Record<string, string>>("a2h.approve", { to: w.ownerId, title: "x", wait_s: 0 });
+    const r = await c.call<Record<string, string>>("a2h.approve", { grant: "once", to: w.ownerId, title: "x", wait_s: 0 });
     expect(await c.call("a2h.verifyAction", { request_id: r.request_id, action: DEPLOY })).toMatchObject({ ok: false, reason: "not_critical" });
   });
 });

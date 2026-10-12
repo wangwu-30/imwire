@@ -1,4 +1,4 @@
-export { SessionGateway, redactCodes, type SessionGatewayOptions, type A2hRoute } from "./gateway.js";
+export { SessionGateway, redactCodes, validateGrant, wireGrant, type SessionGatewayOptions, type A2hRoute } from "./gateway.js";
 export {
   TotpVerifier,
   isTotpVerifier,
@@ -29,7 +29,17 @@ export {
   type AssuranceLevel,
   type QuietHours,
 } from "./a2h.js";
-export { SessionStore, AUDIT_SCHEMA_VERSION, type A2hEvent } from "./store.js";
+export {
+  SessionStore,
+  AUDIT_SCHEMA_VERSION,
+  EXECUTION_UNKNOWN_AFTER_MS,
+  RECEIPT_LEVELS,
+  type A2hEvent,
+  type GrantSpec,
+  type ReceiptLevel,
+  type ReceiptRecord,
+} from "./store.js";
+export { eventType, dataDigest, type EventEnvelope } from "./envelope.js";
 export { ScriptedDriver, type ScriptedController } from "./scripted-driver.js";
 export { identityKey, groupKey, newId, pairCode, hashPairCode, PAIR_CODE_LEN, PAIR_CODE_RE } from "./ids.js";
 export { isExplicitApprove, isDenyOption } from "./types.js";

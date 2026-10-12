@@ -19,6 +19,7 @@ import {
   A2H_CHOICES_MAX,
   A2H_FALLBACK_WINDOW_MS,
   A2hError,
+  ACTION_DIGEST_RE,
   actionBindingHash,
   agentTopicTitle,
   canonicalJson,
@@ -41,7 +42,15 @@ import {
 } from "./a2h.js";
 import { groupKey, identityKey, pairCode, PAIR_CODE_RE } from "./ids.js";
 import { isTotpVerifier, TOTP_CODE_RE, type TotpEnrollment, type TotpVerifier } from "./totp.js";
-import { DEFAULT_LOG_WINDOW, SessionStore } from "./store.js";
+import {
+  DEFAULT_LOG_WINDOW,
+  EXECUTION_UNKNOWN_AFTER_MS,
+  RECEIPT_LEVELS,
+  SessionStore,
+  type GrantSpec,
+  type ReceiptLevel,
+  type ReceiptRecord,
+} from "./store.js";
 import {
   isDenyOption,
   isExplicitApprove,
@@ -231,6 +240,11 @@ export class SessionGateway {
         requestId: req.id,
       });
     }
+    try {
+      this.markUnknownExecutions();
+    } catch (err) {
+      this.logger.warn("execution-unknown sweep failed", { err: String(err) });
+    }
     return { approvals, requests };
   }
 
@@ -341,7 +355,7 @@ export class SessionGateway {
   }
 
   /** Mirror a decided approval onto its a2h request (if any). */
-  private syncA2hFromApproval(decided: PendingApproval): void {
+  private syncA2hFromApproval(decided: PendingApproval, ctx?: { quote?: string; channel?: string }): void {
     const req = this.store.a2hRequestByApproval(decided.id);
     if (!req || req.state !== "pending") return;
     const by = decided.decidedBy ?? "unknown";
@@ -357,8 +371,199 @@ export class SessionGateway {
               : by === "locked"
                 ? "denied"
               : "denied";
-    this.store.decideA2hRequest(req.id, state, by, this.clock.now(), { choice: decided.chosen ?? null });
+    const now = this.clock.now();
+    const after = this.store.decideA2hRequest(req.id, state, by, now, { choice: decided.chosen ?? null });
+    if (after) {
+      const human = state === "approved" || (state === "denied" && by.split(":").length === 3);
+      if (ctx) this.store.setA2hMeta(req.id, { quote: ctx.quote, channel: ctx.channel });
+      const eid = this.store.audit({
+        at: now,
+        occurredAt: decided.decidedAt ?? now,
+        action: "decision",
+        result: state,
+        agentId: req.agentId,
+        personId: req.personId,
+        requestId: req.id,
+        source: human ? `actor:person:${req.personId}` : undefined,
+        idempotencyKey: `dec:${req.id}`,
+        data: this.decisionData(req.id, {
+          choice: human ? (decided.chosen ?? null) : null,
+          decided_by: human ? `person:${req.personId}` : `system:${by}`,
+          decided_level: decided.decidedLevel ?? null,
+        }),
+      });
+      this.store.setA2hDecisionEvent(req.id, eid);
+    }
     this.notifyA2h(req.id);
+  }
+
+  // ---- v0 request / decision metadata (PR 4) ---------------------------------
+
+  private requestMeta(
+    opts: { grant?: GrantSpec; object?: { ref: string; digest?: string }; stateVersion?: string; actionName?: string },
+    critical: boolean,
+  ): { grant: GrantSpec; objectRef?: string; objectDigest?: string; stateVersion?: string; action?: string } {
+    const grant = validateGrant(opts.grant ?? { kind: "once" }, this.clock.now());
+    if (critical && grant.kind !== "once") throw new A2hError("invalid", "critical approvals are grant once");
+    let objectRef: string | undefined;
+    let objectDigest: string | undefined;
+    if (opts.object !== undefined) {
+      if (!opts.object || typeof opts.object.ref !== "string" || !OBJECT_REF_RE.test(opts.object.ref)) {
+        throw new A2hError("invalid", "object.ref must be 1-200 chars of [A-Za-z0-9._:/#@+-]");
+      }
+      objectRef = opts.object.ref;
+      if (opts.object.digest !== undefined) {
+        const m = ACTION_DIGEST_RE.exec(String(opts.object.digest).trim().toLowerCase());
+        if (!m) throw new A2hError("invalid", "object.digest must be a hex SHA-1/SHA-256/SHA-512 digest");
+        objectDigest = m[1]!.length === 64 ? `sha256:${m[1]}` : `digest:${m[1]}`;
+      }
+    }
+    if (opts.stateVersion !== undefined && !/^[A-Za-z0-9._:-]{1,64}$/.test(String(opts.stateVersion))) {
+      throw new A2hError("invalid", "state_version must be 1-64 chars of [A-Za-z0-9._:-]");
+    }
+    if (opts.actionName !== undefined && !/^[a-z][a-z0-9_.-]{0,39}$/.test(String(opts.actionName))) {
+      throw new A2hError("invalid", "action_name must be a short lowercase verb");
+    }
+    return {
+      grant,
+      objectRef,
+      objectDigest,
+      stateVersion: opts.stateVersion === undefined ? undefined : String(opts.stateVersion),
+      action: opts.actionName,
+    };
+  }
+
+  /** v0 Request fields for a `*.request.created` event. */
+  private requestData(requestId: string, extra: Record<string, unknown>): Record<string, unknown> {
+    const req = this.store.getA2hRequest(requestId)!;
+    const m = this.store.a2hMeta(requestId)!;
+    const st = this.store.a2hActionState(requestId);
+    return {
+      kind: req.kind,
+      to: `person:${req.personId}`,
+      ...extra,
+      options: m.options ?? [],
+      object: m.objectRef || m.objectDigest || st?.actionHash ? { ref: m.objectRef ?? null, digest: m.objectDigest ?? st?.actionHash ?? null } : null,
+      state_version: m.stateVersion ?? null,
+      action: m.action ?? null,
+      grant: wireGrant(m.grant),
+    };
+  }
+
+  /** v0 Decision fields. Quotes are untrusted, sanitized and code-masked. */
+  private decisionData(requestId: string, extra: Record<string, unknown>): Record<string, unknown> {
+    const m = this.store.a2hMeta(requestId)!;
+    const st = this.store.a2hActionState(requestId);
+    return {
+      request: requestId,
+      ...extra,
+      quote: m.quote ?? null,
+      channel: m.channel ?? "system",
+      scope: { object: m.objectRef ?? null, action: m.action ?? null, digest: st?.actionHash ?? m.objectDigest ?? null },
+      state_version: m.stateVersion ?? null,
+      grant: wireGrant(m.grant),
+    };
+  }
+
+  /**
+   * v0 Receipt from the agent: received → recorded → executed. Each level is
+   * recorded once (replays return the first). `executed` needs an approved
+   * (or answered) request, and for critical a successful verifyAction.
+   */
+  recordReceipt(opts: {
+    agentId: string;
+    requestId: string;
+    level: ReceiptLevel;
+    exitCode?: number;
+    externalId?: string;
+    note?: string;
+    occurredAt?: number;
+  }): { receipt: ReceiptRecord; replayed: boolean; execution: string } {
+    const req = this.store.getA2hRequest(opts.requestId);
+    if (!req || req.agentId !== opts.agentId) throw new A2hError("not_found", "no such request for this agent");
+    if (!RECEIPT_LEVELS.includes(opts.level)) throw new A2hError("invalid", "level must be received, recorded or executed");
+    if (req.kind === "message") throw new A2hError("invalid", "receipts are for approvals and asks");
+    if (req.state === "pending") throw new A2hError("invalid", "request is not decided yet");
+    if (opts.level === "executed") {
+      if (req.state !== "approved" && req.state !== "answered") throw new A2hError("invalid", `cannot execute a ${req.state} request`);
+      const st = this.store.a2hActionState(req.id);
+      if (st?.risk === "critical" && st.consumedAt === undefined) {
+        throw new A2hError("invalid", "critical: call a2h.verifyAction before reporting executed");
+      }
+    }
+    if (opts.exitCode !== undefined && (!Number.isInteger(opts.exitCode) || Math.abs(opts.exitCode) > 2 ** 31)) {
+      throw new A2hError("invalid", "exit_code must be an integer");
+    }
+    if (opts.externalId !== undefined && !EXTERNAL_ID_RE.test(opts.externalId)) {
+      throw new A2hError("invalid", "external_id must be 1-200 chars of [A-Za-z0-9._:/#@+=-]");
+    }
+    const now = this.clock.now();
+    const occurredAt = opts.occurredAt !== undefined && opts.occurredAt <= now ? opts.occurredAt : now;
+    const note = opts.note ? redactCodes(sanitizeAgentLine(opts.note, 300)) : undefined;
+    const prior = this.store.receipts(req.id).find((r) => r.level === opts.level);
+    if (prior) return { receipt: prior, replayed: true, execution: this.store.a2hMeta(req.id)?.execution ?? "pending" };
+    const m = this.store.a2hMeta(req.id)!;
+    const late = opts.level === "executed" && m.execution === "unknown";
+    const result = {
+      ...(opts.exitCode !== undefined ? { exit_code: opts.exitCode } : {}),
+      ...(opts.externalId !== undefined ? { external_id: opts.externalId } : {}),
+    };
+    const eid = this.store.audit({
+      at: now,
+      occurredAt,
+      action: "receipt",
+      result: opts.level,
+      agentId: req.agentId,
+      personId: req.personId,
+      requestId: req.id,
+      causationId: m.decisionEvent,
+      idempotencyKey: `rcpt:${req.id}:${opts.level}`,
+      data: {
+        of: m.decisionEvent ?? `request:${req.id}`,
+        level: opts.level,
+        result: Object.keys(result).length > 0 ? result : null,
+        note: note ?? null,
+        at: isoLocal(occurredAt),
+        ...(late ? { after_unknown: true } : {}),
+      },
+    });
+    const out = this.store.addReceipt({
+      requestId: req.id,
+      level: opts.level,
+      exitCode: opts.exitCode,
+      externalId: opts.externalId,
+      note,
+      occurredAt,
+      recordedAt: now,
+      eventId: eid,
+    });
+    return { ...out, execution: this.store.a2hMeta(req.id)?.execution ?? "pending" };
+  }
+
+  /**
+   * Decided requests with no `executed` receipt after 24h are marked
+   * `unknown` in the event log, never assumed done.
+   */
+  markUnknownExecutions(): number {
+    const now = this.clock.now();
+    let n = 0;
+    for (const r of this.store.dueExecutionUnknown(now - EXECUTION_UNKNOWN_AFTER_MS)) {
+      if (!this.store.markExecutionUnknown(r.id)) continue;
+      const m = this.store.a2hMeta(r.id);
+      const levels = this.store.receipts(r.id).map((x) => x.level);
+      this.store.audit({
+        at: now,
+        action: "execution_unknown",
+        result: "unknown",
+        agentId: r.agentId,
+        personId: r.personId,
+        requestId: r.id,
+        causationId: m?.decisionEvent,
+        data: { of: m?.decisionEvent ?? `request:${r.id}`, execution: "unknown", receipts: levels, after_ms: EXECUTION_UNKNOWN_AFTER_MS },
+      });
+      n += 1;
+    }
+    return n;
   }
 
   attach(adapter: Adapter): void {
@@ -1073,7 +1278,7 @@ export class SessionGateway {
     return { option: actionId, approved: isExplicitApprove(actionId) };
   }
 
-  private async handleAction(from: UserRef, actionId: string, value?: string, target?: MsgRef): Promise<void> {
+  private async handleAction(from: UserRef, actionId: string, value?: string, target?: MsgRef, quote?: string): Promise<void> {
     if (value && actionId.startsWith("a2h:")) {
       const req = this.store.getA2hRequest(value);
       if (req?.kind === "ask") {
@@ -1143,7 +1348,10 @@ export class SessionGateway {
       const req = this.store.a2hRequestByApproval(approval.id);
       if (req) this.store.consumeStepUp(req.id, this.clock.now());
     }
-    this.syncA2hFromApproval(decided);
+    this.syncA2hFromApproval(decided, {
+      quote: quote ?? `[按钮] ${approved ? "批准" : "拒绝"}`,
+      channel: target?.chat ? `${target.chat.platform}:${target.chat.kind}` : from.platform,
+    });
     this.approvalWaiters.get(approval.id)?.resolve(option);
     this.approvalWaiters.delete(approval.id);
     await this.updateApprovalCards(decided, state);
@@ -1400,7 +1608,7 @@ export class SessionGateway {
     }
     this.store.recordStepUp(req.id, personId, "totp", chat, now);
     audit("ok");
-    await this.handleAction(from, "approve", req.approvalId, { chat, messageId: "" });
+    await this.handleAction(from, "approve", req.approvalId, { chat, messageId: "" }, `/approve ${shortCode(req.id)} ******（已验证 TOTP）`);
   }
 
   /** 5 failures / 15 min: deny every pending targeted approval and tell every surface. */
@@ -1544,6 +1752,16 @@ export class SessionGateway {
     action?: unknown;
     /** … or a digest of it (git SHA, file sha256). Exactly one is required for critical. */
     actionDigest?: string;
+    /** v0 Decision.grant. Default once (pre-v0 behaviour); the hub RPC requires it. */
+    grant?: GrantSpec;
+    /** v0 Request.object */
+    object?: { ref: string; digest?: string };
+    /** v0 Request.state_version: the object's version the agent saw. */
+    stateVersion?: string;
+    /** v0 Decision.scope.action: what will be done (verb), e.g. "deploy". */
+    actionName?: string;
+    /** v0 Request.options[].consequence for the two buttons. */
+    consequences?: { approve?: string; deny?: string };
     expiresInS?: number;
     route?: A2hRoute;
     idempotencyKey?: string;
@@ -1553,6 +1771,7 @@ export class SessionGateway {
     if (!title) throw new A2hError("invalid", "title is required");
     const details = opts.details ? sanitizeAgentText(opts.details) : "";
     const risk = opts.risk && ["low", "medium", "high", "critical"].includes(opts.risk) ? opts.risk : undefined;
+    const meta = this.requestMeta(opts, risk === "critical");
     let bindingHash: string | undefined;
     if (risk === "critical") {
       if (!isTotpVerifier(this.verifier)) throw new A2hError("totp_required", "critical approvals need TOTP on this hub");
@@ -1592,10 +1811,28 @@ export class SessionGateway {
     const riskLabel = risk ? { low: "低风险", medium: "中风险", high: "⚠️ 高风险", critical: "⛔ 关键操作" }[risk] : undefined;
     const preview =
       risk === "critical" && opts.action !== undefined ? sanitizeAgentText(canonicalJson(opts.action), 600) : undefined;
+    const approvalOptions = [
+      {
+        id: "approve",
+        label: "批准",
+        consequence: opts.consequences?.approve
+          ? sanitizeAgentLine(opts.consequences.approve, A2H_CONSEQUENCE_MAX)
+          : meta.action
+            ? `agent 执行 ${meta.action}`
+            : "agent 继续执行",
+      },
+      {
+        id: "deny",
+        label: "拒绝",
+        consequence: opts.consequences?.deny ? sanitizeAgentLine(opts.consequences.deny, A2H_CONSEQUENCE_MAX) : "agent 不执行",
+      },
+    ];
     const card = [
       frameHeader(agent.name),
       "",
       `审批请求：${title}`,
+      ...(meta.objectRef ? [`对象：${meta.objectRef}${meta.stateVersion ? `（版本 ${meta.stateVersion}）` : ""}`] : []),
+      ...(opts.consequences ? [`批准 → ${approvalOptions[0]!.consequence}；拒绝 → ${approvalOptions[1]!.consequence}`] : []),
       ...(details ? ["", details] : []),
       ...(bindingHash
         ? ["", `绑定对象：${preview ? `\n${preview}\n` : ""}${bindingHash.slice(0, 19)}…（执行前会核对，对象变了就作废）`]
@@ -1612,6 +1849,7 @@ export class SessionGateway {
     });
     this.store.setA2hRisk(request.id, risk);
     if (bindingHash) this.store.setA2hActionHash(request.id, bindingHash);
+    this.store.setA2hMeta(request.id, { ...meta, options: approvalOptions });
     this.store.setA2hApprovalId(request.id, approval.id);
     const msg = this.store.appendMessage({
       conversationId: conv.id,
@@ -1648,6 +1886,8 @@ export class SessionGateway {
       object: risk === "critical" ? "critical_action" : "approval",
       bindingHash,
       detail: risk ? { risk } : undefined,
+      idempotencyKey: opts.idempotencyKey,
+      data: this.requestData(request.id, { title, reply_by: isoLocal(expiresAt), risk: risk ?? null }),
     });
     return this.a2hView(this.store.getA2hRequest(request.id)!);
   }
@@ -1736,16 +1976,34 @@ export class SessionGateway {
     agentId: string;
     to: string;
     question: string;
-    choices?: string[];
+    /** Plain labels, or v0 options with a consequence each. */
+    choices?: Array<string | { label: string; consequence?: string }>;
     allowFreeText?: boolean;
+    /** v0 Decision.grant. Default once (pre-v0 behaviour); the hub RPC requires it. */
+    grant?: GrantSpec;
+    /** v0 Request.object */
+    object?: { ref: string; digest?: string };
+    /** v0 Request.state_version: the object's version the agent saw. */
+    stateVersion?: string;
+    /** v0 Decision.scope.action: what will be done (verb), e.g. "deploy". */
+    actionName?: string;
     expiresInS?: number;
     route?: A2hRoute;
     idempotencyKey?: string;
   }): Promise<A2hView> {
     const { agent, personId } = this.a2hAuthorize(opts.agentId, opts.to, "ask");
+    const meta = this.requestMeta(opts, false);
     const question = sanitizeAgentText(opts.question);
     if (!question) throw new A2hError("invalid", "question is required");
-    const choices = (opts.choices ?? []).map((c) => sanitizeAgentLine(c, A2H_CHOICE_MAX)).filter(Boolean);
+    const rawChoices = (opts.choices ?? []).map((c) => (typeof c === "string" ? { label: c } : c));
+    const choiceOpts = rawChoices
+      .map((c, i) => ({
+        id: `a2h:${i}`,
+        label: sanitizeAgentLine(String(c.label ?? ""), A2H_CHOICE_MAX),
+        consequence: c.consequence ? sanitizeAgentLine(String(c.consequence), A2H_CONSEQUENCE_MAX) : "",
+      }))
+      .filter((c) => c.label);
+    const choices = choiceOpts.map((c) => c.label);
     if (choices.length > A2H_CHOICES_MAX) throw new A2hError("invalid", `at most ${A2H_CHOICES_MAX} choices`);
     const allowFreeText = opts.allowFreeText ?? choices.length === 0;
     if (!allowFreeText && choices.length === 0) throw new A2hError("invalid", "need choices or free text");
@@ -1769,10 +2027,13 @@ export class SessionGateway {
     const how = allowFreeText
       ? `引用回复本消息，或发送 /answer ${code} 你的回答`
       : "点下面的选项作答";
+    const askOptions = choiceOpts.map((c) => ({ ...c, consequence: c.consequence || "答案转给 agent" }));
+    this.store.setA2hMeta(request.id, { ...meta, options: askOptions });
     const rendered = [
       frameHeader(agent.name),
       "",
       question,
+      ...(choiceOpts.some((c) => c.consequence) ? ["", ...choiceOpts.map((c) => `· ${c.label} → ${c.consequence || "答案转给 agent"}`)] : []),
       "",
       `— 问题编号 ${code} · 有效至 ${formatLocal(expiresAt)}`,
       `— ${how}。你的回答只会转给这个 agent，不会当作批准。`,
@@ -1808,6 +2069,8 @@ export class SessionGateway {
       agentId: agent.id,
       personId,
       requestId: request.id,
+      idempotencyKey: opts.idempotencyKey,
+      data: this.requestData(request.id, { question, reply_by: isoLocal(expiresAt) }),
     });
     return this.a2hView(this.store.getA2hRequest(request.id)!);
   }
@@ -2050,7 +2313,22 @@ export class SessionGateway {
       requestId: req.id,
     });
     this.store.setA2hAnswerMessage(req.id, msg.id);
-    this.store.audit({ at: now, action: "answer", result: "answered", agentId: req.agentId, personId: req.personId, requestId: req.id });
+    this.store.setA2hMeta(req.id, {
+      quote: redactCodes(sanitizeAgentLine(text, 500)),
+      channel: chat ? `${chat.platform}:${chat.kind}` : from.platform,
+    });
+    const eid = this.store.audit({
+      at: now,
+      action: "answer",
+      result: "answered",
+      agentId: req.agentId,
+      personId: req.personId,
+      requestId: req.id,
+      source: `actor:person:${req.personId}`,
+      idempotencyKey: `dec:${req.id}`,
+      data: this.decisionData(req.id, { choice: picked ?? null, decided_by: `person:${req.personId}`, untrusted: true }),
+    });
+    this.store.setA2hDecisionEvent(req.id, eid);
     this.notifyA2h(req.id);
     await this.closeAskCards(decided, "已回答");
     const agent = this.store.getAgent(req.agentId);
@@ -2163,6 +2441,12 @@ export class SessionGateway {
       requiredLevel: approval?.requiredLevel ?? null,
       decidedLevel: approval?.decidedLevel ?? null,
       stepUpRequired: req.kind === "approval" && req.state === "pending" && this.store.stepUpRequested(req.id),
+      grant: req.kind === "message" ? null : wireGrant(this.store.a2hMeta(req.id)?.grant ?? { kind: "once" }),
+      execution:
+        req.kind === "message" || (req.state !== "approved" && req.state !== "answered")
+          ? null
+          : (this.store.a2hMeta(req.id)?.execution ?? "pending"),
+      receipts: req.kind === "message" ? [] : this.store.receipts(req.id).map((r) => r.level),
       risk: req.kind === "approval" ? (this.store.a2hActionState(req.id)?.risk ?? null) : null,
       bindingHash: req.kind === "approval" ? (this.store.a2hActionState(req.id)?.actionHash ?? null) : null,
     };
@@ -2179,6 +2463,36 @@ export class SessionGateway {
     );
     return next;
   }
+}
+
+const A2H_CONSEQUENCE_MAX = 120;
+const OBJECT_REF_RE = /^[A-Za-z0-9._:/#@+-]{1,200}$/;
+const EXTERNAL_ID_RE = /^[A-Za-z0-9._:/#@+=-]{1,200}$/;
+const MAX_GRANT_UNTIL_MS = 30 * 24 * 3600_000;
+
+/** grant: once | task(task_id) | until(time, ≤ 30 days ahead). */
+export function validateGrant(g: GrantSpec, now: number): GrantSpec {
+  if (!g || typeof g !== "object") throw new A2hError("invalid", "grant is required");
+  if (g.kind === "once") return { kind: "once" };
+  if (g.kind === "task") {
+    if (typeof g.taskId !== "string" || !/^[A-Za-z0-9._:/#-]{1,120}$/.test(g.taskId)) {
+      throw new A2hError("invalid", "grant task needs a task_id");
+    }
+    return { kind: "task", taskId: g.taskId };
+  }
+  if (g.kind === "until") {
+    if (typeof g.until !== "number" || !Number.isFinite(g.until) || g.until <= now || g.until > now + MAX_GRANT_UNTIL_MS) {
+      throw new A2hError("invalid", "grant until must be in the future (max 30 days)");
+    }
+    return { kind: "until", until: g.until };
+  }
+  throw new A2hError("invalid", "grant must be once, task or until");
+}
+
+export function wireGrant(g: GrantSpec): Record<string, unknown> {
+  if (g.kind === "task") return { kind: "task", task_id: g.taskId };
+  if (g.kind === "until") return { kind: "until", until: isoLocal(g.until) };
+  return { kind: "once" };
 }
 
 function timingSafeEqualStr(a: string, b: string): boolean {

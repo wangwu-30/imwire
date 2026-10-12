@@ -1,5 +1,6 @@
 import type { Logger } from "@imwire/core";
-import { A2hError, type A2hView, type SessionGateway } from "@imwire/session";
+import { A2hError, type A2hView, type GrantSpec, type ReceiptLevel, type SessionGateway } from "@imwire/session";
+import { redactText } from "./redact.js";
 import { RpcFail, RPC_APP, RPC_INVALID_PARAMS, RPC_METHOD_NOT_FOUND } from "../rpc.js";
 import { authenticateAgent, tokenFingerprint } from "./tokens.js";
 import type { RpcConnection } from "./unix-server.js";
@@ -28,6 +29,36 @@ function num(p: P, k: string): number | undefined {
   return v;
 }
 
+/** v0 grant on the wire: "once" | {kind:"task",task_id} | {kind:"until",until: ISO or ms}. Required. */
+export function parseGrant(v: unknown): GrantSpec {
+  if (v === undefined || v === null) throw new RpcFail(RPC_INVALID_PARAMS, "grant is required (once | task | until)");
+  const g = (typeof v === "string" ? { kind: v } : v) as { kind?: unknown; task_id?: unknown; until?: unknown };
+  if (g.kind === "once") return { kind: "once" };
+  if (g.kind === "task") return { kind: "task", taskId: typeof g.task_id === "string" ? g.task_id : "" };
+  if (g.kind === "until") {
+    const until = typeof g.until === "number" ? g.until : typeof g.until === "string" ? Date.parse(g.until) : NaN;
+    return { kind: "until", until };
+  }
+  throw new RpcFail(RPC_INVALID_PARAMS, "grant must be once, task or until");
+}
+
+function v0Fields(p: P): {
+  grant: GrantSpec;
+  object?: { ref: string; digest?: string };
+  stateVersion?: string;
+  actionName?: string;
+} {
+  const o = p.object as { ref?: unknown; digest?: unknown } | undefined;
+  if (o !== undefined && (typeof o !== "object" || o === null)) throw new RpcFail(RPC_INVALID_PARAMS, "object must be {ref, digest?}");
+  const sv = p.state_version;
+  return {
+    grant: parseGrant(p.grant),
+    object: o ? { ref: String(o.ref ?? ""), digest: o.digest === undefined ? undefined : String(o.digest) } : undefined,
+    stateVersion: sv === undefined || sv === null ? undefined : String(sv),
+    actionName: str(p, "action_name", false),
+  };
+}
+
 /** snake_case wire shape of a request (design §2). */
 export function wireView(v: A2hView): Record<string, unknown> {
   return {
@@ -47,6 +78,9 @@ export function wireView(v: A2hView): Record<string, unknown> {
     step_up_required: v.stepUpRequired,
     risk: v.risk,
     binding_hash: v.bindingHash,
+    grant: v.grant,
+    execution: v.execution,
+    receipts: v.receipts,
     ...(v.status === "pending"
       ? { next: "NOT approved. Do not proceed. Call a2h.wait with this request_id until a final status." }
       : {}),
@@ -193,14 +227,19 @@ export class A2hRpc {
       }
       case "a2h.ask": {
         const choices = p.choices;
-        if (choices !== undefined && (!Array.isArray(choices) || choices.some((c) => typeof c !== "string"))) {
-          throw new RpcFail(RPC_INVALID_PARAMS, "choices must be an array of strings");
+        if (
+          choices !== undefined &&
+          (!Array.isArray(choices) ||
+            choices.some((c) => typeof c !== "string" && (typeof c !== "object" || c === null || typeof (c as { label?: unknown }).label !== "string")))
+        ) {
+          throw new RpcFail(RPC_INVALID_PARAMS, "choices must be strings or {label, consequence}");
         }
         const v = await gw.askPerson({
           agentId,
           to: str(p, "to")!,
           question: str(p, "question")!,
-          choices: choices as string[] | undefined,
+          choices: choices as Array<string | { label: string; consequence?: string }> | undefined,
+          ...v0Fields(p),
           allowFreeText: typeof p.allow_free_text === "boolean" ? p.allow_free_text : undefined,
           expiresInS: num(p, "expires_in_s"),
           route: str(p, "route", false),
@@ -219,6 +258,8 @@ export class A2hRpc {
           risk: str(p, "risk", false) as "low" | "medium" | "high" | "critical" | undefined,
           action: p.action,
           actionDigest: str(p, "action_digest", false),
+          ...v0Fields(p),
+          consequences: consequences(p.consequences),
           expiresInS: num(p, "expires_in_s"),
           route: str(p, "route", false),
           idempotencyKey: str(p, "idempotency_key", false),
@@ -257,8 +298,30 @@ export class A2hRpc {
           limit: num(p, "limit"),
         });
       case "a2h.events.read": {
-        const events = gw.store.eventsAfter(num(p, "cursor") ?? 0, { agentId, limit: num(p, "limit") });
-        return { events: events.map(wireEvent), cursor: events.at(-1)?.id ?? num(p, "cursor") ?? 0 };
+        const events = gw.store.envelopesAfter(num(p, "cursor") ?? 0, { agentId, limit: num(p, "limit") });
+        return { events, cursor: events.at(-1)?.seq ?? num(p, "cursor") ?? 0 };
+      }
+      case "a2h.receipt": {
+        const result = (p.result ?? {}) as { exit_code?: unknown; external_id?: unknown };
+        if (typeof result !== "object" || result === null) throw new RpcFail(RPC_INVALID_PARAMS, "result must be {exit_code?, external_id?}");
+        const at = str(p, "at", false);
+        const r = gw.recordReceipt({
+          agentId,
+          requestId: str(p, "request_id")!,
+          level: str(p, "level")! as ReceiptLevel,
+          exitCode: result.exit_code === undefined ? undefined : (result.exit_code as number),
+          externalId: result.external_id === undefined ? undefined : String(result.external_id),
+          // Agent-written text: strip anything token/secret-shaped before it reaches the log.
+          note: p.note === undefined ? undefined : redactText(String(p.note)),
+          occurredAt: at ? Date.parse(at) : undefined,
+        });
+        return {
+          receipt_id: r.receipt.id,
+          event_id: r.receipt.eventId,
+          level: r.receipt.level,
+          replayed: r.replayed,
+          execution: r.execution,
+        };
       }
       case "a2h.events.subscribe":
         return this.subscribe(conn, agentId, num(p, "cursor") ?? 0);
@@ -280,10 +343,10 @@ export class A2hRpc {
       if (!conn.token) return; // revoked/expired: stop pushing
       try {
         for (;;) {
-          const batch = this.gw.store.eventsAfter(last, { agentId, limit: 200 });
+          const batch = this.gw.store.envelopesAfter(last, { agentId, limit: 200 });
           if (batch.length === 0) break;
-          for (const e of batch) conn.notify("a2h.event", wireEvent(e));
-          last = batch.at(-1)!.id;
+          for (const e of batch) conn.notify("a2h.event", e);
+          last = batch.at(-1)!.seq;
         }
       } catch (err) {
         this.logger?.warn("event subscription tick failed", { err: String(err) });
@@ -297,19 +360,13 @@ export class A2hRpc {
   }
 }
 
-/** Neutral event wire shape (schema v1). */
-export function wireEvent(e: import("@imwire/session").A2hEvent): Record<string, unknown> {
+
+function consequences(v: unknown): { approve?: string; deny?: string } | undefined {
+  if (v === undefined || v === null) return undefined;
+  if (typeof v !== "object") throw new RpcFail(RPC_INVALID_PARAMS, "consequences must be {approve?, deny?}");
+  const o = v as { approve?: unknown; deny?: unknown };
   return {
-    v: e.v,
-    cursor: e.id,
-    at: e.at,
-    agent_id: e.agentId ?? null,
-    action: e.action,
-    person_id: e.personId ?? null,
-    request_id: e.requestId ?? null,
-    object: e.object ?? null,
-    binding_hash: e.bindingHash ?? null,
-    decision: e.decision,
-    detail: e.detail ?? null,
+    approve: typeof o.approve === "string" ? o.approve : undefined,
+    deny: typeof o.deny === "string" ? o.deny : undefined,
   };
 }

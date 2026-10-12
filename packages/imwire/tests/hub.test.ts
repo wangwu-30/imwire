@@ -33,7 +33,7 @@ describe("imwire hub: e2e TOTP approval over RPC (mock platform)", () => {
     const sub = await c.call<{ subscribed: boolean }>("a2h.events.subscribe", { cursor: 0 });
     expect(sub.subscribed).toBe(true);
 
-    const req = await c.call<Record<string, unknown>>("a2h.approve", { to: w.ownerId, title: "deploy prod", wait_s: 0 });
+    const req = await c.call<Record<string, unknown>>("a2h.approve", { grant: "once", to: w.ownerId, title: "deploy prod", wait_s: 0 });
     expect(req).toMatchObject({ status: "pending", approved: false, required_level: "verified" });
     expect(String(req.next)).toContain("NOT approved");
 
@@ -48,26 +48,31 @@ describe("imwire hub: e2e TOTP approval over RPC (mock platform)", () => {
     r = await c.call("a2h.wait", { request_ids: [req.request_id], wait_s: 0 });
     expect(r.results[0]).toMatchObject({ status: "approved", approved: true, decided_level: "verified" });
 
-    // Neutral event log: schema version, agent, object, decision, time; handoff recorded once.
-    const ev = await c.call<{ events: Array<Record<string, unknown>>; cursor: number }>("a2h.events.read", { cursor: 0 });
-    const actions = ev.events.map((e) => e.action);
+    // v0 envelopes: schema version, agent, object, decision, time; handoff recorded once.
+    type Env = { id: string; seq: number; v: number; type: string; subject: string; source: string; correlationid?: string; data: Record<string, unknown> };
+    const ev = await c.call<{ events: Env[]; cursor: number }>("a2h.events.read", { cursor: 0 });
+    const actions = ev.events.map((e) => e.data.action);
     expect(actions).toContain("handoff");
+    expect(actions).toContain("decision");
     expect(actions.filter((a) => a === "handoff")).toHaveLength(1);
     for (const e of ev.events) {
       expect(e.v).toBe(1);
-      expect(e.agent_id).toBe(agentId);
-      expect(typeof e.at).toBe("number");
-      expect(typeof e.decision).toBe("string");
+      expect(e.data.agent).toBe(`agent:${agentId}`);
+      expect(typeof e.data.decision).toBe("string");
     }
-    expect(ev.events.find((e) => e.action === "handoff")).toMatchObject({ request_id: req.request_id, decision: "approved" });
+    expect(ev.events.find((e) => e.data.action === "handoff")).toMatchObject({
+      subject: `request:${req.request_id as string}`,
+      correlationid: `req:${req.request_id as string}`,
+      data: { decision: "approved" },
+    });
     // cursor reads continue where they stopped
     const more = await c.call<{ events: unknown[] }>("a2h.events.read", { cursor: ev.cursor });
     expect(more.events).toHaveLength(0);
 
-    // subscription pushed the same events
+    // subscription pushed the same envelopes
     await new Promise((res) => setTimeout(res, 400));
-    const pushed = c.notifications.filter((n) => n.method === "a2h.event").map((n) => (n.params as { cursor: number }).cursor);
-    expect(pushed).toEqual(ev.events.map((e) => e.cursor));
+    const pushed = c.notifications.filter((n) => n.method === "a2h.event").map((n) => (n.params as Env).id);
+    expect(pushed).toEqual(ev.events.map((e) => e.id));
 
     // no secrets in DB / logs / audit
     const all = dump(w);
@@ -85,9 +90,10 @@ describe("imwire hub: e2e TOTP approval over RPC (mock platform)", () => {
     const ca = await client(w, a.token);
     const cb = await client(w, b.token);
     await ca.call("a2h.send", { to: w.ownerId, text: "hi" });
-    const evb = await cb.call<{ events: Array<{ agent_id: string }> }>("a2h.events.read", {});
-    expect(evb.events.every((e) => e.agent_id === b.agentId)).toBe(true);
-    expect(evb.events.some((e) => (e as { action?: string }).action === "send")).toBe(false);
+    const evb = await cb.call<{ events: Array<{ data: { agent?: string; action: string } }> }>("a2h.events.read", {});
+    expect(evb.events.length).toBeGreaterThan(0);
+    expect(evb.events.every((e) => e.data.agent === `agent:${b.agentId}`)).toBe(true);
+    expect(evb.events.some((e) => e.data.action === "send")).toBe(false);
   });
 });
 
@@ -96,7 +102,7 @@ describe("imwire hub: token lifecycle", () => {
     const w = await world();
     const { token } = addAgent(w);
     const c = await client(w, token);
-    const req = await c.call<{ request_id: string }>("a2h.approve", { to: w.ownerId, title: "x", wait_s: 0 });
+    const req = await c.call<{ request_id: string }>("a2h.approve", { grant: "once", to: w.ownerId, title: "x", wait_s: 0 });
     // revoke from a separate admin process (own store handle, like the CLI)
     const cliStore = new HubAdmin(new SessionStore(w.db), w.key, () => w.clock.now());
     expect(cliStore.revokeAgent("codex-mac").cancelled).toBe(1);
@@ -159,15 +165,15 @@ describe("imwire hub: identity defaults", () => {
     const w = await world();
     const { token, agentId } = addAgent(w);
     const c = await client(w, token);
-    const a = await c.call<Record<string, unknown>>("a2h.approve", { to: w.ownerId, title: "x", wait_s: 0 });
+    const a = await c.call<Record<string, unknown>>("a2h.approve", { grant: "once", to: w.ownerId, title: "x", wait_s: 0 });
     expect(a.required_level).toBe("verified");
     w.admin.setAgentLevel("codex-mac", "im_account", w.code());
     w.next();
     expect(w.hub.gw.store.agentApprovalLevel(agentId)).toBe("im_account");
-    const b = await c.call<Record<string, unknown>>("a2h.approve", { to: w.ownerId, title: "y", wait_s: 0 });
+    const b = await c.call<Record<string, unknown>>("a2h.approve", { grant: "once", to: w.ownerId, title: "y", wait_s: 0 });
     expect(b.required_level).toBe("im_account");
     // risk high still forces TOTP
-    const h = await c.call<Record<string, unknown>>("a2h.approve", { to: w.ownerId, title: "z", risk: "high", wait_s: 0 });
+    const h = await c.call<Record<string, unknown>>("a2h.approve", { grant: "once", to: w.ownerId, title: "z", risk: "high", wait_s: 0 });
     expect(h.required_level).toBe("verified");
   });
 
@@ -197,8 +203,8 @@ describe("imwire hub: restart", () => {
     const w = await world();
     const { token } = addAgent(w);
     const c = await client(w, token);
-    const ap = await c.call<{ request_id: string }>("a2h.approve", { to: w.ownerId, title: "deploy", wait_s: 0 });
-    const ask = await c.call<{ request_id: string }>("a2h.ask", { to: w.ownerId, question: "which?", choices: ["a", "b"], wait_s: 0 });
+    const ap = await c.call<{ request_id: string }>("a2h.approve", { grant: "once", to: w.ownerId, title: "deploy", wait_s: 0 });
+    const ask = await c.call<{ request_id: string }>("a2h.ask", { grant: "once", to: w.ownerId, question: "which?", choices: ["a", "b"], wait_s: 0 });
     c.close();
     await w.hub.close();
     open.splice(open.indexOf(w.hub), 1);

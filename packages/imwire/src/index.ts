@@ -14,7 +14,7 @@ export { loadAdaptersFromEnv, parseAdapterList, ADAPTER_NAMES, type AdapterName 
 export { stderrLogger, sdkStderrLogger } from "./logger.js";
 export { RpcFail } from "./rpc.js";
 export { startHub, NoChatDriver, defaultHubDir, defaultSocketPath, type Hub, type HubOptions } from "./hub/hub.js";
-export { A2hRpc, wireView, wireEvent, RPC_UNAUTHORIZED } from "./hub/a2h-rpc.js";
+export { A2hRpc, wireView, parseGrant, RPC_UNAUTHORIZED } from "./hub/a2h-rpc.js";
 export { HubAdmin } from "./hub/admin.js";
 export { runHubCli, type CliIo } from "./hub/commands.js";
 export { assistantPreset, parseAllowlist } from "./hub/preset.js";
