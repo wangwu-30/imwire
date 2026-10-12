@@ -78,6 +78,9 @@ export interface IdentityRecord {
   accountId: string;
   userId: string;
   personId: string;
+  linkedAt?: number;
+  /** 'legacy' (pre-TOTP rows / allowlist bootstrap), 'pair', 'pair+totp', 'claim', 'cli'. */
+  linkedVia?: string;
 }
 
 export interface PendingApproval {
@@ -98,6 +101,10 @@ export interface PendingApproval {
   /** Persisted TTL (epoch ms). The sweeper denies the approval once it passes. */
   expiresAt?: number;
   source?: "pi" | "agent";
+  /** Level pinned when the approval was created ('im_account' | 'verified'). */
+  requiredLevel?: string;
+  /** Level actually proven by the deciding click. */
+  decidedLevel?: string;
   cards: Array<{ chat: ChatRef; messageId: string }>;
 }
 
@@ -161,4 +168,9 @@ export interface A2hView {
   answer: { choice: string | null; text: string; via: string; at: string; untrusted: true } | null;
   /** Created during quiet hours (Q5): delivered, but never nudged. */
   quiet: boolean;
+  /** Approvals: level pinned at creation and level proven by the decision. */
+  requiredLevel: string | null;
+  decidedLevel: string | null;
+  /** Approvals: the target clicked Approve and a second factor is awaited. */
+  stepUpRequired: boolean;
 }

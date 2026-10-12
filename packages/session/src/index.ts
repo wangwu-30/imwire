@@ -1,4 +1,17 @@
-export { SessionGateway, type SessionGatewayOptions, type A2hRoute } from "./gateway.js";
+export { SessionGateway, redactCodes, type SessionGatewayOptions, type A2hRoute } from "./gateway.js";
+export {
+  TotpVerifier,
+  isTotpVerifier,
+  hotp,
+  totp,
+  base32Encode,
+  base32Decode,
+  otpauthUrl,
+  LINK_COOLDOWN_MS,
+  type CodeCheck,
+  type TotpEnrollment,
+  type TotpVerifierOptions,
+} from "./totp.js";
 export {
   A2hError,
   DEFAULT_QUIET_HOURS,

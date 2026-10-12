@@ -31,10 +31,13 @@ import {
   shortCode,
   imAccountVerifier,
   meetsLevel,
+  type ApproverVerdict,
   type ApproverVerifier,
+  type AssuranceLevel,
   type QuietHours,
 } from "./a2h.js";
-import { groupKey, identityKey, PAIR_CODE_RE } from "./ids.js";
+import { groupKey, identityKey, pairCode, PAIR_CODE_RE } from "./ids.js";
+import { isTotpVerifier, TOTP_CODE_RE, type TotpEnrollment, type TotpVerifier } from "./totp.js";
 import { DEFAULT_LOG_WINDOW, SessionStore } from "./store.js";
 import {
   isDenyOption,
@@ -81,7 +84,17 @@ export interface SessionGatewayOptions {
    * valid decision. Default keeps v1 behaviour (allowlisted owner, linked IM
    * account). Fail-closed: a throwing verifier denies the click.
    */
-  approverVerifier?: ApproverVerifier;
+  approverVerifier?: ApproverVerifier | ((store: SessionStore) => ApproverVerifier);
+  /**
+   * Identity bootstrap/binding policy (compat switch, a2h-identity §3).
+   * - "legacy" (default): unchanged behaviour — an allowlisted ID's first DM
+   *   becomes the owner; `/pair` needs only the 8-digit code.
+   * - "totp": owners are created by `initOwner()` (CLI) and claimed with
+   *   `/claim <code> <totp>`; `/pair` needs `<code> <totp>`, only allowlisted
+   *   IDs may claim or pair, every bound surface is notified, and new
+   *   surfaces get a cooling-off period. Requires a TotpVerifier.
+   */
+  identityMode?: "legacy" | "totp";
   logWindow?: number;
 }
 
@@ -126,6 +139,7 @@ export class SessionGateway {
   private readonly expiredOnBoot: PendingApproval[] = [];
   private readonly quietHours: QuietHours | null;
   private readonly verifier: ApproverVerifier;
+  private readonly identityMode: "legacy" | "totp";
   private readonly a2hListeners = new Map<string, Set<() => void>>();
   private readonly sweepTimer?: ReturnType<typeof setInterval>;
   private closed = false;
@@ -140,7 +154,12 @@ export class SessionGateway {
     this.unpairedText = opts.unpairedText ?? UNPAIRED;
     this.approvalTimeoutMs = opts.approvalTimeoutMs ?? DEFAULT_APPROVAL_TTL_MS;
     this.logWindow = opts.logWindow ?? DEFAULT_LOG_WINDOW;
-    this.verifier = opts.approverVerifier ?? imAccountVerifier;
+    const v = opts.approverVerifier;
+    this.verifier = typeof v === "function" ? v(this.store) : (v ?? imAccountVerifier);
+    this.identityMode = opts.identityMode ?? "legacy";
+    if (this.identityMode === "totp" && !isTotpVerifier(this.verifier)) {
+      throw new Error('identityMode "totp" requires a TotpVerifier');
+    }
     this.quietHours = opts.quietHours === undefined ? DEFAULT_QUIET_HOURS : opts.quietHours;
     // Q4: a hub restart fails every open agent request closed.
     for (const req of this.store.expirePendingA2hRequests(this.clock.now(), "restart")) {
@@ -242,12 +261,17 @@ export class SessionGateway {
   }
 
   /** Pluggable approver check for targeted (a2h) approvals. Fail-closed. */
-  private async verifyApproverClick(approval: PendingApproval, from: UserRef): Promise<boolean> {
+  private async verifyApproverClick(
+    approval: PendingApproval,
+    from: UserRef,
+    surface: ChatRef | undefined,
+  ): Promise<ApproverVerdict> {
     const ident = this.store.findIdentity(from.platform, from.accountId, from.userId);
     const request = this.store.a2hRequestByApproval(approval.id);
     let ok = false;
-    let level = "none";
+    let level: AssuranceLevel = "none";
     let reason: string | undefined;
+    const need = maxLevel(this.verifier.requiredLevel ?? "im_account", (approval.requiredLevel as AssuranceLevel) ?? "im_account");
     try {
       const verdict = await this.verifier.verifyApprover({
         personId: approval.targetPersonId!,
@@ -255,15 +279,32 @@ export class SessionGateway {
         from: { platform: from.platform, accountId: from.accountId, userId: from.userId },
         approvalId: approval.id,
         requestId: request?.id,
+        agentId: request?.agentId,
+        surface: surface ? { ...surface } : undefined,
+        requiredLevel: need,
+        risk: request ? (this.store.db.prepare<{ risk: string | null }>("SELECT risk FROM a2h_request WHERE id = ?").get(request.id)?.risk ?? undefined) : undefined,
         now: this.clock.now(),
       });
       level = verdict.level;
       reason = verdict.reason;
-      ok = verdict.ok && meetsLevel(verdict.level, this.verifier.requiredLevel ?? "im_account");
-    } catch (err) {
-      reason = `verifier_error: ${String(err)}`;
+      ok = verdict.ok && meetsLevel(verdict.level, need);
+      if (verdict.ok && !ok) reason = "insufficient_level";
+    } catch {
+      reason = "verifier_error"; // never echo verifier internals into the audit trail
     }
-    if (!ok) {
+    if (ok) return { ok: true, level };
+    if (reason === "step_up_required") {
+      this.store.audit({
+        at: this.clock.now(),
+        action: "click",
+        result: "step_up_required",
+        agentId: request?.agentId,
+        personId: ident?.personId,
+        requestId: request?.id,
+      });
+      return { ok: false, level, reason };
+    }
+    {
       this.store.audit({
         at: this.clock.now(),
         action: "click",
@@ -274,7 +315,7 @@ export class SessionGateway {
         detail: { approvalId: approval.id, level, reason },
       });
     }
-    return ok;
+    return { ok: false, level, reason };
   }
 
   /** Mirror a decided approval onto its a2h request (if any). */
@@ -291,6 +332,8 @@ export class SessionGateway {
             ? "cancelled"
             : by === "failed"
               ? "failed"
+              : by === "locked"
+                ? "denied"
               : "denied";
     this.store.decideA2hRequest(req.id, state, by, this.clock.now(), { choice: decided.chosen ?? null });
     this.notifyA2h(req.id);
@@ -346,6 +389,11 @@ export class SessionGateway {
         }
         return;
       }
+      if (event.type === "command" && event.name === "approve") {
+        // Codes must never land in a group log, and group approval never counts.
+        await adapter.send(chat, { blocks: [{ kind: "markdown", text: "审批只能在私聊里完成。" }] });
+        return;
+      }
       const conv = this.store.groupConversation(chat, this.clock.now());
       if (event.type === "command" && (event.name === "stop" || event.name === "cancel")) {
         await this.handleStop(adapter, chat, conv.id);
@@ -375,6 +423,20 @@ export class SessionGateway {
       return;
     }
 
+    if (event.type === "command" && event.name === "approve") {
+      this.store.touchPresence(identity.personId, chat, this.clock.now());
+      await this.handleApproveCommand(adapter, chat, from, identity.personId, event.args);
+      return;
+    }
+    if (event.type === "message" && TOTP_CODE_RE.test(event.text.trim()) && !event.replyTo) {
+      const awaiting = this.awaitingStepUp(identity.personId);
+      if (awaiting.length > 0) {
+        // Never let a bare TOTP reach pi or the message log.
+        if (awaiting.length === 1) await this.submitStepUp(adapter, chat, from, identity.personId, awaiting[0]!, event.text.trim());
+        else await this.a2hReply(adapter, chat, "有多个审批在等验证码，请用 /approve <编号> <6位验证码>。");
+        return;
+      }
+    }
     if (event.type === "command" && event.name === "answer") {
       this.store.touchPresence(identity.personId, chat, this.clock.now());
       await this.handleAnswerCommand(adapter, chat, from, identity.personId, event.args);
@@ -470,6 +532,10 @@ export class SessionGateway {
   }
 
   private async handleUnpaired(adapter: Adapter, chat: ChatRef, from: UserRef, text: string): Promise<void> {
+    if (this.identityMode === "totp") {
+      await this.handleUnpairedTotp(adapter, chat, from, text);
+      return;
+    }
     const sender = identityKey(from.platform, from.accountId, from.userId);
     const now = this.clock.now();
     const code = text.trim();
@@ -1003,13 +1069,38 @@ export class SessionGateway {
       }
       return;
     }
-    if (approval.targetPersonId && !(await this.verifyApproverClick(approval, from))) return;
     if (approval.expiresAt !== undefined && approval.expiresAt <= this.clock.now()) {
       // Past TTL but not yet swept: fail closed, never honour a late click.
       this.sweepExpired();
       return;
     }
     const { option, approved } = this.interpretAction(approval, actionId);
+    let decidedLevel: string | undefined;
+    if (approval.targetPersonId) {
+      if (target && target.chat.kind !== "dm") {
+        // a2h cards are DM-only; a click in a group never decides (deny included).
+        this.store.audit({
+          at: this.clock.now(),
+          action: "click",
+          result: "group_click",
+          personId: this.store.findIdentity(from.platform, from.accountId, from.userId)?.personId,
+          requestId: this.store.a2hRequestByApproval(approval.id)?.id,
+        });
+        return;
+      }
+      if (approved) {
+        // Denying never needs a second factor: it can only make the outcome safer.
+        const verdict = await this.verifyApproverClick(approval, from, target?.chat);
+        if (!verdict.ok) {
+          if (verdict.reason === "step_up_required") await this.promptStepUp(approval, target?.chat);
+          else if (target) await this.explainRefusal(target.chat, verdict.reason);
+          return;
+        }
+        decidedLevel = verdict.level;
+      } else {
+        decidedLevel = "im_account";
+      }
+    }
     const state = approved ? "approved" : "denied";
     const decided = this.store.decideApproval(
       approval.id,
@@ -1017,8 +1108,13 @@ export class SessionGateway {
       identityKey(from.platform, from.accountId, from.userId),
       this.clock.now(),
       option,
+      decidedLevel,
     );
     if (!decided) return;
+    if (approval.targetPersonId) {
+      const req = this.store.a2hRequestByApproval(approval.id);
+      if (req) this.store.consumeStepUp(req.id, this.clock.now());
+    }
     this.syncA2hFromApproval(decided);
     this.approvalWaiters.get(approval.id)?.resolve(option);
     this.approvalWaiters.delete(approval.id);
@@ -1036,6 +1132,261 @@ export class SessionGateway {
         await dest.send(card.chat, { blocks: [{ kind: "markdown", text: handled }] }).catch(() => undefined);
       }
     }
+  }
+
+  // ---- a2h identity: TOTP step-up, /claim, /pair+TOTP (PR 2.5) -------------
+
+  /**
+   * Session-layer half of `imwire owner init` (CLI lands in PR 3): create the
+   * owner person, enrol TOTP + recovery codes and mint a one-time claim code
+   * (10 min). Returns the only clear copies; nothing secret is logged.
+   */
+  initOwner(opts: { name: string; account?: string; claimTtlMs?: number }): TotpEnrollment & {
+    personId: string;
+    claimCode: string;
+  } {
+    const v = this.totpVerifier();
+    const now = this.clock.now();
+    const person = this.store.createPerson(opts.name, now);
+    this.store.defaultConversation(person.id, now);
+    const enrollment = v.enroll(person.id, opts.account ?? opts.name, now);
+    const claimCode = pairCode();
+    this.store.createOwnerClaim(person.id, claimCode, now, opts.claimTtlMs ?? 10 * 60 * 1000);
+    this.store.audit({ at: now, action: "owner_init", result: "ok", personId: person.id });
+    return { ...enrollment, personId: person.id, claimCode };
+  }
+
+  /** `imwire owner enroll-totp` for an existing (legacy) owner. */
+  enrollTotp(personId: string, account?: string): TotpEnrollment {
+    const v = this.totpVerifier();
+    if (!this.store.getPerson(personId)) throw new A2hError("unknown_person", "no such person");
+    const out = v.enroll(personId, account ?? this.store.getPerson(personId)?.name ?? personId, this.clock.now());
+    this.store.audit({ at: this.clock.now(), action: "enroll_totp", result: "ok", personId });
+    return out;
+  }
+
+  private totpVerifier(): TotpVerifier {
+    if (!isTotpVerifier(this.verifier)) throw new A2hError("invalid", "TOTP is not configured on this hub");
+    return this.verifier;
+  }
+
+  private isAllowlistedSender(from: UserRef): boolean {
+    return this.allowlist.some(
+      (e) => e.platform === from.platform && e.accountId === from.accountId && e.userId === from.userId,
+    );
+  }
+
+  private async handleUnpairedTotp(adapter: Adapter, chat: ChatRef, from: UserRef, text: string): Promise<void> {
+    const say = (t: string) => adapter.send(chat, { blocks: [{ kind: "markdown", text: t }] });
+    const now = this.clock.now();
+    const sender = identityKey(from.platform, from.accountId, from.userId);
+    // Allowlist is the gate: unknown IDs cannot even attempt /claim or /pair.
+    if (!this.isAllowlistedSender(from) || chat.kind !== "dm") {
+      await say(this.unpairedText);
+      return;
+    }
+    const v = this.totpVerifier();
+    const claim = /^\/claim\s+(\d{8})\s+(\d{6})\s*$/.exec(text.trim());
+    const pair = /^(\d{8})(?:\s+(\d{6}))?\s*$/.exec(text.trim());
+    if (claim) {
+      const personId = this.store.liveOwnerClaim(claim[1]!, now);
+      if (!personId || this.store.pairLocked(sender, now)) {
+        this.store.recordPairAttempt(sender, now, false);
+        await say("首绑码无效或已过期。请在 Mac mini 上重新运行 imwire owner init。");
+        return;
+      }
+      const check = v.checkCode(personId, claim[2]!, now);
+      if (!check.ok) {
+        this.store.audit({ at: now, action: "claim", result: `totp_${check.reason}`, personId });
+        await say(totpFailureText(check.reason));
+        return;
+      }
+      if (!this.store.consumeOwnerClaim(claim[1]!, now)) {
+        await say("首绑码已经用过。");
+        return;
+      }
+      this.store.linkIdentity(personId, from.platform, from.accountId, from.userId, now, "claim");
+      this.store.touchPresence(personId, chat, now);
+      this.store.audit({ at: now, action: "claim", result: "linked", personId, detail: { surface: from.platform } });
+      await say("已认领。你是主人。要绑定其他 IM，在这里发 /pair，再到新 IM 上发「配对码 验证码」。");
+      return;
+    }
+    if (pair) {
+      const personId = this.store.livePairPerson(pair[1]!, now);
+      if (!personId || this.store.pairLocked(sender, now)) {
+        this.store.recordPairAttempt(sender, now, false);
+        await say(this.unpairedText);
+        return;
+      }
+      if (!pair[2]) {
+        await say("还需要验证码：请发送「配对码 6位验证码」，例如 12345678 123456。");
+        return;
+      }
+      const check = v.checkCode(personId, pair[2], now);
+      if (!check.ok) {
+        this.store.recordPairAttempt(sender, now, false);
+        this.store.audit({ at: now, action: "pair", result: `totp_${check.reason}`, personId });
+        if (check.nowLocked) await this.lockoutPerson(personId);
+        await say(totpFailureText(check.reason));
+        return;
+      }
+      const consumed = this.store.consumePairCode(pair[1]!, now);
+      if (consumed !== personId || !this.store.linkIdentity(personId, from.platform, from.accountId, from.userId, now, "pair+totp")) {
+        await say(this.unpairedText);
+        return;
+      }
+      this.store.recordPairAttempt(sender, now, true);
+      this.store.touchPresence(personId, chat, now);
+      this.store.audit({ at: now, action: "pair", result: "linked", personId, detail: { surface: from.platform } });
+      await say("已绑定。这个 IM 有 24 小时冷静期，期间不能用来批准需要验证码的审批。");
+      await this.notifyAllSurfaces(
+        personId,
+        `新增绑定：${from.platform} ${from.userId}，时间 ${formatLocal(now)}。不是你操作的话，请在 Mac mini 上执行 imwire owner reset。`,
+        chat,
+      );
+      return;
+    }
+    await say("请先在 Mac mini 上运行 imwire owner init，然后在这里发送 /claim <首绑码> <6位验证码>。");
+  }
+
+  private async notifyAllSurfaces(personId: string, text: string, except?: ChatRef): Promise<void> {
+    const seen = new Set<string>();
+    const targets: ChatRef[] = [];
+    const add = (c?: ChatRef) => {
+      if (!c || c.kind !== "dm") return;
+      const k = `${c.platform}:${c.accountId}:${c.chatId}`;
+      if (seen.has(k) || (except && sameSurface(c, except))) return;
+      seen.add(k);
+      targets.push(c);
+    };
+    add(this.store.lastSurface(personId));
+    for (const i of this.store.listIdentities(personId)) {
+      if (except && i.platform === except.platform && i.accountId === except.accountId && i.userId === except.chatId) continue;
+      add({ platform: i.platform, accountId: i.accountId, chatId: i.userId, kind: "dm" });
+    }
+    for (const c of targets) {
+      await this.adapterFor(c)?.send(c, { blocks: [{ kind: "markdown", text }] }).catch(() => undefined);
+    }
+  }
+
+  private awaitingStepUp(personId: string): A2hRequest[] {
+    return this.store
+      .openA2hRequests(personId, "approval")
+      .filter((r) => this.store.stepUpRequested(r.id));
+  }
+
+  private async promptStepUp(approval: PendingApproval, chat: ChatRef | undefined): Promise<void> {
+    const req = this.store.a2hRequestByApproval(approval.id);
+    if (!req) return;
+    this.store.markStepUpRequested(req.id, this.clock.now());
+    const surface = chat ?? this.store.lastSurface(req.personId);
+    const adapter = surface ? this.adapterFor(surface) : undefined;
+    if (!adapter || !surface) return;
+    const code = shortCode(req.id);
+    const refs = await adapter
+      .send(surface, {
+        blocks: [
+          {
+            kind: "markdown",
+            text: `需要验证码才能批准（编号 ${code}）。请回复 /approve ${code} <6位验证码>，或直接引用这条消息回复 6 位数字。验证码只在本机校验，不会转给 agent。`,
+          },
+        ],
+      })
+      .catch(() => []);
+    // Quote-replies to the prompt route like quote-replies to the card.
+    const promptMsg = this.store.a2hPromptMessageId(req.id);
+    if (promptMsg) for (const ref of refs) this.store.addDelivery(promptMsg, ref.chat, ref.messageId);
+  }
+
+  private async explainRefusal(chat: ChatRef, reason: string | undefined): Promise<void> {
+    const text =
+      reason === "cooling_off"
+        ? "这个 IM 刚绑定，还在 24 小时冷静期内，不能批准这类审批。请在已绑定更久的 IM 上操作。"
+        : reason === "locked"
+          ? "验证码错误次数过多，已锁定 15 分钟。"
+          : undefined;
+    if (!text) return;
+    await this.adapterFor(chat)?.send(chat, { blocks: [{ kind: "markdown", text }] }).catch(() => undefined);
+  }
+
+  private async handleApproveCommand(
+    adapter: Adapter,
+    chat: ChatRef,
+    from: UserRef,
+    personId: string,
+    args: string,
+  ): Promise<void> {
+    const m = /^\s*(\S+)\s+(\d{6})\s*$/.exec(args ?? "");
+    if (!m) {
+      await this.a2hReply(adapter, chat, "用法：/approve <编号> <6位验证码>");
+      return;
+    }
+    const code = m[1]!.toLowerCase();
+    const matches = this.store.openA2hRequests(personId, "approval").filter((r) => shortCode(r.id) === code);
+    if (matches.length !== 1) {
+      await this.a2hReply(adapter, chat, `没有找到编号为 ${code} 的待审批请求。`);
+      return;
+    }
+    await this.submitStepUp(adapter, chat, from, personId, matches[0]!, m[2]!);
+  }
+
+  /**
+   * Second factor for one approval. Order: DM only → TOTP configured →
+   * surface not cooling off → code (lockout, replay) → bind the step-up to
+   * this request → run the normal click path, which re-verifies.
+   */
+  private async submitStepUp(
+    adapter: Adapter,
+    chat: ChatRef,
+    from: UserRef,
+    personId: string,
+    req: A2hRequest,
+    code: string,
+  ): Promise<void> {
+    const now = this.clock.now();
+    const audit = (result: string) =>
+      this.store.audit({ at: now, action: "step_up", result, agentId: req.agentId, personId, requestId: req.id });
+    if (chat.kind !== "dm") return;
+    if (!isTotpVerifier(this.verifier)) {
+      audit("not_configured");
+      await this.a2hReply(adapter, chat, "这个 hub 没有启用验证码。");
+      return;
+    }
+    if (req.kind !== "approval" || req.state !== "pending" || req.personId !== personId || !req.approvalId) {
+      await this.a2hReply(adapter, chat, `编号 ${shortCode(req.id)} 的审批已经结束。`);
+      return;
+    }
+    const ident = this.store.findIdentity(from.platform, from.accountId, from.userId);
+    if (!ident || ident.personId !== personId) return;
+    if (this.verifier.inCooldown(ident, now)) {
+      audit("cooling_off");
+      await this.explainRefusal(chat, "cooling_off");
+      return;
+    }
+    const check = this.verifier.checkCode(personId, code, now);
+    if (!check.ok) {
+      audit(`totp_${check.reason}`);
+      if (check.nowLocked || check.reason === "locked") await this.lockoutPerson(personId);
+      else await this.a2hReply(adapter, chat, totpFailureText(check.reason));
+      return;
+    }
+    this.store.recordStepUp(req.id, personId, "totp", chat, now);
+    audit("ok");
+    await this.handleAction(from, "approve", req.approvalId, { chat, messageId: "" });
+  }
+
+  /** 5 failures / 15 min: deny every pending targeted approval and tell every surface. */
+  private async lockoutPerson(personId: string): Promise<void> {
+    const now = this.clock.now();
+    for (const a of this.store.pendingApprovals()) {
+      if (a.targetPersonId !== personId) continue;
+      const decided = this.store.decideApproval(a.id, "denied", "locked", now, "deny", "none");
+      if (!decided) continue;
+      this.syncA2hFromApproval(decided);
+      await this.updateApprovalCards(decided, "denied");
+    }
+    this.store.audit({ at: now, action: "lockout", result: "locked", personId });
+    await this.notifyAllSurfaces(personId, "验证码连续错误，已锁定 15 分钟，所有待审批已拒绝。不是你操作的话，请在 Mac mini 上执行 imwire owner reset。");
   }
 
   // ---- a2h: agent-facing API (PR 2) ---------------------------------------
@@ -1125,6 +1476,9 @@ export class SessionGateway {
     });
     if (replayed) return this.a2hView(request);
     const code = shortCode(request.id);
+    // Pinned now: later policy changes never affect cards already sent.
+    const requiredLevel: AssuranceLevel =
+      this.verifier.requiredLevelFor?.({ agentId: agent.id, risk }) ?? this.verifier.requiredLevel ?? "im_account";
     const riskLabel = risk ? { low: "低风险", medium: "中风险", high: "⚠️ 高风险" }[risk] : undefined;
     const card = [
       frameHeader(agent.name),
@@ -1135,11 +1489,13 @@ export class SessionGateway {
       `— 编号 ${code}${riskLabel ? ` · ${riskLabel}` : ""} · 有效至 ${formatLocal(expiresAt)}`,
       "— 只有点按钮才算数；文字回复不算批准。超时视为拒绝。",
     ].join("\n");
-    const approval = this.store.createApproval(conv.id, request.id, card, ["approve", "deny"], undefined, now, {
+    const approval = this.store.createApproval(conv.id, request.id, card + stepUpFooter(requiredLevel, code), ["approve", "deny"], undefined, now, {
       targetPersonId: personId,
       expiresAt,
       source: "agent",
+      requiredLevel,
     });
+    this.store.setA2hRisk(request.id, risk);
     this.store.setA2hApprovalId(request.id, approval.id);
     const msg = this.store.appendMessage({
       conversationId: conv.id,
@@ -1346,11 +1702,15 @@ export class SessionGateway {
           await this.a2hReply(adapter, chat, `编号 ${shortCode(req.id)} 的请求已经结束（${req.state}），这条回复没有转给 agent。`);
           return true;
         }
+        if (req.kind === "approval" && TOTP_CODE_RE.test(text.trim())) {
+          await this.submitStepUp(adapter, chat, from, personId, req, text.trim());
+          return true;
+        }
         if (req.kind === "approval") {
           this.store.appendMessage({
             conversationId: req.conversationId,
             role: "user",
-            text,
+            text: redactCodes(text),
             surface: chat,
             now: this.clock.now(),
             requestId: req.id,
@@ -1589,6 +1949,7 @@ export class SessionGateway {
   private a2hView(req: A2hRequest): A2hView {
     const by = req.decidedBy && req.decidedBy.split(":").length === 3 ? req.decidedBy : undefined;
     const answer = req.kind === "ask" && req.state === "answered" ? (req.answer as A2hView["answer"]) : null;
+    const approval = req.approvalId ? this.store.getApproval(req.approvalId) : undefined;
     return {
       requestId: req.id,
       code: req.kind === "message" ? "" : shortCode(req.id),
@@ -1601,6 +1962,9 @@ export class SessionGateway {
       decidedBy: by ? { personId: req.personId, via: by.split(":")[0]! } : null,
       answer: answer ?? null,
       quiet: Boolean((req.payload as { quiet?: boolean } | null)?.quiet),
+      requiredLevel: approval?.requiredLevel ?? null,
+      decidedLevel: approval?.decidedLevel ?? null,
+      stepUpRequired: req.kind === "approval" && req.state === "pending" && this.store.stepUpRequested(req.id),
     };
   }
 
@@ -1614,6 +1978,34 @@ export class SessionGateway {
       }),
     );
     return next;
+  }
+}
+
+function maxLevel(a: AssuranceLevel, b: AssuranceLevel): AssuranceLevel {
+  return meetsLevel(a, b) ? a : b;
+}
+
+function stepUpFooter(level: AssuranceLevel, code: string): string {
+  return level === "verified" ? `\n— 批准需要补交验证码：点「批准」后回复 /approve ${code} <6位验证码>。` : "";
+}
+
+/** Mask anything that looks like a one-time code before it is persisted. */
+export function redactCodes(text: string): string {
+  return text.replace(/\b\d{6}\b/g, "******");
+}
+
+function totpFailureText(reason: string): string {
+  switch (reason) {
+    case "replay":
+      return "这个验证码已经用过，请等下一个。";
+    case "locked":
+      return "验证码错误次数过多，已锁定 15 分钟。";
+    case "not_enrolled":
+      return "还没有配置验证码，请先在 Mac mini 上运行 imwire owner enroll-totp。";
+    case "error":
+      return "验证失败，请稍后再试。";
+    default:
+      return "验证码不对。";
   }
 }
 
