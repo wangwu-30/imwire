@@ -173,4 +173,8 @@ export interface A2hView {
   decidedLevel: string | null;
   /** Approvals: the target clicked Approve and a second factor is awaited. */
   stepUpRequired: boolean;
+  /** Approvals: risk as created ("critical" binds an action object). */
+  risk: string | null;
+  /** critical: hash of the bound action object. */
+  bindingHash: string | null;
 }

@@ -14,6 +14,8 @@ export {
 } from "./totp.js";
 export {
   A2hError,
+  actionBindingHash,
+  canonicalJson,
   DEFAULT_QUIET_HOURS,
   frameHeader,
   isQuietTime,

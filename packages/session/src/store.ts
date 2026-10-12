@@ -204,6 +204,13 @@ CREATE TABLE IF NOT EXISTS audit_log (
   result TEXT NOT NULL,
   detail TEXT
 );
+CREATE TABLE IF NOT EXISTS agent_tool_policy (
+  agent_id TEXT NOT NULL REFERENCES agent(id),
+  tool TEXT NOT NULL,
+  class TEXT NOT NULL,
+  created_at INTEGER NOT NULL,
+  PRIMARY KEY (agent_id, tool)
+);
 CREATE TABLE IF NOT EXISTS person_credential (
   id TEXT PRIMARY KEY,
   person_id TEXT NOT NULL REFERENCES person(id),
@@ -292,6 +299,8 @@ export class SessionStore {
       "ALTER TABLE audit_log ADD COLUMN v INTEGER NOT NULL DEFAULT 1",
       "ALTER TABLE audit_log ADD COLUMN object TEXT",
       "ALTER TABLE audit_log ADD COLUMN binding_hash TEXT",
+      // critical actions + tool policy (PR 3b), additive only.
+      "ALTER TABLE a2h_request ADD COLUMN action_consumed_at INTEGER",
     ];
     for (const sql of alters) {
       try {
@@ -1533,6 +1542,55 @@ CREATE INDEX IF NOT EXISTS approval_pending_expiry
         .prepare<{ t: number | null }>("SELECT stepup_requested_at AS t FROM a2h_request WHERE id = ?")
         .get(requestId)?.t,
     );
+  }
+
+  setA2hActionHash(requestId: string, hash: string): void {
+    this.db.prepare("UPDATE a2h_request SET action_hash = ? WHERE id = ?").run(hash, requestId);
+  }
+
+  a2hActionState(requestId: string): { risk?: string; actionHash?: string; consumedAt?: number } | undefined {
+    const r = this.db
+      .prepare<{ risk: string | null; action_hash: string | null; action_consumed_at: number | null }>(
+        "SELECT risk, action_hash, action_consumed_at FROM a2h_request WHERE id = ?",
+      )
+      .get(requestId);
+    return r ? { risk: r.risk ?? undefined, actionHash: r.action_hash ?? undefined, consumedAt: r.action_consumed_at ?? undefined } : undefined;
+  }
+
+  /** Single use: true only for the first caller. */
+  consumeA2hAction(requestId: string, now: number): boolean {
+    return (
+      this.db
+        .prepare("UPDATE a2h_request SET action_consumed_at = ? WHERE id = ? AND action_consumed_at IS NULL AND state = 'approved'")
+        .run(now, requestId).changes === 1
+    );
+  }
+
+  // ---- per-agent tool policy (owned by a2h; changed only via the CLI) -----
+
+  setToolPolicy(agentId: string, tool: string, cls: "read_only", now: number): void {
+    this.db
+      .prepare("INSERT OR REPLACE INTO agent_tool_policy(agent_id, tool, class, created_at) VALUES (?, ?, ?, ?)")
+      .run(agentId, tool, cls, now);
+  }
+
+  removeToolPolicy(agentId: string, tool: string): boolean {
+    return this.db.prepare("DELETE FROM agent_tool_policy WHERE agent_id = ? AND tool = ?").run(agentId, tool).changes > 0;
+  }
+
+  toolPolicy(agentId: string): Array<{ tool: string; class: string; createdAt: number }> {
+    return this.db
+      .prepare<{ tool: string; class: string; created_at: number }>(
+        "SELECT tool, class, created_at FROM agent_tool_policy WHERE agent_id = ? ORDER BY tool",
+      )
+      .all(agentId)
+      .map((r) => ({ tool: r.tool, class: r.class, createdAt: r.created_at }));
+  }
+
+  toolClass(agentId: string, tool: string): string | undefined {
+    return this.db
+      .prepare<{ class: string }>("SELECT class FROM agent_tool_policy WHERE agent_id = ? AND tool = ?")
+      .get(agentId, tool)?.class;
   }
 
   setA2hRisk(requestId: string, risk: string | undefined): void {

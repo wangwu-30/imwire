@@ -1,3 +1,4 @@
+import { timingSafeEqual } from "node:crypto";
 import {
   noopLogger,
   systemClock,
@@ -18,7 +19,9 @@ import {
   A2H_CHOICES_MAX,
   A2H_FALLBACK_WINDOW_MS,
   A2hError,
+  actionBindingHash,
   agentTopicTitle,
+  canonicalJson,
   clampTtlS,
   DEFAULT_QUIET_HOURS,
   formatLocal,
@@ -280,7 +283,12 @@ export class SessionGateway {
     let ok = false;
     let level: AssuranceLevel = "none";
     let reason: string | undefined;
-    const need = maxLevel(this.verifier.requiredLevel ?? "im_account", (approval.requiredLevel as AssuranceLevel) ?? "im_account");
+    const reqRisk = request ? this.store.a2hActionState(request.id)?.risk : undefined;
+    // critical: TOTP always, whatever the verifier or a per-agent downgrade says.
+    const need =
+      reqRisk === "critical"
+        ? "verified"
+        : maxLevel(this.verifier.requiredLevel ?? "im_account", (approval.requiredLevel as AssuranceLevel) ?? "im_account");
     try {
       const verdict = await this.verifier.verifyApprover({
         personId: approval.targetPersonId!,
@@ -291,12 +299,17 @@ export class SessionGateway {
         agentId: request?.agentId,
         surface: surface ? { ...surface } : undefined,
         requiredLevel: need,
-        risk: request ? (this.store.db.prepare<{ risk: string | null }>("SELECT risk FROM a2h_request WHERE id = ?").get(request.id)?.risk ?? undefined) : undefined,
+        risk: reqRisk,
         now: this.clock.now(),
       });
       level = verdict.level;
       reason = verdict.reason;
       ok = verdict.ok && meetsLevel(verdict.level, need);
+      // critical additionally needs a live TOTP step-up for this exact request.
+      if (ok && reqRisk === "critical" && !(request && this.store.liveStepUp(request.id, approval.targetPersonId!))) {
+        ok = false;
+        reason = "step_up_required";
+      }
       if (verdict.ok && !ok) reason = "insufficient_level";
     } catch {
       reason = "verifier_error"; // never echo verifier internals into the audit trail
@@ -1526,7 +1539,11 @@ export class SessionGateway {
     to: string;
     title: string;
     details?: string;
-    risk?: "low" | "medium" | "high";
+    risk?: "low" | "medium" | "high" | "critical";
+    /** critical only: the exact object being approved (plain JSON) … */
+    action?: unknown;
+    /** … or a digest of it (git SHA, file sha256). Exactly one is required for critical. */
+    actionDigest?: string;
     expiresInS?: number;
     route?: A2hRoute;
     idempotencyKey?: string;
@@ -1535,7 +1552,15 @@ export class SessionGateway {
     const title = sanitizeAgentLine(opts.title);
     if (!title) throw new A2hError("invalid", "title is required");
     const details = opts.details ? sanitizeAgentText(opts.details) : "";
-    const risk = opts.risk && ["low", "medium", "high"].includes(opts.risk) ? opts.risk : undefined;
+    const risk = opts.risk && ["low", "medium", "high", "critical"].includes(opts.risk) ? opts.risk : undefined;
+    let bindingHash: string | undefined;
+    if (risk === "critical") {
+      if (!isTotpVerifier(this.verifier)) throw new A2hError("totp_required", "critical approvals need TOTP on this hub");
+      if (!this.store.totpCredential(personId)) throw new A2hError("totp_required", "target has no TOTP enrolled");
+      bindingHash = actionBindingHash({ action: opts.action, digest: opts.actionDigest });
+    } else if (opts.action !== undefined || opts.actionDigest !== undefined) {
+      throw new A2hError("invalid", "action binding is only for risk: critical");
+    }
     const ttlS = clampTtlS(opts.expiresInS, A2H_APPROVAL_DEFAULT_S);
     const now = this.clock.now();
     const expiresAt = now + ttlS * 1000;
@@ -1550,17 +1575,31 @@ export class SessionGateway {
       now,
       idempotencyKey: opts.idempotencyKey,
     });
-    if (replayed) return this.a2hView(request);
+    if (replayed) {
+      // Same idempotency key must not re-bind a different object.
+      const prior = this.store.a2hActionState(request.id);
+      if ((prior?.actionHash ?? undefined) !== bindingHash) {
+        throw new A2hError("conflict", "idempotency_key reused with a different action");
+      }
+      return this.a2hView(request);
+    }
     const code = shortCode(request.id);
-    // Pinned now: later policy changes never affect cards already sent.
+    // Pinned now: later policy changes never affect cards already sent. critical is never downgraded.
     const requiredLevel: AssuranceLevel =
-      this.verifier.requiredLevelFor?.({ agentId: agent.id, risk }) ?? this.verifier.requiredLevel ?? "im_account";
-    const riskLabel = risk ? { low: "低风险", medium: "中风险", high: "⚠️ 高风险" }[risk] : undefined;
+      risk === "critical"
+        ? "verified"
+        : (this.verifier.requiredLevelFor?.({ agentId: agent.id, risk }) ?? this.verifier.requiredLevel ?? "im_account");
+    const riskLabel = risk ? { low: "低风险", medium: "中风险", high: "⚠️ 高风险", critical: "⛔ 关键操作" }[risk] : undefined;
+    const preview =
+      risk === "critical" && opts.action !== undefined ? sanitizeAgentText(canonicalJson(opts.action), 600) : undefined;
     const card = [
       frameHeader(agent.name),
       "",
       `审批请求：${title}`,
       ...(details ? ["", details] : []),
+      ...(bindingHash
+        ? ["", `绑定对象：${preview ? `\n${preview}\n` : ""}${bindingHash.slice(0, 19)}…（执行前会核对，对象变了就作废）`]
+        : []),
       "",
       `— 编号 ${code}${riskLabel ? ` · ${riskLabel}` : ""} · 有效至 ${formatLocal(expiresAt)}`,
       "— 只有点按钮才算数；文字回复不算批准。超时视为拒绝。",
@@ -1572,6 +1611,7 @@ export class SessionGateway {
       requiredLevel,
     });
     this.store.setA2hRisk(request.id, risk);
+    if (bindingHash) this.store.setA2hActionHash(request.id, bindingHash);
     this.store.setA2hApprovalId(request.id, approval.id);
     const msg = this.store.appendMessage({
       conversationId: conv.id,
@@ -1605,8 +1645,90 @@ export class SessionGateway {
       agentId: agent.id,
       personId,
       requestId: request.id,
+      object: risk === "critical" ? "critical_action" : "approval",
+      bindingHash,
+      detail: risk ? { risk } : undefined,
     });
     return this.a2hView(this.store.getA2hRequest(request.id)!);
+  }
+
+  /**
+   * Pre-execution check for a critical approval. Passes only if the request
+   * is approved with TOTP (`verified`) and the object (or digest) hashes to
+   * the one bound on the card. Single use: a second call fails. Every call
+   * is audited with the bound and presented hashes (never the object).
+   */
+  verifyApprovedAction(opts: { agentId: string; requestId: string; action?: unknown; actionDigest?: string }): {
+    ok: boolean;
+    reason?: "not_found" | "not_critical" | "not_approved" | "not_verified" | "mismatch" | "already_used" | "invalid";
+    bindingHash?: string;
+  } {
+    const req = this.store.getA2hRequest(opts.requestId);
+    if (!req || req.agentId !== opts.agentId) return { ok: false, reason: "not_found" };
+    const st = this.store.a2hActionState(req.id)!;
+    const now = this.clock.now();
+    const fail = (reason: NonNullable<ReturnType<SessionGateway["verifyApprovedAction"]>["reason"]>, presented?: string) => {
+      this.store.audit({
+        at: now,
+        action: "action_verify",
+        result: `rejected:${reason}`,
+        agentId: req.agentId,
+        personId: req.personId,
+        requestId: req.id,
+        object: "critical_action",
+        bindingHash: st.actionHash,
+        detail: presented ? { presented_hash: presented } : undefined,
+      });
+      return { ok: false, reason, bindingHash: st.actionHash };
+    };
+    if (st.risk !== "critical" || !st.actionHash) return fail("not_critical");
+    let presented: string;
+    try {
+      presented = actionBindingHash({ action: opts.action, digest: opts.actionDigest });
+    } catch {
+      return fail("invalid");
+    }
+    if (req.state !== "approved") return fail("not_approved", presented);
+    const approval = req.approvalId ? this.store.getApproval(req.approvalId) : undefined;
+    if (approval?.decidedLevel !== "verified") return fail("not_verified", presented);
+    if (!timingSafeEqualStr(presented, st.actionHash)) return fail("mismatch", presented);
+    if (!this.store.consumeA2hAction(req.id, now)) return fail("already_used", presented);
+    this.store.audit({
+      at: now,
+      action: "action_verify",
+      result: "ok",
+      agentId: req.agentId,
+      personId: req.personId,
+      requestId: req.id,
+      object: "critical_action",
+      bindingHash: st.actionHash,
+    });
+    return { ok: true, bindingHash: st.actionHash };
+  }
+
+  /**
+   * Tool gate: "allow" only for exact tool names the owner marked read-only
+   * for this agent (via the CLI). Everything else goes to a human. Drivers
+   * and agents cannot change the policy.
+   */
+  checkTool(agentId: string, tool: string): { decision: "allow" | "ask_human"; reason: string } {
+    const agent = this.store.getAgent(agentId);
+    if (!agent || agent.revokedAt !== undefined) throw new A2hError("unknown_agent", "unknown agent");
+    const name = typeof tool === "string" ? tool.trim() : "";
+    const cls = name ? this.store.toolClass(agentId, name) : undefined;
+    const out =
+      cls === "read_only"
+        ? { decision: "allow" as const, reason: "read_only_allowlisted" }
+        : { decision: "ask_human" as const, reason: name ? "not_allowlisted" : "invalid_tool" };
+    this.store.audit({
+      at: this.clock.now(),
+      action: "tool_check",
+      result: out.decision,
+      agentId,
+      object: `tool:${sanitizeAgentLine(name, 80)}`,
+      detail: { reason: out.reason },
+    });
+    return out;
   }
 
   /** Ask a question. Replies are untrusted data and never count as approval (Q2). */
@@ -2041,6 +2163,8 @@ export class SessionGateway {
       requiredLevel: approval?.requiredLevel ?? null,
       decidedLevel: approval?.decidedLevel ?? null,
       stepUpRequired: req.kind === "approval" && req.state === "pending" && this.store.stepUpRequested(req.id),
+      risk: req.kind === "approval" ? (this.store.a2hActionState(req.id)?.risk ?? null) : null,
+      bindingHash: req.kind === "approval" ? (this.store.a2hActionState(req.id)?.actionHash ?? null) : null,
     };
   }
 
@@ -2055,6 +2179,12 @@ export class SessionGateway {
     );
     return next;
   }
+}
+
+function timingSafeEqualStr(a: string, b: string): boolean {
+  const x = Buffer.from(a);
+  const y = Buffer.from(b);
+  return x.length === y.length && timingSafeEqual(x, y);
 }
 
 function maxLevel(a: AssuranceLevel, b: AssuranceLevel): AssuranceLevel {

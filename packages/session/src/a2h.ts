@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 /**
  * a2h (agent → human) helpers: outbound sanitising, the hub-owned frame
  * around agent content, quiet hours and time formatting. Pure functions;
@@ -15,6 +16,45 @@ export const A2H_MAX_S = 24 * 60 * 60;
 /** A lone open ask may be answered by an unquoted reply only this soon after it was sent. */
 export const A2H_FALLBACK_WINDOW_MS = 30 * 60 * 1000;
 
+/** Deterministic JSON (sorted keys, no whitespace) for hashing action objects. */
+export function canonicalJson(v: unknown): string {
+  if (v === null || typeof v !== "object") {
+    if (typeof v === "number" && !Number.isFinite(v)) throw new A2hError("invalid", "action contains a non-finite number");
+    if (v === undefined || typeof v === "function" || typeof v === "symbol" || typeof v === "bigint") {
+      throw new A2hError("invalid", "action must be plain JSON");
+    }
+    return JSON.stringify(v);
+  }
+  if (Array.isArray(v)) return `[${v.map(canonicalJson).join(",")}]`;
+  const o = v as Record<string, unknown>;
+  return `{${Object.keys(o)
+    .filter((k) => o[k] !== undefined)
+    .sort()
+    .map((k) => `${JSON.stringify(k)}:${canonicalJson(o[k])}`)
+    .join(",")}}`;
+}
+
+export const ACTION_DIGEST_RE = /^(?:sha256:)?([0-9a-f]{40}|[0-9a-f]{64}|[0-9a-f]{128})$/;
+
+/**
+ * Binding hash for a critical action: `sha256:<hex>` of the canonical JSON
+ * object, or an agent-supplied digest (git SHA-1/SHA-256, file sha256/512),
+ * stored as `digest:<hex>`. Exactly one of the two must be given.
+ */
+export function actionBindingHash(input: { action?: unknown; digest?: string }): string {
+  const hasAction = input.action !== undefined && input.action !== null;
+  const hasDigest = typeof input.digest === "string" && input.digest.length > 0;
+  if (hasAction === hasDigest) throw new A2hError("invalid", "critical approvals need exactly one of action or action_digest");
+  if (hasDigest) {
+    const m = ACTION_DIGEST_RE.exec(input.digest!.trim().toLowerCase());
+    if (!m) throw new A2hError("invalid", "action_digest must be a hex SHA-1/SHA-256/SHA-512 digest");
+    return `digest:${m[1]}`;
+  }
+  const json = canonicalJson(input.action);
+  if (json.length > 64 * 1024) throw new A2hError("invalid", "action is too large (max 64 KiB)");
+  return `sha256:${createHash("sha256").update(json).digest("hex")}`;
+}
+
 export class A2hError extends Error {
   constructor(
     readonly code:
@@ -26,6 +66,8 @@ export class A2hError extends Error {
       | "no_surface"
       | "invalid"
       | "rejected_content"
+      | "totp_required"
+      | "conflict"
       | "not_found",
     message: string,
   ) {

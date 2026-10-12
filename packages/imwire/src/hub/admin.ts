@@ -197,6 +197,36 @@ export class HubAdmin {
     this.store.audit({ at: this.now(), action: "agent_level", result: level, agentId: agent.id, object: `agent:${agent.name}` });
   }
 
+  // ---- tool policy (3b) ---------------------------------------------------
+
+  /**
+   * Mark exact tool names as read-only for one agent (auto-allowed). No
+   * globs; names that look like writes are refused. Owner TOTP required.
+   */
+  allowReadOnlyTools(nameOrId: string, tools: string[], ownerProof: string | undefined): string[] {
+    const agent = this.resolveAgent(nameOrId);
+    for (const t of tools) checkReadOnlyName(t);
+    this.requireOwnerProof(this.ownerId(), ownerProof, "policy_allow");
+    const now = this.now();
+    for (const t of tools) {
+      this.store.setToolPolicy(agent.id, t, "read_only", now);
+      this.store.audit({ at: now, action: "policy_allow", result: "read_only", agentId: agent.id, object: `tool:${t}` });
+    }
+    return tools;
+  }
+
+  /** Removing an allowance only tightens policy, so no TOTP is needed. */
+  removeTool(nameOrId: string, tool: string): boolean {
+    const agent = this.resolveAgent(nameOrId);
+    const ok = this.store.removeToolPolicy(agent.id, tool);
+    this.store.audit({ at: this.now(), action: "policy_remove", result: ok ? "ok" : "absent", agentId: agent.id, object: `tool:${tool}` });
+    return ok;
+  }
+
+  toolPolicy(nameOrId: string): Array<{ tool: string; class: string; createdAt: number }> {
+    return this.store.toolPolicy(this.resolveAgent(nameOrId).id);
+  }
+
   listAgents(): ReturnType<SessionStore["listAgents"]> {
     return this.store.listAgents();
   }
@@ -220,4 +250,14 @@ export class HubAdmin {
     if (!a) throw new Error(`no such agent: ${nameOrId}`);
     return a;
   }
+}
+
+const TOOL_NAME_RE = /^[A-Za-z0-9][A-Za-z0-9_.:/-]{0,79}$/;
+const WRITE_HINT_RE =
+  /(^|[_.:/-])(write|edit|patch|apply|create|update|delete|remove|rm|move|mv|rename|exec|execute|run|shell|bash|sh|cmd|spawn|kill|install|push|commit|merge|deploy|publish|release|send|post|put|upload|pay|transfer|approve|grant|revoke|set|drop|truncate|insert)([_.:/-]|$)/i;
+
+/** Allowlist entries are exact, non-glob names that do not look like writes. */
+export function checkReadOnlyName(tool: string): void {
+  if (!TOOL_NAME_RE.test(tool) || /[*?[\]]/.test(tool)) throw new Error(`invalid tool name: ${tool} (exact names only, no wildcards)`);
+  if (WRITE_HINT_RE.test(tool)) throw new Error(`refusing to auto-allow ${tool}: looks like a write/side-effect tool`);
 }
