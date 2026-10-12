@@ -21,6 +21,17 @@ export const GROUP_NOTICE_WINDOW_MS = 24 * 60 * 60 * 1000;
 export const DEFAULT_LOG_WINDOW = 40;
 export const CALLBACK_TTL_MS = 24 * 60 * 60 * 1000;
 
+type MessageRow = {
+  id: string;
+  seq: number;
+  role: string;
+  surface: string | null;
+  content: string;
+  created_at: number;
+  author: string | null;
+  request_id: string | null;
+};
+
 const SCHEMA = `
 PRAGMA foreign_keys = ON;
 CREATE TABLE IF NOT EXISTS person (
@@ -474,14 +485,14 @@ CREATE INDEX IF NOT EXISTS approval_pending_expiry
     const limit = opts?.maxMessages;
     const rows = limit
       ? this.db
-          .prepare<{ id: string; seq: number; role: string; surface: string | null; content: string; created_at: number }>(
-            "SELECT id, seq, role, surface, content, created_at FROM message WHERE conversation_id = ? ORDER BY seq DESC LIMIT ?",
+          .prepare<MessageRow>(
+            "SELECT id, seq, role, surface, content, created_at, author, request_id FROM message WHERE conversation_id = ? ORDER BY seq DESC LIMIT ?",
           )
           .all(conversationId, limit)
           .reverse()
       : this.db
-          .prepare<{ id: string; seq: number; role: string; surface: string | null; content: string; created_at: number }>(
-            "SELECT id, seq, role, surface, content, created_at FROM message WHERE conversation_id = ? ORDER BY seq",
+          .prepare<MessageRow>(
+            "SELECT id, seq, role, surface, content, created_at, author, request_id FROM message WHERE conversation_id = ? ORDER BY seq",
           )
           .all(conversationId);
     const messages = rows.map((m) => {
@@ -493,6 +504,8 @@ CREATE INDEX IF NOT EXISTS approval_pending_expiry
         text: content.text ?? "",
         surface: m.surface ? (JSON.parse(m.surface) as ChatRef) : undefined,
         createdAt: m.created_at,
+        author: m.author ?? undefined,
+        requestId: m.request_id ?? undefined,
       };
     });
     return { ...conv, messages };
@@ -504,6 +517,8 @@ CREATE INDEX IF NOT EXISTS approval_pending_expiry
     text: string;
     surface?: ChatRef;
     now: number;
+    author?: string;
+    requestId?: string;
   }): LogMessage {
     return this.db.transaction(() => {
       const seqRow = this.db
@@ -513,7 +528,7 @@ CREATE INDEX IF NOT EXISTS approval_pending_expiry
       const id = newId("m");
       this.db
         .prepare(
-          "INSERT INTO message(id, conversation_id, seq, role, surface, content, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+          "INSERT INTO message(id, conversation_id, seq, role, surface, content, created_at, author, request_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .run(
           id,
@@ -523,8 +538,19 @@ CREATE INDEX IF NOT EXISTS approval_pending_expiry
           opts.surface ? JSON.stringify(opts.surface) : null,
           JSON.stringify({ text: opts.text }),
           opts.now,
+          opts.author ?? null,
+          opts.requestId ?? null,
         );
-      return { id, seq, role: opts.role, text: opts.text, surface: opts.surface, createdAt: opts.now };
+      return {
+        id,
+        seq,
+        role: opts.role,
+        text: opts.text,
+        surface: opts.surface,
+        createdAt: opts.now,
+        author: opts.author,
+        requestId: opts.requestId,
+      };
     });
   }
 
@@ -988,6 +1014,122 @@ CREATE INDEX IF NOT EXISTS approval_pending_expiry
         requestId: r.request_id ?? undefined,
         detail: r.detail ?? undefined,
       }));
+  }
+
+  /**
+   * The per-agent topic for a person (Q1). Never changes the active topic;
+   * `/topic agent:<name>` finds it by title like any other topic.
+   */
+  agentConversation(personId: string, agentId: string, title: string, now: number): ConversationSnapshot {
+    return this.db.transaction(() => {
+      const existing = this.db
+        .prepare<{ id: string }>("SELECT id FROM conversation WHERE person_id = ? AND agent_id = ?")
+        .get(personId, agentId);
+      if (existing) return this.snapshot(existing.id);
+      const byTitle = this.db
+        .prepare<{ id: string }>(
+          "SELECT id FROM conversation WHERE person_id = ? AND title = ? AND is_default = 0 AND agent_id IS NULL",
+        )
+        .get(personId, title);
+      if (byTitle) {
+        // A human-created topic with this title is adopted rather than shadowed.
+        this.db.prepare("UPDATE conversation SET agent_id = ? WHERE id = ?").run(agentId, byTitle.id);
+        return this.snapshot(byTitle.id);
+      }
+      const id = newId("c");
+      this.db
+        .prepare(
+          "INSERT INTO conversation(id, person_id, group_key, title, is_default, created_at, agent_id) VALUES (?, ?, NULL, ?, 0, ?, ?)",
+        )
+        .run(id, personId, title, now, agentId);
+      return this.snapshot(id);
+    });
+  }
+
+  agentByName(name: string): AgentRecord | undefined {
+    const row = this.db.prepare<{ id: string }>("SELECT id FROM agent WHERE name = ?").get(name);
+    return row ? this.getAgent(row.id) : undefined;
+  }
+
+  /** Persons whose name matches exactly (case-insensitive). */
+  personsByName(name: string): PersonRecord[] {
+    return this.db
+      .prepare<{ id: string; name: string | null }>("SELECT id, name FROM person WHERE lower(name) = lower(?)")
+      .all(name.trim())
+      .map((r) => ({ id: r.id, name: r.name ?? undefined }));
+  }
+
+  setA2hApprovalId(requestId: string, approvalId: string): void {
+    this.db.prepare("UPDATE a2h_request SET approval_id = ? WHERE id = ?").run(approvalId, requestId);
+  }
+
+  setA2hPromptMessage(requestId: string, messageId: string): void {
+    this.db.prepare("UPDATE a2h_request SET prompt_message_id = ? WHERE id = ?").run(messageId, requestId);
+  }
+
+  setA2hAnswerMessage(requestId: string, messageId: string): void {
+    this.db.prepare("UPDATE a2h_request SET answer_message_id = ? WHERE id = ?").run(messageId, requestId);
+  }
+
+  a2hPromptMessageId(requestId: string): string | undefined {
+    return (
+      this.db
+        .prepare<{ prompt_message_id: string | null }>("SELECT prompt_message_id FROM a2h_request WHERE id = ?")
+        .get(requestId)?.prompt_message_id ?? undefined
+    );
+  }
+
+  /** Request whose prompt was delivered as this platform message (quote-reply routing). */
+  a2hRequestByDelivery(chat: ChatRef, platformMsgId: string): A2hRequest | undefined {
+    const row = this.db
+      .prepare<{ request_id: string | null }>(
+        `SELECT m.request_id AS request_id FROM delivery d JOIN message m ON m.id = d.message_id
+         WHERE d.platform = ? AND d.account_id = ? AND d.chat_id = ? AND d.platform_msg_id = ?
+         ORDER BY d.id DESC LIMIT 1`,
+      )
+      .get(chat.platform, chat.accountId, chat.chatId, platformMsgId);
+    return row?.request_id ? this.getA2hRequest(row.request_id) : undefined;
+  }
+
+  /** The latest message the bot delivered into this chat (any source). */
+  lastDeliveryInChat(chat: ChatRef): { messageId: string; requestId?: string; createdAt: number } | undefined {
+    const row = this.db
+      .prepare<{ message_id: string; request_id: string | null; created_at: number }>(
+        `SELECT d.message_id AS message_id, m.request_id AS request_id, m.created_at AS created_at
+         FROM delivery d JOIN message m ON m.id = d.message_id
+         WHERE d.platform = ? AND d.account_id = ? AND d.chat_id = ?
+         ORDER BY d.id DESC LIMIT 1`,
+      )
+      .get(chat.platform, chat.accountId, chat.chatId);
+    return row ? { messageId: row.message_id, requestId: row.request_id ?? undefined, createdAt: row.created_at } : undefined;
+  }
+
+  deliveriesFor(messageId: string): Array<{ chat: ChatRef; messageId: string }> {
+    return this.db
+      .prepare<{ platform: string; account_id: string; chat_id: string; platform_msg_id: string | null }>(
+        "SELECT platform, account_id, chat_id, platform_msg_id FROM delivery WHERE message_id = ? ORDER BY id",
+      )
+      .all(messageId)
+      .filter((r) => r.platform_msg_id)
+      .map((r) => ({
+        chat: { platform: r.platform, accountId: r.account_id, chatId: r.chat_id, kind: "dm" as const },
+        messageId: r.platform_msg_id!,
+      }));
+  }
+
+  openA2hRequests(personId: string, kind?: A2hRequestKind): A2hRequest[] {
+    const rows = kind
+      ? this.db
+          .prepare<{ id: string }>(
+            "SELECT id FROM a2h_request WHERE person_id = ? AND kind = ? AND state = 'pending' ORDER BY created_at, id",
+          )
+          .all(personId, kind)
+      : this.db
+          .prepare<{ id: string }>(
+            "SELECT id FROM a2h_request WHERE person_id = ? AND state = 'pending' ORDER BY created_at, id",
+          )
+          .all(personId);
+    return rows.map(({ id }) => this.getA2hRequest(id)).filter((r): r is A2hRequest => Boolean(r));
   }
 
   identityKey = identityKey;
