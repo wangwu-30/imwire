@@ -6,6 +6,11 @@ import type {
   ConversationSnapshot,
   IdentityRecord,
   LogMessage,
+  A2hRequest,
+  A2hRequestKind,
+  A2hScope,
+  A2hTerminalState,
+  AgentRecord,
   PendingApproval,
   PersonRecord,
 } from "./types.js";
@@ -111,6 +116,51 @@ CREATE TABLE IF NOT EXISTS interrupt_notice (
   conversation_id TEXT PRIMARY KEY,
   last_seq INTEGER NOT NULL DEFAULT 0
 );
+CREATE TABLE IF NOT EXISTS agent (
+  id TEXT PRIMARY KEY,
+  name TEXT UNIQUE NOT NULL,
+  token_hash TEXT NOT NULL,
+  created_at INTEGER NOT NULL,
+  revoked_at INTEGER,
+  limits TEXT
+);
+CREATE TABLE IF NOT EXISTS agent_grant (
+  agent_id TEXT NOT NULL REFERENCES agent(id),
+  person_id TEXT NOT NULL REFERENCES person(id),
+  scopes TEXT NOT NULL,
+  PRIMARY KEY (agent_id, person_id)
+);
+CREATE TABLE IF NOT EXISTS a2h_request (
+  id TEXT PRIMARY KEY,
+  agent_id TEXT NOT NULL REFERENCES agent(id),
+  person_id TEXT NOT NULL REFERENCES person(id),
+  conversation_id TEXT NOT NULL REFERENCES conversation(id),
+  kind TEXT NOT NULL,
+  state TEXT NOT NULL,
+  payload TEXT NOT NULL,
+  answer TEXT,
+  approval_id TEXT REFERENCES approval(id),
+  prompt_message_id TEXT,
+  answer_message_id TEXT,
+  idempotency_key TEXT,
+  created_at INTEGER NOT NULL,
+  expires_at INTEGER NOT NULL,
+  decided_at INTEGER,
+  decided_by TEXT,
+  version INTEGER NOT NULL DEFAULT 1,
+  UNIQUE (agent_id, idempotency_key)
+);
+CREATE INDEX IF NOT EXISTS a2h_request_open ON a2h_request(state, expires_at);
+CREATE TABLE IF NOT EXISTS audit_log (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  at INTEGER NOT NULL,
+  agent_id TEXT,
+  action TEXT NOT NULL,
+  person_id TEXT,
+  request_id TEXT,
+  result TEXT NOT NULL,
+  detail TEXT
+);
 CREATE TABLE IF NOT EXISTS telegram_callback (
   hash TEXT PRIMARY KEY,
   action_id TEXT NOT NULL,
@@ -141,6 +191,13 @@ export class SessionStore {
       "ALTER TABLE approval ADD COLUMN created_at INTEGER",
       "ALTER TABLE pairing ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0",
       "ALTER TABLE interrupt_notice ADD COLUMN last_seq INTEGER NOT NULL DEFAULT 0",
+      // a2h (agent → human), additive only.
+      "ALTER TABLE approval ADD COLUMN target_person_id TEXT",
+      "ALTER TABLE approval ADD COLUMN expires_at INTEGER",
+      "ALTER TABLE approval ADD COLUMN source TEXT",
+      "ALTER TABLE conversation ADD COLUMN agent_id TEXT",
+      "ALTER TABLE message ADD COLUMN author TEXT",
+      "ALTER TABLE message ADD COLUMN request_id TEXT",
     ];
     for (const sql of alters) {
       try {
@@ -149,6 +206,15 @@ export class SessionStore {
         // column exists
       }
     }
+    // Indexes that reference migrated columns must run after the ALTERs.
+    this.db.exec(`
+CREATE UNIQUE INDEX IF NOT EXISTS conv_person_agent
+  ON conversation(person_id, agent_id) WHERE agent_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS delivery_platform_msg
+  ON delivery(platform, account_id, chat_id, platform_msg_id);
+CREATE INDEX IF NOT EXISTS approval_pending_expiry
+  ON approval(state, expires_at);
+`);
   }
 
   close(): void {
@@ -565,6 +631,7 @@ export class SessionStore {
     options: string[],
     requestedBy: string | undefined,
     now: number,
+    extra: { targetPersonId?: string; expiresAt?: number; source?: "pi" | "agent" } = {},
   ): PendingApproval {
     const id = newId("a");
     const rec: PendingApproval = {
@@ -577,13 +644,26 @@ export class SessionStore {
       state: "pending",
       requestedBy,
       createdAt: now,
+      targetPersonId: extra.targetPersonId,
+      expiresAt: extra.expiresAt,
+      source: extra.source,
       cards: [],
     };
     this.db
       .prepare(
-        "INSERT INTO approval(id, conversation_id, tool_call, state, version, cards, requested_by, created_at) VALUES (?, ?, ?, 'pending', 1, ?, ?, ?)",
+        "INSERT INTO approval(id, conversation_id, tool_call, state, version, cards, requested_by, created_at, target_person_id, expires_at, source) VALUES (?, ?, ?, 'pending', 1, ?, ?, ?, ?, ?, ?)",
       )
-      .run(id, conversationId, JSON.stringify({ toolCallId, title, options }), "[]", requestedBy ?? null, now);
+      .run(
+        id,
+        conversationId,
+        JSON.stringify({ toolCallId, title, options }),
+        "[]",
+        requestedBy ?? null,
+        now,
+        extra.targetPersonId ?? null,
+        extra.expiresAt ?? null,
+        extra.source ?? null,
+      );
     return rec;
   }
 
@@ -598,9 +678,14 @@ export class SessionStore {
         cards: string | null;
         requested_by: string | null;
         chosen: string | null;
+        decided_by: string | null;
+        decided_at: number | null;
         created_at: number | null;
+        target_person_id: string | null;
+        expires_at: number | null;
+        source: string | null;
       }>(
-        "SELECT id, conversation_id, tool_call, state, version, cards, requested_by, chosen, created_at FROM approval WHERE id = ?",
+        "SELECT id, conversation_id, tool_call, state, version, cards, requested_by, chosen, decided_by, decided_at, created_at, target_person_id, expires_at, source FROM approval WHERE id = ?",
       )
       .get(id);
     if (!row) return undefined;
@@ -615,7 +700,12 @@ export class SessionStore {
       state: row.state as PendingApproval["state"],
       requestedBy: row.requested_by ?? undefined,
       chosen: row.chosen ?? undefined,
+      decidedBy: row.decided_by ?? undefined,
+      decidedAt: row.decided_at ?? undefined,
       createdAt: row.created_at ?? undefined,
+      targetPersonId: row.target_person_id ?? undefined,
+      expiresAt: row.expires_at ?? undefined,
+      source: (row.source as PendingApproval["source"]) ?? undefined,
       cards: row.cards ? (JSON.parse(row.cards) as PendingApproval["cards"]) : [],
     };
   }
@@ -659,6 +749,245 @@ export class SessionStore {
       if (decided) out.push(decided);
     }
     return out;
+  }
+
+  /**
+   * Sweeper: deny every pending approval whose persisted `expires_at` has
+   * passed. Fail-closed — expiry is a denial (`decided_by = reason`).
+   */
+  expireDueApprovals(now: number, reason = "expired"): PendingApproval[] {
+    const due = this.db
+      .prepare<{ id: string }>(
+        "SELECT id FROM approval WHERE state = 'pending' AND expires_at IS NOT NULL AND expires_at <= ?",
+      )
+      .all(now);
+    const out: PendingApproval[] = [];
+    for (const { id } of due) {
+      const decided = this.decideApproval(id, "denied", reason, now, "deny");
+      if (decided) out.push(decided);
+    }
+    return out;
+  }
+
+  // ---- a2h: agents, grants, requests, audit -------------------------------
+
+  createAgent(name: string, tokenHash: string, now: number): AgentRecord {
+    const id = newId("ag");
+    this.db
+      .prepare("INSERT INTO agent(id, name, token_hash, created_at) VALUES (?, ?, ?, ?)")
+      .run(id, name, tokenHash, now);
+    return { id, name, createdAt: now };
+  }
+
+  getAgent(id: string): AgentRecord | undefined {
+    const row = this.db
+      .prepare<{ id: string; name: string; created_at: number; revoked_at: number | null }>(
+        "SELECT id, name, created_at, revoked_at FROM agent WHERE id = ?",
+      )
+      .get(id);
+    if (!row) return undefined;
+    return { id: row.id, name: row.name, createdAt: row.created_at, revokedAt: row.revoked_at ?? undefined };
+  }
+
+  revokeAgent(id: string, now: number): void {
+    this.db.prepare("UPDATE agent SET revoked_at = ? WHERE id = ? AND revoked_at IS NULL").run(now, id);
+  }
+
+  /** Raw grant write. Callers must apply the target allowlist gate first (see SessionGateway.grantAgent). */
+  setAgentGrant(agentId: string, personId: string, scopes: A2hScope[]): void {
+    this.db
+      .prepare("INSERT OR REPLACE INTO agent_grant(agent_id, person_id, scopes) VALUES (?, ?, ?)")
+      .run(agentId, personId, JSON.stringify([...new Set(scopes)]));
+  }
+
+  agentScopes(agentId: string, personId: string): A2hScope[] {
+    const row = this.db
+      .prepare<{ scopes: string }>("SELECT scopes FROM agent_grant WHERE agent_id = ? AND person_id = ?")
+      .get(agentId, personId);
+    if (!row) return [];
+    try {
+      const parsed = JSON.parse(row.scopes) as unknown;
+      return Array.isArray(parsed) ? (parsed.filter((s) => typeof s === "string") as A2hScope[]) : [];
+    } catch {
+      return [];
+    }
+  }
+
+  createA2hRequest(opts: {
+    agentId: string;
+    personId: string;
+    conversationId: string;
+    kind: A2hRequestKind;
+    payload: unknown;
+    expiresAt: number;
+    now: number;
+    approvalId?: string;
+    idempotencyKey?: string;
+  }): { request: A2hRequest; replayed: boolean } {
+    return this.db.transaction(() => {
+      if (opts.idempotencyKey !== undefined) {
+        const prior = this.db
+          .prepare<{ id: string }>("SELECT id FROM a2h_request WHERE agent_id = ? AND idempotency_key = ?")
+          .get(opts.agentId, opts.idempotencyKey);
+        if (prior) return { request: this.getA2hRequest(prior.id)!, replayed: true };
+      }
+      const id = newId("r");
+      this.db
+        .prepare(
+          "INSERT INTO a2h_request(id, agent_id, person_id, conversation_id, kind, state, payload, approval_id, idempotency_key, created_at, expires_at) VALUES (?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?)",
+        )
+        .run(
+          id,
+          opts.agentId,
+          opts.personId,
+          opts.conversationId,
+          opts.kind,
+          JSON.stringify(opts.payload ?? null),
+          opts.approvalId ?? null,
+          opts.idempotencyKey ?? null,
+          opts.now,
+          opts.expiresAt,
+        );
+      return { request: this.getA2hRequest(id)!, replayed: false };
+    });
+  }
+
+  getA2hRequest(id: string): A2hRequest | undefined {
+    const row = this.db
+      .prepare<{
+        id: string;
+        agent_id: string;
+        person_id: string;
+        conversation_id: string;
+        kind: string;
+        state: string;
+        payload: string;
+        answer: string | null;
+        approval_id: string | null;
+        idempotency_key: string | null;
+        created_at: number;
+        expires_at: number;
+        decided_at: number | null;
+        decided_by: string | null;
+        version: number;
+      }>(
+        "SELECT id, agent_id, person_id, conversation_id, kind, state, payload, answer, approval_id, idempotency_key, created_at, expires_at, decided_at, decided_by, version FROM a2h_request WHERE id = ?",
+      )
+      .get(id);
+    if (!row) return undefined;
+    return {
+      id: row.id,
+      agentId: row.agent_id,
+      personId: row.person_id,
+      conversationId: row.conversation_id,
+      kind: row.kind as A2hRequestKind,
+      state: row.state as A2hRequest["state"],
+      payload: JSON.parse(row.payload) as unknown,
+      answer: row.answer === null ? undefined : (JSON.parse(row.answer) as unknown),
+      approvalId: row.approval_id ?? undefined,
+      idempotencyKey: row.idempotency_key ?? undefined,
+      createdAt: row.created_at,
+      expiresAt: row.expires_at,
+      decidedAt: row.decided_at ?? undefined,
+      decidedBy: row.decided_by ?? undefined,
+      version: row.version,
+    };
+  }
+
+  a2hRequestByApproval(approvalId: string): A2hRequest | undefined {
+    const row = this.db.prepare<{ id: string }>("SELECT id FROM a2h_request WHERE approval_id = ?").get(approvalId);
+    return row ? this.getA2hRequest(row.id) : undefined;
+  }
+
+  /** CAS pending → terminal. Returns undefined if already terminal (idempotent). */
+  decideA2hRequest(
+    id: string,
+    state: A2hTerminalState,
+    decidedBy: string,
+    now: number,
+    answer?: unknown,
+  ): A2hRequest | undefined {
+    const current = this.getA2hRequest(id);
+    if (!current || current.state !== "pending") return undefined;
+    const res = this.db
+      .prepare(
+        "UPDATE a2h_request SET state = ?, decided_by = ?, decided_at = ?, answer = COALESCE(?, answer), version = version + 1 WHERE id = ? AND state = 'pending' AND version = ?",
+      )
+      .run(state, decidedBy, now, answer === undefined ? null : JSON.stringify(answer), id, current.version);
+    if (res.changes !== 1) return undefined;
+    return this.getA2hRequest(id);
+  }
+
+  /** Sweeper for a2h requests past `expires_at`. */
+  expireDueA2hRequests(now: number): A2hRequest[] {
+    const due = this.db
+      .prepare<{ id: string }>("SELECT id FROM a2h_request WHERE state = 'pending' AND expires_at <= ?")
+      .all(now);
+    return due
+      .map(({ id }) => this.decideA2hRequest(id, "expired", "expired", now))
+      .filter((r): r is A2hRequest => Boolean(r));
+  }
+
+  /** Boot (Q4): every open a2h request becomes `expired`, regardless of TTL. */
+  expirePendingA2hRequests(now: number, reason = "restart"): A2hRequest[] {
+    const open = this.db.prepare<{ id: string }>("SELECT id FROM a2h_request WHERE state = 'pending'").all();
+    return open
+      .map(({ id }) => this.decideA2hRequest(id, "expired", reason, now))
+      .filter((r): r is A2hRequest => Boolean(r));
+  }
+
+  pendingA2hRequests(): A2hRequest[] {
+    return this.db
+      .prepare<{ id: string }>("SELECT id FROM a2h_request WHERE state = 'pending'")
+      .all()
+      .map(({ id }) => this.getA2hRequest(id))
+      .filter((r): r is A2hRequest => Boolean(r));
+  }
+
+  /** Append-only audit trail. Never pass tokens in `detail`. */
+  audit(entry: {
+    at: number;
+    action: string;
+    result: string;
+    agentId?: string;
+    personId?: string;
+    requestId?: string;
+    detail?: unknown;
+  }): void {
+    this.db
+      .prepare(
+        "INSERT INTO audit_log(at, agent_id, action, person_id, request_id, result, detail) VALUES (?, ?, ?, ?, ?, ?, ?)",
+      )
+      .run(
+        entry.at,
+        entry.agentId ?? null,
+        entry.action,
+        entry.personId ?? null,
+        entry.requestId ?? null,
+        entry.result,
+        entry.detail === undefined ? null : JSON.stringify(entry.detail),
+      );
+  }
+
+  auditEntries(): Array<{ action: string; result: string; agentId?: string; personId?: string; requestId?: string; detail?: string }> {
+    return this.db
+      .prepare<{
+        action: string;
+        result: string;
+        agent_id: string | null;
+        person_id: string | null;
+        request_id: string | null;
+        detail: string | null;
+      }>("SELECT action, result, agent_id, person_id, request_id, detail FROM audit_log ORDER BY id")
+      .all()
+      .map((r) => ({
+        action: r.action,
+        result: r.result,
+        agentId: r.agent_id ?? undefined,
+        personId: r.person_id ?? undefined,
+        requestId: r.request_id ?? undefined,
+        detail: r.detail ?? undefined,
+      }));
   }
 
   identityKey = identityKey;
