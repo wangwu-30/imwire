@@ -86,8 +86,44 @@ export interface PendingApproval {
   state: "pending" | "approved" | "denied";
   requestedBy?: string;
   chosen?: string;
+  decidedBy?: string;
+  decidedAt?: number;
   createdAt?: number;
+  /** a2h: only this person may decide. Falls back to the conversation owner when unset. */
+  targetPersonId?: string;
+  /** Persisted TTL (epoch ms). The sweeper denies the approval once it passes. */
+  expiresAt?: number;
+  source?: "pi" | "agent";
   cards: Array<{ chat: ChatRef; messageId: string }>;
+}
+
+export type A2hScope = "send" | "ask" | "approve" | "read" | "read_all";
+export type A2hRequestKind = "message" | "ask" | "approval";
+export type A2hTerminalState = "approved" | "denied" | "answered" | "expired" | "cancelled" | "failed";
+
+export interface AgentRecord {
+  id: string;
+  name: string;
+  createdAt: number;
+  revokedAt?: number;
+}
+
+export interface A2hRequest {
+  id: string;
+  agentId: string;
+  personId: string;
+  conversationId: string;
+  kind: A2hRequestKind;
+  state: "pending" | A2hTerminalState;
+  payload: unknown;
+  answer?: unknown;
+  approvalId?: string;
+  idempotencyKey?: string;
+  createdAt: number;
+  expiresAt: number;
+  decidedAt?: number;
+  decidedBy?: string;
+  version: number;
 }
 
 export function isExplicitApprove(option: string): boolean {

@@ -16,6 +16,8 @@ import {
   isDenyOption,
   isExplicitApprove,
   type AgentDriver,
+  type A2hRequest,
+  type A2hScope,
   type ApprovalDecision,
   type OwnerAllowlistEntry,
   type PendingApproval,
@@ -30,6 +32,7 @@ const PAIR_TTL_MS = 10 * 60 * 1000;
 const PAIR_RATE = 5;
 const PAIR_WINDOW_MS = 10 * 60 * 1000;
 const DEFAULT_APPROVAL_TTL_MS = 10 * 60 * 1000;
+const DEFAULT_SWEEP_INTERVAL_MS = 15 * 1000;
 
 export interface SessionGatewayOptions {
   dbPath: string;
@@ -38,8 +41,10 @@ export interface SessionGatewayOptions {
   clock?: Clock;
   logger?: Logger;
   unpairedText?: string;
-  /** Approval wait TTL. Default 10 minutes. */
+  /** Approval wait TTL. Default 10 minutes. Persisted as `approval.expires_at`. */
   approvalTimeoutMs?: number;
+  /** How often the expiry sweeper runs. Default 15 s; 0 disables the timer (call `sweepExpired()` yourself). */
+  sweepIntervalMs?: number;
   logWindow?: number;
 }
 
@@ -82,6 +87,7 @@ export class SessionGateway {
   private readonly agentSessions = new Map<string, string>();
   private readonly turns = new Map<string, Promise<void>>();
   private readonly expiredOnBoot: PendingApproval[] = [];
+  private readonly sweepTimer?: ReturnType<typeof setInterval>;
   private closed = false;
   private recoverChain: Promise<void> = Promise.resolve();
 
@@ -94,10 +100,109 @@ export class SessionGateway {
     this.unpairedText = opts.unpairedText ?? UNPAIRED;
     this.approvalTimeoutMs = opts.approvalTimeoutMs ?? DEFAULT_APPROVAL_TTL_MS;
     this.logWindow = opts.logWindow ?? DEFAULT_LOG_WINDOW;
+    // Q4: a hub restart fails every open agent request closed.
+    for (const req of this.store.expirePendingA2hRequests(this.clock.now(), "restart")) {
+      this.logger.info("expired a2h request on boot", { id: req.id });
+      this.store.audit({
+        at: this.clock.now(),
+        action: "expire",
+        result: "expired_on_restart",
+        agentId: req.agentId,
+        personId: req.personId,
+        requestId: req.id,
+      });
+    }
     for (const expired of this.store.expirePendingApprovals(this.clock.now(), "expired")) {
       this.logger.info("expired stale approval on boot", { id: expired.id });
       this.expiredOnBoot.push(expired);
+      this.syncA2hFromApproval(expired);
     }
+    const sweepMs = opts.sweepIntervalMs ?? DEFAULT_SWEEP_INTERVAL_MS;
+    if (sweepMs > 0) {
+      this.sweepTimer = setInterval(() => {
+        try {
+          this.sweepExpired();
+        } catch (err) {
+          this.logger.warn("expiry sweep failed", { err: String(err) });
+        }
+      }, sweepMs);
+      this.sweepTimer.unref?.();
+    }
+  }
+
+  /**
+   * Expiry sweeper. Denies approvals and expires a2h requests whose persisted
+   * `expires_at` has passed (fail-closed), wakes any in-process waiter, and
+   * rewrites the cards. Safe to call at any time; idempotent.
+   */
+  sweepExpired(): { approvals: PendingApproval[]; requests: A2hRequest[] } {
+    if (this.closed) return { approvals: [], requests: [] };
+    const now = this.clock.now();
+    const approvals = this.store.expireDueApprovals(now, "expired");
+    for (const decided of approvals) {
+      this.syncA2hFromApproval(decided);
+      this.approvalWaiters.get(decided.id)?.resolve("deny");
+      this.approvalWaiters.delete(decided.id);
+      void this.updateApprovalCards(decided, "denied");
+    }
+    const requests = this.store.expireDueA2hRequests(now);
+    for (const req of requests) {
+      this.store.audit({
+        at: now,
+        action: "expire",
+        result: "expired",
+        agentId: req.agentId,
+        personId: req.personId,
+        requestId: req.id,
+      });
+    }
+    return { approvals, requests };
+  }
+
+  /**
+   * v1 target gate (Q6): the data model is multi-person, but agents may only
+   * reach people who are owners on the allowlist.
+   */
+  isA2hTargetAllowed(personId: string): boolean {
+    return this.store
+      .listIdentities(personId)
+      .some((id) =>
+        this.allowlist.some(
+          (o) => o.platform === id.platform && o.accountId === id.accountId && o.userId === id.userId,
+        ),
+      );
+  }
+
+  /** Grant an agent scopes on a person. Throws unless the person passes the v1 allowlist gate. */
+  grantAgent(agentId: string, personId: string, scopes: A2hScope[]): void {
+    if (!this.store.getAgent(agentId)) throw new Error(`unknown agent ${agentId}`);
+    if (!this.isA2hTargetAllowed(personId)) {
+      this.store.audit({
+        at: this.clock.now(),
+        action: "grant",
+        result: "forbidden_target",
+        agentId,
+        personId,
+      });
+      throw new Error("a2h v1: agents may only reach allowlisted owners");
+    }
+    this.store.setAgentGrant(agentId, personId, scopes);
+  }
+
+  /** Mirror a decided approval onto its a2h request (if any). */
+  private syncA2hFromApproval(decided: PendingApproval): void {
+    const req = this.store.a2hRequestByApproval(decided.id);
+    if (!req || req.state !== "pending") return;
+    const by = decided.decidedBy ?? "unknown";
+    const state =
+      decided.state === "approved"
+        ? "approved"
+        : by === "expired" || by === "timeout" || by === "restart"
+          ? "expired"
+          : by === "cancelled"
+            ? "cancelled"
+            : "denied";
+    this.store.decideA2hRequest(req.id, state, by, this.clock.now(), { choice: decided.chosen ?? null });
   }
 
   attach(adapter: Adapter): void {
@@ -124,6 +229,7 @@ export class SessionGateway {
 
   close(): void {
     this.closed = true;
+    if (this.sweepTimer) clearInterval(this.sweepTimer);
     this.store.close();
   }
 
@@ -660,6 +766,7 @@ export class SessionGateway {
           req.options,
           live.personId,
           this.clock.now(),
+          { expiresAt: this.clock.now() + this.approvalTimeoutMs, source: "pi" },
         );
         await this.renderApproval(approval, live.adapter, live.surface);
         return this.waitForApproval(approval.id);
@@ -680,11 +787,18 @@ export class SessionGateway {
         resolve: finish,
         abort: () => {
           const decided = this.store.decideApproval(id, "denied", "cancelled", this.clock.now(), "deny");
-          if (decided) void this.updateApprovalCards(decided, "denied");
+          if (decided) {
+            this.syncA2hFromApproval(decided);
+            void this.updateApprovalCards(decided, "denied");
+          }
           finish("deny");
         },
       });
+      // Expiry lives in the DB (`expires_at`); this timer only nudges the
+      // sweeper so the waiter wakes promptly instead of on the next tick.
       void this.clock.sleep(this.approvalTimeoutMs).then(() => {
+        if (settled) return;
+        this.sweepExpired();
         if (settled) return;
         const decided = this.store.decideApproval(id, "denied", "timeout", this.clock.now(), "deny");
         if (decided) void this.updateApprovalCards(decided, "denied");
@@ -746,6 +860,8 @@ export class SessionGateway {
   private canDecide(approval: PendingApproval, from: UserRef): boolean {
     const ident = this.store.findIdentity(from.platform, from.accountId, from.userId);
     if (!ident) return false;
+    // a2h: only the person who was asked may decide.
+    if (approval.targetPersonId) return ident.personId === approval.targetPersonId;
     const conv = this.store.conversationMeta(approval.conversationId);
     if (!conv) return false;
     if (conv.personId) return ident.personId === conv.personId;
@@ -764,7 +880,24 @@ export class SessionGateway {
     const approvalId = value && this.store.getApproval(value) ? value : actionId;
     const approval = this.store.getApproval(approvalId);
     if (!approval || approval.state !== "pending") return;
-    if (!this.canDecide(approval, from)) return;
+    if (!this.canDecide(approval, from)) {
+      if (approval.targetPersonId) {
+        this.store.audit({
+          at: this.clock.now(),
+          action: "click",
+          result: "forbidden_click",
+          personId: this.store.findIdentity(from.platform, from.accountId, from.userId)?.personId,
+          requestId: this.store.a2hRequestByApproval(approval.id)?.id,
+          detail: { approvalId: approval.id, from: identityKey(from.platform, from.accountId, from.userId) },
+        });
+      }
+      return;
+    }
+    if (approval.expiresAt !== undefined && approval.expiresAt <= this.clock.now()) {
+      // Past TTL but not yet swept: fail closed, never honour a late click.
+      this.sweepExpired();
+      return;
+    }
     const { option, approved } = this.interpretAction(approval, actionId);
     const state = approved ? "approved" : "denied";
     const decided = this.store.decideApproval(
@@ -775,6 +908,7 @@ export class SessionGateway {
       option,
     );
     if (!decided) return;
+    this.syncA2hFromApproval(decided);
     this.approvalWaiters.get(approval.id)?.resolve(option);
     this.approvalWaiters.delete(approval.id);
     await this.updateApprovalCards(decided, state);
