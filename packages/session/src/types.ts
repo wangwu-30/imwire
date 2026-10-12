@@ -14,6 +14,10 @@ export interface LogMessage {
   text: string;
   surface?: ChatRef;
   createdAt: number;
+  /** a2h: `agent:<name>` for agent-authored messages; undefined for humans and pi. */
+  author?: string;
+  /** a2h: the request this message belongs to (prompt or answer). */
+  requestId?: string;
 }
 
 export interface ConversationSnapshot {
@@ -99,7 +103,14 @@ export interface PendingApproval {
 
 export type A2hScope = "send" | "ask" | "approve" | "read" | "read_all";
 export type A2hRequestKind = "message" | "ask" | "approval";
-export type A2hTerminalState = "approved" | "denied" | "answered" | "expired" | "cancelled" | "failed";
+export type A2hTerminalState =
+  | "approved"
+  | "denied"
+  | "answered"
+  | "delivered"
+  | "expired"
+  | "cancelled"
+  | "failed";
 
 export interface AgentRecord {
   id: string;
@@ -132,4 +143,22 @@ export function isExplicitApprove(option: string): boolean {
 
 export function isDenyOption(option: string): boolean {
   return /^(deny|denied|reject|rejected|block|no)$/i.test(option.trim());
+}
+
+/** What an agent sees for one of its requests. Human text is always `untrusted`. */
+export interface A2hView {
+  requestId: string;
+  /** Short code shown on the card and used by `/answer`. Empty for one-way messages. */
+  code: string;
+  kind: A2hRequestKind;
+  status: A2hRequest["state"];
+  /** True only for an approval explicitly approved by the target person. */
+  approved: boolean;
+  conversationId: string;
+  expiresAt: string;
+  decidedAt: string | null;
+  decidedBy: { personId: string; via: string } | null;
+  answer: { choice: string | null; text: string; via: string; at: string; untrusted: true } | null;
+  /** Created during quiet hours (Q5): delivered, but never nudged. */
+  quiet: boolean;
 }

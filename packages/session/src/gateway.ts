@@ -8,8 +8,32 @@ import {
   type Inbound,
   type Logger,
   type MsgRef,
+  type OutMessage,
   type UserRef,
 } from "@imwire/core";
+import {
+  A2H_APPROVAL_DEFAULT_S,
+  A2H_ASK_DEFAULT_S,
+  A2H_CHOICE_MAX,
+  A2H_CHOICES_MAX,
+  A2H_FALLBACK_WINDOW_MS,
+  A2hError,
+  agentTopicTitle,
+  clampTtlS,
+  DEFAULT_QUIET_HOURS,
+  formatLocal,
+  frameHeader,
+  isoLocal,
+  isQuietTime,
+  safeAgentName,
+  sanitizeAgentLine,
+  sanitizeAgentText,
+  shortCode,
+  imAccountVerifier,
+  meetsLevel,
+  type ApproverVerifier,
+  type QuietHours,
+} from "./a2h.js";
 import { groupKey, identityKey, PAIR_CODE_RE } from "./ids.js";
 import { DEFAULT_LOG_WINDOW, SessionStore } from "./store.js";
 import {
@@ -18,6 +42,8 @@ import {
   type AgentDriver,
   type A2hRequest,
   type A2hScope,
+  type A2hView,
+  type AgentRecord,
   type ApprovalDecision,
   type OwnerAllowlistEntry,
   type PendingApproval,
@@ -45,6 +71,17 @@ export interface SessionGatewayOptions {
   approvalTimeoutMs?: number;
   /** How often the expiry sweeper runs. Default 15 s; 0 disables the timer (call `sweepExpired()` yourself). */
   sweepIntervalMs?: number;
+  /**
+   * a2h quiet hours (Q5). Messages are still delivered; nothing nudges.
+   * Default 23:00–08:00 UTC+8. `null` disables.
+   */
+  quietHours?: QuietHours | null;
+  /**
+   * a2h identity policy: who agents may target and whether a click is a
+   * valid decision. Default keeps v1 behaviour (allowlisted owner, linked IM
+   * account). Fail-closed: a throwing verifier denies the click.
+   */
+  approverVerifier?: ApproverVerifier;
   logWindow?: number;
 }
 
@@ -87,6 +124,9 @@ export class SessionGateway {
   private readonly agentSessions = new Map<string, string>();
   private readonly turns = new Map<string, Promise<void>>();
   private readonly expiredOnBoot: PendingApproval[] = [];
+  private readonly quietHours: QuietHours | null;
+  private readonly verifier: ApproverVerifier;
+  private readonly a2hListeners = new Map<string, Set<() => void>>();
   private readonly sweepTimer?: ReturnType<typeof setInterval>;
   private closed = false;
   private recoverChain: Promise<void> = Promise.resolve();
@@ -100,6 +140,8 @@ export class SessionGateway {
     this.unpairedText = opts.unpairedText ?? UNPAIRED;
     this.approvalTimeoutMs = opts.approvalTimeoutMs ?? DEFAULT_APPROVAL_TTL_MS;
     this.logWindow = opts.logWindow ?? DEFAULT_LOG_WINDOW;
+    this.verifier = opts.approverVerifier ?? imAccountVerifier;
+    this.quietHours = opts.quietHours === undefined ? DEFAULT_QUIET_HOURS : opts.quietHours;
     // Q4: a hub restart fails every open agent request closed.
     for (const req of this.store.expirePendingA2hRequests(this.clock.now(), "restart")) {
       this.logger.info("expired a2h request on boot", { id: req.id });
@@ -147,6 +189,8 @@ export class SessionGateway {
     }
     const requests = this.store.expireDueA2hRequests(now);
     for (const req of requests) {
+      this.notifyA2h(req.id);
+      if (req.kind === "ask") void this.closeAskCards(req, "已过期");
       this.store.audit({
         at: now,
         action: "expire",
@@ -164,6 +208,14 @@ export class SessionGateway {
    * reach people who are owners on the allowlist.
    */
   isA2hTargetAllowed(personId: string): boolean {
+    try {
+      return this.verifier.isAllowedTarget(personId, { isAllowlistedOwner: this.isAllowlistedOwner(personId) });
+    } catch {
+      return false;
+    }
+  }
+
+  private isAllowlistedOwner(personId: string): boolean {
     return this.store
       .listIdentities(personId)
       .some((id) =>
@@ -189,6 +241,42 @@ export class SessionGateway {
     this.store.setAgentGrant(agentId, personId, scopes);
   }
 
+  /** Pluggable approver check for targeted (a2h) approvals. Fail-closed. */
+  private async verifyApproverClick(approval: PendingApproval, from: UserRef): Promise<boolean> {
+    const ident = this.store.findIdentity(from.platform, from.accountId, from.userId);
+    const request = this.store.a2hRequestByApproval(approval.id);
+    let ok = false;
+    let level = "none";
+    let reason: string | undefined;
+    try {
+      const verdict = await this.verifier.verifyApprover({
+        personId: approval.targetPersonId!,
+        clickerPersonId: ident?.personId ?? "",
+        from: { platform: from.platform, accountId: from.accountId, userId: from.userId },
+        approvalId: approval.id,
+        requestId: request?.id,
+        now: this.clock.now(),
+      });
+      level = verdict.level;
+      reason = verdict.reason;
+      ok = verdict.ok && meetsLevel(verdict.level, this.verifier.requiredLevel ?? "im_account");
+    } catch (err) {
+      reason = `verifier_error: ${String(err)}`;
+    }
+    if (!ok) {
+      this.store.audit({
+        at: this.clock.now(),
+        action: "click",
+        result: "unverified_click",
+        agentId: request?.agentId,
+        personId: ident?.personId,
+        requestId: request?.id,
+        detail: { approvalId: approval.id, level, reason },
+      });
+    }
+    return ok;
+  }
+
   /** Mirror a decided approval onto its a2h request (if any). */
   private syncA2hFromApproval(decided: PendingApproval): void {
     const req = this.store.a2hRequestByApproval(decided.id);
@@ -201,8 +289,11 @@ export class SessionGateway {
           ? "expired"
           : by === "cancelled"
             ? "cancelled"
-            : "denied";
+            : by === "failed"
+              ? "failed"
+              : "denied";
     this.store.decideA2hRequest(req.id, state, by, this.clock.now(), { choice: decided.chosen ?? null });
+    this.notifyA2h(req.id);
   }
 
   attach(adapter: Adapter): void {
@@ -235,7 +326,7 @@ export class SessionGateway {
 
   async handle(adapter: Adapter, event: Inbound): Promise<void> {
     if (event.type === "action") {
-      await this.handleAction(event.from, event.actionId, event.value);
+      await this.handleAction(event.from, event.actionId, event.value, event.target);
       return;
     }
     if (event.type !== "message" && event.type !== "command") return;
@@ -282,6 +373,16 @@ export class SessionGateway {
       const conv = this.store.activeConversation(identity.personId, this.clock.now());
       await this.handleStop(adapter, chat, conv.id);
       return;
+    }
+
+    if (event.type === "command" && event.name === "answer") {
+      this.store.touchPresence(identity.personId, chat, this.clock.now());
+      await this.handleAnswerCommand(adapter, chat, from, identity.personId, event.args);
+      return;
+    }
+    if (event.type === "message") {
+      this.store.touchPresence(identity.personId, chat, this.clock.now());
+      if (await this.tryResolve(adapter, chat, from, identity.personId, event.text, event.replyTo)) return;
     }
 
     this.store.touchPresence(identity.personId, chat, this.clock.now());
@@ -834,7 +935,7 @@ export class SessionGateway {
     await adapter.send(chat, { blocks: [{ kind: "markdown", text: `Stopped.${extra}` }] });
   }
 
-  private async renderApproval(approval: PendingApproval, adapter: Adapter, chat: ChatRef): Promise<void> {
+  private async renderApproval(approval: PendingApproval, adapter: Adapter, chat: ChatRef): Promise<MsgRef[]> {
     const buttons = (approval.options.length > 0 ? approval.options : ["approve", "deny"]).map((opt) => ({
       id: opt,
       label: opt === "deny" ? "Deny" : opt === "approve" ? "Approve" : opt,
@@ -847,8 +948,10 @@ export class SessionGateway {
         { kind: "buttons", buttons },
       ],
     });
-    const cards = [...approval.cards, ...refs.map((r) => ({ chat: r.chat, messageId: r.messageId }))];
+    const fresh = this.store.getApproval(approval.id) ?? approval;
+    const cards = [...fresh.cards, ...refs.map((r) => ({ chat: r.chat, messageId: r.messageId }))];
     this.store.setApprovalCards(approval.id, cards);
+    return refs;
   }
 
   private async rerenderApprovals(conversationId: string, adapter: Adapter, chat: ChatRef): Promise<void> {
@@ -876,7 +979,14 @@ export class SessionGateway {
     return { option: actionId, approved: isExplicitApprove(actionId) };
   }
 
-  private async handleAction(from: UserRef, actionId: string, value?: string): Promise<void> {
+  private async handleAction(from: UserRef, actionId: string, value?: string, target?: MsgRef): Promise<void> {
+    if (value && actionId.startsWith("a2h:")) {
+      const req = this.store.getA2hRequest(value);
+      if (req?.kind === "ask") {
+        await this.handleAskChoice(req, from, actionId, target);
+        return;
+      }
+    }
     const approvalId = value && this.store.getApproval(value) ? value : actionId;
     const approval = this.store.getApproval(approvalId);
     if (!approval || approval.state !== "pending") return;
@@ -893,6 +1003,7 @@ export class SessionGateway {
       }
       return;
     }
+    if (approval.targetPersonId && !(await this.verifyApproverClick(approval, from))) return;
     if (approval.expiresAt !== undefined && approval.expiresAt <= this.clock.now()) {
       // Past TTL but not yet swept: fail closed, never honour a late click.
       this.sweepExpired();
@@ -927,6 +1038,572 @@ export class SessionGateway {
     }
   }
 
+  // ---- a2h: agent-facing API (PR 2) ---------------------------------------
+
+  /** Send a one-way message from an agent into its `agent:<name>` topic. */
+  async sendToPerson(opts: {
+    agentId: string;
+    to: string;
+    text: string;
+    route?: A2hRoute;
+    idempotencyKey?: string;
+  }): Promise<A2hView & { messageId?: string; delivered: Array<{ platform: string; ok: boolean }> }> {
+    const { agent, personId } = this.a2hAuthorize(opts.agentId, opts.to, "send");
+    const body = sanitizeAgentText(opts.text);
+    const now = this.clock.now();
+    const conv = this.agentTopic(agent, personId);
+    const { request, replayed } = this.store.createA2hRequest({
+      agentId: agent.id,
+      personId,
+      conversationId: conv.id,
+      kind: "message",
+      payload: { text: body, code: "", quiet: isQuietTime(now, this.quietHours) },
+      expiresAt: now,
+      now,
+      idempotencyKey: opts.idempotencyKey,
+    });
+    if (replayed) return { ...this.a2hView(request), delivered: [] };
+    const surfaces = this.a2hSurfaces(personId, opts.route);
+    const rendered = `${frameHeader(agent.name)}\n\n${body}`;
+    const msg = this.store.appendMessage({
+      conversationId: conv.id,
+      role: "assistant",
+      text: body,
+      surface: surfaces[0],
+      now,
+      author: `agent:${safeAgentName(agent.name)}`,
+      requestId: request.id,
+    });
+    this.store.setA2hPromptMessage(request.id, msg.id);
+    const delivered = await this.a2hDeliver(msg.id, surfaces, { blocks: [{ kind: "markdown", text: rendered }] });
+    const ok = delivered.some((d) => d.ok);
+    this.store.decideA2hRequest(request.id, ok ? "delivered" : "failed", ok ? "hub" : "failed", this.clock.now());
+    this.store.audit({
+      at: now,
+      action: "send",
+      result: ok ? "delivered" : "failed",
+      agentId: agent.id,
+      personId,
+      requestId: request.id,
+    });
+    this.notifyA2h(request.id);
+    return { ...this.a2hView(this.store.getA2hRequest(request.id)!), messageId: msg.id, delivered };
+  }
+
+  /**
+   * Approval card from an agent. Only the asked person's button click counts;
+   * expiry, cancel, failure and unknown buttons all deny (fail-closed).
+   */
+  async createAgentApproval(opts: {
+    agentId: string;
+    to: string;
+    title: string;
+    details?: string;
+    risk?: "low" | "medium" | "high";
+    expiresInS?: number;
+    route?: A2hRoute;
+    idempotencyKey?: string;
+  }): Promise<A2hView> {
+    const { agent, personId } = this.a2hAuthorize(opts.agentId, opts.to, "approve");
+    const title = sanitizeAgentLine(opts.title);
+    if (!title) throw new A2hError("invalid", "title is required");
+    const details = opts.details ? sanitizeAgentText(opts.details) : "";
+    const risk = opts.risk && ["low", "medium", "high"].includes(opts.risk) ? opts.risk : undefined;
+    const ttlS = clampTtlS(opts.expiresInS, A2H_APPROVAL_DEFAULT_S);
+    const now = this.clock.now();
+    const expiresAt = now + ttlS * 1000;
+    const conv = this.agentTopic(agent, personId);
+    const { request, replayed } = this.store.createA2hRequest({
+      agentId: agent.id,
+      personId,
+      conversationId: conv.id,
+      kind: "approval",
+      payload: { title, details, risk, quiet: isQuietTime(now, this.quietHours) },
+      expiresAt,
+      now,
+      idempotencyKey: opts.idempotencyKey,
+    });
+    if (replayed) return this.a2hView(request);
+    const code = shortCode(request.id);
+    const riskLabel = risk ? { low: "低风险", medium: "中风险", high: "⚠️ 高风险" }[risk] : undefined;
+    const card = [
+      frameHeader(agent.name),
+      "",
+      `审批请求：${title}`,
+      ...(details ? ["", details] : []),
+      "",
+      `— 编号 ${code}${riskLabel ? ` · ${riskLabel}` : ""} · 有效至 ${formatLocal(expiresAt)}`,
+      "— 只有点按钮才算数；文字回复不算批准。超时视为拒绝。",
+    ].join("\n");
+    const approval = this.store.createApproval(conv.id, request.id, card, ["approve", "deny"], undefined, now, {
+      targetPersonId: personId,
+      expiresAt,
+      source: "agent",
+    });
+    this.store.setA2hApprovalId(request.id, approval.id);
+    const msg = this.store.appendMessage({
+      conversationId: conv.id,
+      role: "assistant",
+      text: `审批请求：${title}${details ? `\n\n${details}` : ""}`,
+      now,
+      author: `agent:${safeAgentName(agent.name)}`,
+      requestId: request.id,
+    });
+    this.store.setA2hPromptMessage(request.id, msg.id);
+    let sent = 0;
+    for (const surface of this.a2hSurfaces(personId, opts.route)) {
+      const adapter = this.adapterFor(surface);
+      if (!adapter) continue;
+      try {
+        const refs = await this.renderApproval(approval, adapter, surface);
+        for (const ref of refs) this.store.addDelivery(msg.id, ref.chat, ref.messageId);
+        sent += refs.length;
+      } catch (err) {
+        this.logger.warn("a2h approval render failed", { err: String(err), platform: surface.platform });
+      }
+    }
+    if (sent === 0) {
+      const failed = this.store.decideApproval(approval.id, "denied", "failed", this.clock.now(), "deny");
+      if (failed) this.syncA2hFromApproval(failed);
+    }
+    this.store.audit({
+      at: now,
+      action: "approve",
+      result: sent > 0 ? "pending" : "failed",
+      agentId: agent.id,
+      personId,
+      requestId: request.id,
+    });
+    return this.a2hView(this.store.getA2hRequest(request.id)!);
+  }
+
+  /** Ask a question. Replies are untrusted data and never count as approval (Q2). */
+  async askPerson(opts: {
+    agentId: string;
+    to: string;
+    question: string;
+    choices?: string[];
+    allowFreeText?: boolean;
+    expiresInS?: number;
+    route?: A2hRoute;
+    idempotencyKey?: string;
+  }): Promise<A2hView> {
+    const { agent, personId } = this.a2hAuthorize(opts.agentId, opts.to, "ask");
+    const question = sanitizeAgentText(opts.question);
+    if (!question) throw new A2hError("invalid", "question is required");
+    const choices = (opts.choices ?? []).map((c) => sanitizeAgentLine(c, A2H_CHOICE_MAX)).filter(Boolean);
+    if (choices.length > A2H_CHOICES_MAX) throw new A2hError("invalid", `at most ${A2H_CHOICES_MAX} choices`);
+    const allowFreeText = opts.allowFreeText ?? choices.length === 0;
+    if (!allowFreeText && choices.length === 0) throw new A2hError("invalid", "need choices or free text");
+    const ttlS = clampTtlS(opts.expiresInS, A2H_ASK_DEFAULT_S);
+    const now = this.clock.now();
+    const expiresAt = now + ttlS * 1000;
+    const conv = this.agentTopic(agent, personId);
+    const base = { question, choices, allowFreeText, quiet: isQuietTime(now, this.quietHours) };
+    const { request, replayed } = this.store.createA2hRequest({
+      agentId: agent.id,
+      personId,
+      conversationId: conv.id,
+      kind: "ask",
+      payload: base,
+      expiresAt,
+      now,
+      idempotencyKey: opts.idempotencyKey,
+    });
+    if (replayed) return this.a2hView(request);
+    const code = shortCode(request.id);
+    const how = allowFreeText
+      ? `引用回复本消息，或发送 /answer ${code} 你的回答`
+      : "点下面的选项作答";
+    const rendered = [
+      frameHeader(agent.name),
+      "",
+      question,
+      "",
+      `— 问题编号 ${code} · 有效至 ${formatLocal(expiresAt)}`,
+      `— ${how}。你的回答只会转给这个 agent，不会当作批准。`,
+    ].join("\n");
+    this.store.db
+      .prepare("UPDATE a2h_request SET payload = ? WHERE id = ?")
+      .run(JSON.stringify({ ...base, code, rendered }), request.id);
+    const msg = this.store.appendMessage({
+      conversationId: conv.id,
+      role: "assistant",
+      text: question,
+      now,
+      author: `agent:${safeAgentName(agent.name)}`,
+      requestId: request.id,
+    });
+    this.store.setA2hPromptMessage(request.id, msg.id);
+    const blocks: OutMessage["blocks"] = [{ kind: "markdown", text: rendered }];
+    if (choices.length > 0) {
+      blocks.push({
+        kind: "buttons",
+        buttons: choices.map((label, i) => ({ id: `a2h:${i}`, label, value: request.id })),
+      });
+    }
+    const delivered = await this.a2hDeliver(msg.id, this.a2hSurfaces(personId, opts.route), { blocks });
+    if (!delivered.some((d) => d.ok)) {
+      this.store.decideA2hRequest(request.id, "failed", "failed", this.clock.now());
+      this.notifyA2h(request.id);
+    }
+    this.store.audit({
+      at: now,
+      action: "ask",
+      result: delivered.some((d) => d.ok) ? "pending" : "failed",
+      agentId: agent.id,
+      personId,
+      requestId: request.id,
+    });
+    return this.a2hView(this.store.getA2hRequest(request.id)!);
+  }
+
+  /** Withdraw an open request. Cancelling an approval denies it. */
+  async cancelRequest(opts: { agentId: string; requestId: string; reason?: string }): Promise<A2hView> {
+    const req = this.store.getA2hRequest(opts.requestId);
+    if (!req || req.agentId !== opts.agentId) throw new A2hError("not_found", "no such request for this agent");
+    if (req.state !== "pending") return this.a2hView(req);
+    if (req.kind === "approval" && req.approvalId) {
+      const decided = this.store.decideApproval(req.approvalId, "denied", "cancelled", this.clock.now(), "deny");
+      if (decided) {
+        this.syncA2hFromApproval(decided);
+        this.approvalWaiters.get(decided.id)?.resolve("deny");
+        this.approvalWaiters.delete(decided.id);
+        await this.updateApprovalCards(decided, "cancelled");
+      }
+    } else {
+      const decided = this.store.decideA2hRequest(req.id, "cancelled", "cancelled", this.clock.now());
+      if (decided) {
+        this.notifyA2h(req.id);
+        if (req.kind === "ask") await this.closeAskCards(decided, "已撤回");
+      }
+    }
+    this.store.audit({
+      at: this.clock.now(),
+      action: "cancel",
+      result: "cancelled",
+      agentId: req.agentId,
+      personId: req.personId,
+      requestId: req.id,
+      detail: opts.reason ? { reason: opts.reason.slice(0, 200) } : undefined,
+    });
+    return this.a2hView(this.store.getA2hRequest(req.id)!);
+  }
+
+  /** Current state of a request owned by this agent. */
+  getAgentRequest(agentId: string, requestId: string): A2hView {
+    const req = this.store.getA2hRequest(requestId);
+    if (!req || req.agentId !== agentId) throw new A2hError("not_found", "no such request for this agent");
+    return this.a2hView(req);
+  }
+
+  /**
+   * Resolve when any of the requests is terminal or after `waitMs` (via the
+   * gateway clock). `waitMs = 0` is a non-blocking poll.
+   */
+  async waitForRequests(agentId: string, requestIds: string[], waitMs: number): Promise<A2hView[]> {
+    const views = () => requestIds.map((id) => this.getAgentRequest(agentId, id));
+    const done = () => views().some((v) => v.status !== "pending");
+    if (waitMs <= 0 || done()) return views();
+    await new Promise<void>((resolve) => {
+      let finished = false;
+      const finish = () => {
+        if (finished) return;
+        finished = true;
+        for (const id of requestIds) this.a2hListeners.get(id)?.delete(onChange);
+        resolve();
+      };
+      const onChange = () => {
+        if (done()) finish();
+      };
+      for (const id of requestIds) {
+        let set = this.a2hListeners.get(id);
+        if (!set) this.a2hListeners.set(id, (set = new Set()));
+        set.add(onChange);
+      }
+      void this.clock.sleep(waitMs).then(finish);
+    });
+    return views();
+  }
+
+  /**
+   * Route a human DM to an open ask (Q2: quote-reply, /answer, or a lone
+   * recent ask). Returns true when consumed; otherwise the message goes to
+   * the normal turn, with a hint when asks are waiting.
+   */
+  private async tryResolve(
+    adapter: Adapter,
+    chat: ChatRef,
+    from: UserRef,
+    personId: string,
+    text: string,
+    quoted?: MsgRef,
+  ): Promise<boolean> {
+    if (quoted) {
+      const req = this.store.a2hRequestByDelivery(quoted.chat ?? chat, quoted.messageId);
+      if (req && req.personId === personId) {
+        if (req.state !== "pending") {
+          await this.a2hReply(adapter, chat, `编号 ${shortCode(req.id)} 的请求已经结束（${req.state}），这条回复没有转给 agent。`);
+          return true;
+        }
+        if (req.kind === "approval") {
+          this.store.appendMessage({
+            conversationId: req.conversationId,
+            role: "user",
+            text,
+            surface: chat,
+            now: this.clock.now(),
+            requestId: req.id,
+          });
+          this.store.audit({
+            at: this.clock.now(),
+            action: "reply",
+            result: "text_on_approval_ignored",
+            agentId: req.agentId,
+            personId,
+            requestId: req.id,
+          });
+          await this.a2hReply(adapter, chat, "文字回复不算批准。要批准或拒绝，请点审批卡片上的按钮。");
+          return true;
+        }
+        if (req.kind === "ask") {
+          await this.answerAsk(adapter, req, chat, from, text, undefined);
+          return true;
+        }
+      }
+    }
+    const open = this.store.openA2hRequests(personId, "ask");
+    const freeText = open.filter((r) => askPayload(r).allowFreeText);
+    if (freeText.length === 1 && open.length === 1) {
+      const only = freeText[0]!;
+      const last = this.store.lastDeliveryInChat(chat);
+      if (
+        last?.requestId === only.id &&
+        this.clock.now() - last.createdAt <= A2H_FALLBACK_WINDOW_MS
+      ) {
+        await this.answerAsk(adapter, only, chat, from, text, undefined);
+        return true;
+      }
+    }
+    if (open.length > 0) {
+      const codes = open.map((r) => shortCode(r.id)).join("、");
+      await this.a2hReply(
+        adapter,
+        chat,
+        `有 ${open.length} 个 agent 的问题待回答（${codes}）。这条消息按普通对话处理；要回答请引用回复那条问题，或发送 /answer <编号> 你的回答。`,
+      );
+    }
+    return false;
+  }
+
+  private async handleAnswerCommand(
+    adapter: Adapter,
+    chat: ChatRef,
+    from: UserRef,
+    personId: string,
+    args: string,
+  ): Promise<void> {
+    const m = /^\s*(\S+)\s*([\s\S]*)$/.exec(args ?? "");
+    const code = m?.[1]?.toLowerCase();
+    const answer = (m?.[2] ?? "").trim();
+    if (!code || !answer) {
+      await this.a2hReply(adapter, chat, "用法：/answer <编号> 你的回答");
+      return;
+    }
+    const matches = this.store.openA2hRequests(personId, "ask").filter((r) => shortCode(r.id) === code);
+    if (matches.length !== 1) {
+      await this.a2hReply(adapter, chat, `没有找到编号为 ${code} 的待回答问题。`);
+      return;
+    }
+    await this.answerAsk(adapter, matches[0]!, chat, from, answer, undefined);
+  }
+
+  private async handleAskChoice(req: A2hRequest, from: UserRef, actionId: string, target?: MsgRef): Promise<void> {
+    const ident = this.store.findIdentity(from.platform, from.accountId, from.userId);
+    if (!ident || ident.personId !== req.personId) {
+      this.store.audit({
+        at: this.clock.now(),
+        action: "click",
+        result: "forbidden_click",
+        agentId: req.agentId,
+        personId: ident?.personId,
+        requestId: req.id,
+        detail: { from: identityKey(from.platform, from.accountId, from.userId) },
+      });
+      return;
+    }
+    if (req.state !== "pending") return;
+    if (req.expiresAt <= this.clock.now()) {
+      this.sweepExpired();
+      return;
+    }
+    const idx = Number(actionId.slice("a2h:".length));
+    const choice = askPayload(req).choices[idx];
+    if (choice === undefined) return; // unknown button: ignore, request stays open until expiry
+    const chat = target?.chat ?? this.store.lastSurface(req.personId);
+    const adapter = chat ? this.adapterFor(chat) : undefined;
+    await this.answerAsk(adapter, req, chat, from, choice, choice);
+  }
+
+  private async answerAsk(
+    adapter: Adapter | undefined,
+    req: A2hRequest,
+    chat: ChatRef | undefined,
+    from: UserRef,
+    text: string,
+    choice: string | undefined,
+  ): Promise<void> {
+    const now = this.clock.now();
+    if (req.expiresAt <= now) {
+      this.sweepExpired();
+      if (adapter && chat) await this.a2hReply(adapter, chat, `编号 ${shortCode(req.id)} 的问题已过期，回答没有转给 agent。`);
+      return;
+    }
+    const payload = askPayload(req);
+    let picked = choice;
+    if (picked === undefined && payload.choices.length > 0) {
+      picked = payload.choices.find((c) => c.toLowerCase() === text.trim().toLowerCase());
+    }
+    if (!payload.allowFreeText && picked === undefined) {
+      if (adapter && chat) await this.a2hReply(adapter, chat, "这个问题只接受选项，请点消息下面的按钮。");
+      return;
+    }
+    const answer = {
+      choice: picked ?? null,
+      text,
+      via: chat?.platform ?? from.platform,
+      at: isoLocal(now),
+      untrusted: true as const,
+    };
+    const decided = this.store.decideA2hRequest(
+      req.id,
+      "answered",
+      identityKey(from.platform, from.accountId, from.userId),
+      now,
+      answer,
+    );
+    if (!decided) return; // lost the race: first answer wins, no side effects
+    const msg = this.store.appendMessage({
+      conversationId: req.conversationId,
+      role: "user",
+      text,
+      surface: chat,
+      now,
+      requestId: req.id,
+    });
+    this.store.setA2hAnswerMessage(req.id, msg.id);
+    this.store.audit({ at: now, action: "answer", result: "answered", agentId: req.agentId, personId: req.personId, requestId: req.id });
+    this.notifyA2h(req.id);
+    await this.closeAskCards(decided, "已回答");
+    const agent = this.store.getAgent(req.agentId);
+    if (adapter && chat) await this.a2hReply(adapter, chat, `已转给 agent「${safeAgentName(agent?.name ?? "?")}」。`);
+  }
+
+  private async closeAskCards(req: A2hRequest, label: string): Promise<void> {
+    const promptId = this.store.a2hPromptMessageId(req.id);
+    if (!promptId) return;
+    const rendered = (askPayload(req).rendered ?? "").trim();
+    const text = `${rendered}\n\n_${label}_`.trim();
+    for (const ref of this.store.deliveriesFor(promptId)) {
+      const dest = this.adapterFor(ref.chat);
+      await dest?.edit(ref, { blocks: [{ kind: "markdown", text }] }).catch(() => undefined);
+    }
+  }
+
+  private async a2hReply(adapter: Adapter, chat: ChatRef, text: string): Promise<void> {
+    await adapter.send(chat, { blocks: [{ kind: "markdown", text }] }).catch(() => undefined);
+  }
+
+  private a2hAuthorize(agentId: string, to: string, scope: A2hScope): { agent: AgentRecord; personId: string } {
+    const agent = this.store.getAgent(agentId);
+    if (!agent) throw new A2hError("unknown_agent", "unknown agent");
+    if (agent.revokedAt !== undefined) throw new A2hError("revoked", "agent token revoked");
+    let personId: string;
+    if (this.store.getPerson(to)) {
+      personId = to;
+    } else {
+      const byName = this.store.personsByName(to);
+      if (byName.length === 0) throw new A2hError("unknown_person", "no such person");
+      if (byName.length > 1) throw new A2hError("ambiguous_person", "name matches more than one person");
+      personId = byName[0]!.id;
+    }
+    if (!this.isA2hTargetAllowed(personId) || !this.store.agentScopes(agent.id, personId).includes(scope)) {
+      this.store.audit({ at: this.clock.now(), action: scope, result: "forbidden", agentId: agent.id, personId });
+      throw new A2hError("forbidden", `agent may not ${scope} this person`);
+    }
+    return { agent, personId };
+  }
+
+  private agentTopic(agent: AgentRecord, personId: string) {
+    return this.store.agentConversation(personId, agent.id, agentTopicTitle(agent.name), this.clock.now());
+  }
+
+  /** v1: DMs only, only adapters that can send proactively. Last active surface first. */
+  private a2hSurfaces(personId: string, route: A2hRoute = "last_active"): ChatRef[] {
+    const out: ChatRef[] = [];
+    const seen = new Set<string>();
+    const add = (c: ChatRef | undefined) => {
+      if (!c || c.kind !== "dm") return;
+      const adapter = this.adapterFor(c);
+      if (!adapter || adapter.capabilities.proactiveSend === false) return;
+      const k = `${c.platform}:${c.accountId}`;
+      if (seen.has(k)) return; // one DM per bot account
+      seen.add(k);
+      out.push(c);
+    };
+    add(this.store.lastSurface(personId));
+    for (const ident of this.store.listIdentities(personId)) {
+      add({ platform: ident.platform, accountId: ident.accountId, chatId: ident.userId, kind: "dm" });
+    }
+    const picked =
+      route === "all" ? out : route === "last_active" ? out.slice(0, 1) : out.filter((c) => c.platform === route);
+    if (picked.length === 0) throw new A2hError("no_surface", "no reachable DM for this person");
+    return picked;
+  }
+
+  private async a2hDeliver(
+    messageId: string,
+    surfaces: ChatRef[],
+    msg: OutMessage,
+  ): Promise<Array<{ platform: string; ok: boolean }>> {
+    const out: Array<{ platform: string; ok: boolean }> = [];
+    for (const surface of surfaces) {
+      const adapter = this.adapterFor(surface);
+      if (!adapter) continue;
+      try {
+        const refs = await adapter.send(surface, msg);
+        for (const ref of refs) this.store.addDelivery(messageId, ref.chat, ref.messageId);
+        out.push({ platform: surface.platform, ok: refs.length > 0 });
+      } catch (err) {
+        this.logger.warn("a2h send failed", { err: String(err), platform: surface.platform });
+        out.push({ platform: surface.platform, ok: false });
+      }
+    }
+    return out;
+  }
+
+  private notifyA2h(id: string): void {
+    for (const fn of [...(this.a2hListeners.get(id) ?? [])]) fn();
+  }
+
+  private a2hView(req: A2hRequest): A2hView {
+    const by = req.decidedBy && req.decidedBy.split(":").length === 3 ? req.decidedBy : undefined;
+    const answer = req.kind === "ask" && req.state === "answered" ? (req.answer as A2hView["answer"]) : null;
+    return {
+      requestId: req.id,
+      code: req.kind === "message" ? "" : shortCode(req.id),
+      kind: req.kind,
+      status: req.state,
+      approved: req.kind === "approval" && req.state === "approved",
+      conversationId: req.conversationId,
+      expiresAt: isoLocal(req.expiresAt),
+      decidedAt: req.decidedAt !== undefined ? isoLocal(req.decidedAt) : null,
+      decidedBy: by ? { personId: req.personId, via: by.split(":")[0]! } : null,
+      answer: answer ?? null,
+      quiet: Boolean((req.payload as { quiet?: boolean } | null)?.quiet),
+    };
+  }
+
   private lane(key: string, fn: () => Promise<void>): Promise<void> {
     const prev = this.lanes.get(key) ?? Promise.resolve();
     const next = prev.then(fn, fn);
@@ -938,6 +1615,23 @@ export class SessionGateway {
     );
     return next;
   }
+}
+
+export type A2hRoute = "last_active" | "all" | (string & {});
+
+function askPayload(req: A2hRequest): {
+  question: string;
+  choices: string[];
+  allowFreeText: boolean;
+  rendered?: string;
+} {
+  const p = (req.payload ?? {}) as { question?: string; choices?: string[]; allowFreeText?: boolean; rendered?: string };
+  return {
+    question: p.question ?? "",
+    choices: Array.isArray(p.choices) ? p.choices : [],
+    allowFreeText: p.allowFreeText !== false,
+    rendered: p.rendered,
+  };
 }
 
 function sameSurface(a: ChatRef, b: ChatRef): boolean {
