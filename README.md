@@ -8,6 +8,8 @@ Packages are **ESM-only** (Node 20+). The npm name `imwire` is the `imwire serve
 
 Wiring a real bot to pi: follow [`INSTALL.md`](INSTALL.md) (credentials, env, verify, errors).
 
+Positioning and design: [`docs/design.md`](docs/design.md).
+
 ## 30 秒看懂 imwire
 
 三层，从上到下互不倒依赖：L1 只说话，L2 认得「人」，L3 才是模型。
