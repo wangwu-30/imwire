@@ -30,6 +30,7 @@ import {
   interactiveContent,
 } from "./cards.js";
 import { createFeishuHttp, type FeishuFetch, type FeishuHttp } from "./http.js";
+import { FeishuDualDelivery } from "./dual-delivery.js";
 import { mapFeishuEvent } from "./map.js";
 import { createSdkRealtime, type FeishuRealtime } from "./realtime.js";
 import { asString } from "./util.js";
@@ -73,6 +74,7 @@ export class FeishuAdapter implements Adapter, Connectable {
   readonly capabilities: Capabilities = feishuCapabilities;
   readonly accountId: string;
   private readonly runtime: AdapterRuntime;
+  private readonly dualDelivery: FeishuDualDelivery;
   private readonly http: FeishuHttp;
   private readonly draftThrottleMs: number;
   private readonly createRealtime: () => Promise<FeishuRealtime>;
@@ -82,6 +84,7 @@ export class FeishuAdapter implements Adapter, Connectable {
 
   constructor(opts: FeishuAdapterOptions) {
     this.accountId = opts.accountId ?? opts.appId;
+    this.dualDelivery = new FeishuDualDelivery(opts.appId);
     this.http = opts.http ?? createFeishuHttp({
       appId: opts.appId,
       appSecret: opts.appSecret,
@@ -139,6 +142,7 @@ export class FeishuAdapter implements Adapter, Connectable {
   async ingest(raw: unknown, eventType?: string, opts?: { wait?: boolean }): Promise<void> {
     const events = mapFeishuEvent(raw, { accountId: this.accountId, botOpenId: this.botOpenId }, eventType);
     for (const event of events) {
+      if (!(await this.dualDelivery.accept(event))) continue;
       if (event.type === "message" || event.type === "command") {
         this.chatKinds.set(event.chat.chatId, event.chat.kind);
       }
