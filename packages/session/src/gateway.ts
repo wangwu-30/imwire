@@ -1,3 +1,4 @@
+import { proactiveFailure, proactiveText, type ProactiveResult } from "./proactive.js";
 import { timingSafeEqual } from "node:crypto";
 import {
   noopLogger,
@@ -78,6 +79,8 @@ const RESTART_LABEL = "已失效（hub 重启）";
 
 export interface SessionGatewayOptions {
   dbPath: string;
+  /** Ordered proactive channels. WeCom is always excluded. */
+  preferredChannels?: Array<"telegram" | "feishu">;
   driver: AgentDriver;
   allowlist?: OwnerAllowlistEntry[];
   clock?: Clock;
@@ -140,6 +143,8 @@ interface ApprovalWaiter {
 
 export class SessionGateway {
   readonly store: SessionStore;
+  private readonly preferredChannels: Array<"telegram" | "feishu">;
+  private readonly proactivePending = new Map<string, Promise<ProactiveResult>>();
   private readonly driver: AgentDriver;
   private readonly allowlist: OwnerAllowlistEntry[];
   private readonly clock: Clock;
@@ -167,6 +172,7 @@ export class SessionGateway {
   constructor(opts: SessionGatewayOptions) {
     this.store = new SessionStore(opts.dbPath);
     this.driver = opts.driver;
+    this.preferredChannels = opts.preferredChannels ?? ["telegram", "feishu"];
     this.allowlist = opts.allowlist ?? [];
     this.clock = opts.clock ?? systemClock();
     this.logger = opts.logger ?? noopLogger;
@@ -566,8 +572,13 @@ export class SessionGateway {
     return n;
   }
 
-  attach(adapter: Adapter): void {
+  /** Register outbound access without subscribing to inbound DMs or boot recovery. */
+  registerAdapter(adapter: Adapter): void {
     this.adapters.set(`${adapter.platform}:${adapter.accountId}`, adapter);
+  }
+
+  attach(adapter: Adapter): void {
+    this.registerAdapter(adapter);
     adapter.on(async (event) => {
       try {
         await this.handle(adapter, event);
@@ -679,21 +690,75 @@ export class SessionGateway {
     await this.acceptTurn(adapter, conv.id, identity.personId, chat, from, text, replyTo);
   }
 
-  async sendProactive(personId: string, text: string): Promise<void> {
-    const surface = this.store.lastSurface(personId);
-    if (!surface) return;
-    const adapter = this.adapterFor(surface);
-    if (!adapter) return;
-    const conv = this.store.activeConversation(personId, this.clock.now());
-    const msg = this.store.appendMessage({
-      conversationId: conv.id,
-      role: "assistant",
-      text,
-      surface,
-      now: this.clock.now(),
+  async sendProactive(personId: string, text: string): Promise<ProactiveResult> {
+    const result = await this.sendProactiveTo(personId, text);
+    if (result.status !== "delivered") {
+      this.logger.warn("proactive delivery failed", {
+        status: result.status, channel: result.channel,
+        code: result.status === "dead" ? result.detail : result.reason,
+      });
+    }
+    return result;
+  }
+
+  async sendProactiveTo(personId: string, text: string, opts: { idempotencyKey?: string } = {}): Promise<ProactiveResult> {
+    const key = opts.idempotencyKey;
+    if (!key) return this.deliverProactive(personId, text);
+    const pending = this.proactivePending.get(key);
+    if (pending) return pending;
+    const run = this.deliverProactive(personId, text, key);
+    this.proactivePending.set(key, run);
+    try { return await run; }
+    finally { this.proactivePending.delete(key); }
+  }
+
+  private async deliverProactive(personId: string, text: string, key?: string): Promise<ProactiveResult> {
+    const prior = key ? this.store.getOutboxDelivery(key) : undefined;
+    if (prior?.status === "delivered" && prior.refs[0]) {
+      return { status: "delivered", surface: prior.refs[0].chat, refs: prior.refs };
+    }
+    const identities = this.store.listIdentities(personId);
+    const last = this.store.lastSurface(personId);
+    let surface: ChatRef | undefined;
+    let adapter: Adapter | undefined;
+    for (const channel of this.preferredChannels) {
+      // Runtime config is not necessarily typed; never allow WeCom here.
+      if (channel !== "telegram" && channel !== "feishu") continue;
+      for (const ident of identities.filter((id) => id.platform === channel)) {
+        const candidate: ChatRef = last?.platform === channel && last.accountId === ident.accountId && last.kind === "dm"
+          ? last : { platform: channel, accountId: ident.accountId, chatId: ident.userId, kind: "dm" };
+        const a = this.adapterFor(candidate);
+        if (!a || a.capabilities.proactiveSend !== true || a.isAlive?.() === false) continue;
+        surface = candidate;
+        adapter = a;
+        break;
+      }
+      if (surface) break;
+    }
+    if (!surface || !adapter) {
+      const reason = identities.length ? "unsupported" : "no_surface";
+      return { status: "dead", reason, detail: reason };
+    }
+    const cleaned = proactiveText(text);
+    let refs: MsgRef[];
+    try {
+      refs = await adapter.send(surface, { blocks: [{ kind: "text", text: cleaned }] }, { maxAttempts: 1 });
+      if (!refs.length) return { status: "dead", reason: "permanent", detail: "empty_refs", channel: surface.platform };
+    } catch (err) {
+      return { ...proactiveFailure(err, this.clock.now()), channel: surface.platform };
+    }
+    const now = this.clock.now();
+    const conv = this.store.activeConversation(personId, now);
+    const msg = this.store.appendMessage({ conversationId: conv.id, role: "assistant", text: cleaned, surface, now });
+    // Delivery references and the durable dedup marker commit together.
+    this.store.db.transaction(() => {
+      for (const ref of refs) this.store.addDelivery(msg.id, ref.chat, ref.messageId);
+      if (key) this.store.putOutboxDelivery({
+        outboxId: key, status: "delivered", attempts: prior?.attempts ?? 1,
+        nextTryAt: null, refs, updatedAt: now, channel: surface.platform,
+      });
     });
-    const refs = await adapter.send(surface, { blocks: [{ kind: "markdown", text }] });
-    for (const ref of refs) this.store.addDelivery(msg.id, ref.chat, ref.messageId);
+    return { status: "delivered", surface, refs };
   }
 
   private async recoverInterrupted(): Promise<void> {

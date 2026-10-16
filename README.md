@@ -10,6 +10,8 @@ Wiring a real bot to pi: follow [`INSTALL.md`](INSTALL.md) (credentials, env, ve
 
 Positioning and design: [`docs/design.md`](docs/design.md).
 
+Optional file outbox delivery in `imwire serve`: [`docs/outbox-bridge.md`](docs/outbox-bridge.md).
+
 ## 30 秒看懂 imwire
 
 三层，从上到下互不倒依赖：L1 只说话，L2 认得「人」，L3 才是模型。

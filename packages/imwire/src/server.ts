@@ -1,4 +1,9 @@
-import type { Adapter, ChatRef, Inbound } from "@imwire/core";
+import { mkdirSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { homedir } from "node:os";
+import { OutboxBridge, SessionGateway, type OutboxBridgeOptions } from "@imwire/session";
+import { NoChatDriver } from "./hub/hub.js";
+import type { Adapter, ChatRef, Inbound, Logger } from "@imwire/core";
 import {
   MAX_RPC_BYTES,
   PROTOCOL_VERSION,
@@ -20,6 +25,11 @@ export type RpcReply = (msg: JsonRpcMessage) => void;
 
 export interface ServeOptions {
   adapters: Adapter[];
+  outboxBridge?: OutboxBridgeOptions;
+  /** Existing person/identity database; defaults to IMWIRE_DB or ~/.imwire/hub.sqlite. */
+  dbPath?: string;
+  preferredChannels?: Array<"telegram" | "feishu">;
+  logger?: Logger;
   write?: RpcReply;
 }
 
@@ -29,7 +39,7 @@ export interface ServeHost {
   subscribe: (write: RpcReply) => void;
   unsubscribe: (write: RpcReply) => void;
   start: (signal: AbortSignal) => Promise<void>;
-  stop: () => void;
+  stop: () => Promise<void>;
 }
 
 interface ClientState {
@@ -39,6 +49,26 @@ interface ClientState {
 }
 
 export function createServeHost(opts: ServeOptions): ServeHost {
+  let gateway: SessionGateway | undefined;
+  let bridge: OutboxBridge | undefined;
+  if (opts.outboxBridge?.enabled) {
+    if (!opts.outboxBridge.dir) throw new Error("outboxBridge.dir is required when enabled");
+    const dbPath = opts.dbPath ?? process.env.IMWIRE_DB ?? join(process.env.IMWIRE_HOME ?? join(homedir(), ".imwire"), "hub.sqlite");
+    if (dbPath !== ":memory:") mkdirSync(dirname(dbPath), { recursive: true });
+    gateway = new SessionGateway({ dbPath, driver: new NoChatDriver(), logger: opts.logger,
+      preferredChannels: opts.preferredChannels, bootExpiry: false, sweepIntervalMs: 0 });
+    try { bridge = new OutboxBridge(gateway, opts.outboxBridge, opts.logger); }
+    catch (err) { gateway.close(); throw err; }
+    // Serve continues broadcasting inbound events to RPC clients; no chat driver is attached.
+    for (const adapter of opts.adapters) gateway.registerAdapter(adapter);
+  }
+  let stopping: Promise<void> | undefined;
+  const stop = (): Promise<void> => stopping ??= (async () => {
+    await bridge?.stop();
+    gateway?.close();
+    drafts.clear();
+    clients.clear();
+  })();
   const drafts = new Map<string, DraftRecord>();
   let draftSeq = 0;
   const adapters = opts.adapters;
@@ -237,11 +267,17 @@ export function createServeHost(opts: ServeOptions): ServeHost {
       if (c) c.subscribed = false;
     },
     async start(signal) {
-      await Promise.all(adapters.map((a) => a.start(signal)));
+      if (signal.aborted) { await stop(); return; }
+      const onAbort = () => { void stop(); };
+      signal.addEventListener("abort", onAbort, { once: true });
+      try {
+        await bridge?.start();
+        if (!signal.aborted) await Promise.all(adapters.map((a) => a.start(signal)));
+      } finally {
+        signal.removeEventListener("abort", onAbort);
+        await stop();
+      }
     },
-    stop() {
-      drafts.clear();
-      clients.clear();
-    },
+    stop,
   };
 }

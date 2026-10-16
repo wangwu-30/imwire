@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+### Outbox delivery bridge
+
+- Added an opt-in `outboxBridge` to `imwire serve --config`: atomic file claiming,
+  SQLite delivery deduplication, bounded durable retries, crash recovery and atomic
+  `chat-results` receipts. See [the configuration and file format](docs/outbox-bridge.md).
+- Added `SessionGateway.sendProactiveTo()` with explicit delivered/retrying/dead results,
+  configurable Telegram → Feishu preference, online/capability checks, and WeCom exclusion.
+- Fixed legacy `sendProactive()` silently dropping messages without a surface: it now
+  delegates, returns a result and warns on failure.
+- Added literal text blocks for Telegram and Feishu so untrusted outbox text bypasses
+  Markdown rendering; bridge retries are not multiplied by adapter retries.
+- `delivered` means IM delivery acknowledgment, never a2h `received` or human acknowledgment.
+
 ### a2h: agent-protocol v0 (PR 4)
 
 - Event log rows written before v0 envelopes existed have no stored event id. Their id is derived as

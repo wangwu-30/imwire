@@ -53,6 +53,7 @@ export interface Button {
 }
 
 export type Block =
+  | { kind: "text"; text: string }
   | { kind: "markdown"; text: string }
   | { kind: "buttons"; buttons: Button[] }
   | { kind: "status"; text: string };
@@ -149,13 +150,19 @@ export interface Capabilities {
 
 export type InboundHandler = (event: Inbound) => Promise<void>;
 
+export interface SendOptions {
+  /** Let a durable caller own retries instead of retrying within send(). */
+  maxAttempts?: number;
+}
+
 export interface Adapter {
   readonly platform: Platform;
   readonly accountId: string;
   readonly capabilities: Capabilities;
+  isAlive?(): boolean;
   start(signal: AbortSignal): Promise<void>;
   on(handler: InboundHandler): void;
-  send(chat: ChatRef, msg: OutMessage): Promise<MsgRef[]>;
+  send(chat: ChatRef, msg: OutMessage, opts?: SendOptions): Promise<MsgRef[]>;
   edit(ref: MsgRef, msg: OutMessage): Promise<void>;
   draft(chat: ChatRef, opts?: { replyTo?: MsgRef }): Promise<DraftHandle>;
   typing(chat: ChatRef): Promise<void>;

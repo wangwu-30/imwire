@@ -116,10 +116,10 @@ export class AdapterRuntime {
     await Promise.all([...this.queues.values()]);
   }
 
-  async outbound<T>(chat: ChatRef, fn: () => Promise<T>): Promise<T> {
+  async outbound<T>(chat: ChatRef, fn: () => Promise<T>, opts?: { maxAttempts?: number }): Promise<T> {
     await this.limiter.take(chatKey(chat));
     try {
-      return await withRetry(fn, this.retry);
+      return await withRetry(fn, { ...this.retry, ...opts });
     } catch (err) {
       const wait = (this.retry.retryAfterMs ?? retryAfterMs)(err);
       if (wait && wait > 0) this.limiter.cooldown(chatKey(chat), wait);

@@ -6,6 +6,7 @@ import {
   createStreamingDraft,
   markdownText,
   statusText,
+  type SendOptions,
   type Adapter,
   type Button,
   type Capabilities,
@@ -159,12 +160,24 @@ export class FeishuAdapter implements Adapter, Connectable {
   }
 
   /**
-   * Always send interactive cards. Feishu `PATCH /im/v1/messages` only accepts
+   * Markdown/buttons use interactive cards. Plain text uses msg_type=text. Feishu `PATCH /im/v1/messages` only accepts
    * cards (`editScope: "cards"`); cards also render markdown.
    */
-  async send(chat: ChatRef, msg: OutMessage): Promise<MsgRef[]> {
+  async send(chat: ChatRef, msg: OutMessage, opts?: SendOptions): Promise<MsgRef[]> {
     assertChatPlatform(this, chat);
     this.chatKinds.set(chat.chatId, chat.kind);
+    // Plain blocks must never pass through the Markdown card renderer.
+    if (msg.blocks.some((b) => b.kind === "text")) {
+      if (msg.blocks.some((b) => b.kind !== "text")) throw new Error("text blocks cannot be mixed with cards");
+      const text = msg.blocks.map((b) => b.kind === "text" ? b.text : "").join("\n\n");
+      const refs: MsgRef[] = [];
+      for (const chunk of chunkText(text || "…", this.capabilities.maxTextLength)) {
+        const created = await this.runtime.outbound(chat, () =>
+          this.createMessage(chat, "text", JSON.stringify({ text: chunk }), msg.replyTo), opts);
+        refs.push(toRef(chat, created));
+      }
+      return refs;
+    }
     const buttons = collectButtons(msg);
     const text = [markdownText(msg), statusText(msg)].filter(Boolean).join("\n\n") || "…";
     const chunks = chunkText(text, this.capabilities.maxTextLength);
@@ -178,6 +191,7 @@ export class FeishuAdapter implements Adapter, Connectable {
       });
       const created = await this.runtime.outbound(chat, () =>
         this.createMessage(chat, "interactive", interactiveContent(card), i === 0 ? msg.replyTo : undefined),
+        opts,
       );
       refs.push(toRef(chat, created));
     }
@@ -298,7 +312,7 @@ export class FeishuAdapter implements Adapter, Connectable {
     return this.http.request<CreatedMessage>({
       method: "POST",
       path: "/open-apis/im/v1/messages",
-      query: { receive_id_type: "chat_id" },
+      query: { receive_id_type: msgType === "text" && chat.kind === "dm" && chat.chatId.startsWith("ou_") ? "open_id" : "chat_id" },
       body: { receive_id: chat.chatId, content, msg_type: msgType },
     });
   }

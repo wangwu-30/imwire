@@ -64,3 +64,7 @@ export type {
   TurnSink,
   UserTurn,
 } from "./types.js";
+
+export { proactiveText, type ProactiveResult } from "./proactive.js";
+export type { OutboxDelivery } from "./store.js";
+export { OutboxBridge, isOutboxItem, type OutboxBridgeOptions, type OutboxItem, type OutboxResult } from "./outbox-bridge.js";
