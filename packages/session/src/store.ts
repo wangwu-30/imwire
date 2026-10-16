@@ -1,4 +1,4 @@
-import type { ChatRef } from "@imwire/core";
+import type { ChatRef, MsgRef } from "@imwire/core";
 import { groupKey, hashPairCode, identityKey, newId, pairCode } from "./ids.js";
 import { openSqlite, type SqlDatabase } from "./sqlite.js";
 import { randomBytes } from "node:crypto";
@@ -305,6 +305,17 @@ CREATE TABLE IF NOT EXISTS telegram_callback (
 );
 `;
 
+export interface OutboxDelivery {
+  outboxId: string;
+  status: "delivered" | "retrying" | "dead";
+  attempts: number;
+  nextTryAt: number | null;
+  refs: MsgRef[];
+  updatedAt: number;
+  reason?: string;
+  channel?: string;
+}
+
 export class SessionStore {
   readonly db: SqlDatabase;
 
@@ -397,6 +408,17 @@ CREATE INDEX IF NOT EXISTS approval_pending_expiry
   ON approval(state, expires_at);
 CREATE UNIQUE INDEX IF NOT EXISTS audit_log_eid ON audit_log(eid) WHERE eid IS NOT NULL;
 CREATE INDEX IF NOT EXISTS audit_log_request ON audit_log(request_id, id);
+-- Additive migration, also applied when opening an existing session database.
+CREATE TABLE IF NOT EXISTS outbox_deliveries (
+  outbox_id TEXT PRIMARY KEY,
+  status TEXT NOT NULL CHECK(status IN ('delivered', 'retrying', 'dead')),
+  attempts INTEGER NOT NULL,
+  next_try_at INTEGER,
+  refs TEXT NOT NULL,
+  updated_at INTEGER NOT NULL,
+  reason TEXT,
+  channel TEXT
+);
 CREATE TABLE IF NOT EXISTS hub_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS a2h_receipt (
   id TEXT PRIMARY KEY,
@@ -425,6 +447,31 @@ CREATE INDEX IF NOT EXISTS a2h_request_execution ON a2h_request(state, decided_a
 
   close(): void {
     this.db.close();
+  }
+
+  getOutboxDelivery(outboxId: string): OutboxDelivery | undefined {
+    const row = this.db.prepare<{
+      outbox_id: string; status: OutboxDelivery["status"]; attempts: number;
+      next_try_at: number | null; refs: string; updated_at: number;
+      reason: string | null; channel: string | null;
+    }>("SELECT * FROM outbox_deliveries WHERE outbox_id = ?").get(outboxId);
+    return row ? {
+      outboxId: row.outbox_id, status: row.status, attempts: row.attempts,
+      nextTryAt: row.next_try_at, refs: JSON.parse(row.refs) as MsgRef[],
+      updatedAt: row.updated_at, reason: row.reason ?? undefined, channel: row.channel ?? undefined,
+    } : undefined;
+  }
+
+  putOutboxDelivery(row: OutboxDelivery): void {
+    this.db.prepare(`INSERT INTO outbox_deliveries
+      (outbox_id, status, attempts, next_try_at, refs, updated_at, reason, channel)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(outbox_id) DO UPDATE SET status=excluded.status, attempts=excluded.attempts,
+      next_try_at=excluded.next_try_at, refs=excluded.refs, updated_at=excluded.updated_at,
+      reason=excluded.reason, channel=excluded.channel`).run(
+      row.outboxId, row.status, row.attempts, row.nextTryAt, JSON.stringify(row.refs),
+      row.updatedAt, row.reason ?? null, row.channel ?? null,
+    );
   }
 
   createPerson(name: string | undefined, now: number): PersonRecord {

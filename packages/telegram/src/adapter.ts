@@ -6,6 +6,7 @@ import {
   createStreamingDraft,
   markdownText,
   statusText,
+  type SendOptions,
   type Adapter,
   type Capabilities,
   type ChatRef,
@@ -153,9 +154,9 @@ export class TelegramAdapter implements Adapter, Connectable {
     await this.runtime.flush();
   }
 
-  async send(chat: ChatRef, msg: OutMessage): Promise<MsgRef[]> {
+  async send(chat: ChatRef, msg: OutMessage, opts?: SendOptions): Promise<MsgRef[]> {
     assertChatPlatform(this, chat);
-    const text = [markdownText(msg), statusText(msg)].filter(Boolean).join("\n\n") || "…";
+    const text = [msg.blocks.filter((b) => b.kind === "text").map((b) => b.text).join("\n\n"), markdownText(msg), statusText(msg)].filter(Boolean).join("\n\n") || "…";
     const chunks = chunkText(text, this.capabilities.maxTextLength);
     const buttons = collectButtons(msg);
     const refs: MsgRef[] = [];
@@ -172,6 +173,7 @@ export class TelegramAdapter implements Adapter, Connectable {
               : undefined,
           reply_markup: isLast && buttons.length > 0 ? inlineKeyboard(buttons, this.callbackTable) : undefined,
         }),
+        opts,
       );
       refs.push(toRef(chat, sent));
     }

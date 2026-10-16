@@ -166,7 +166,7 @@ export const outboundSchema = {
             type: "object",
             additionalProperties: false,
             required: ["kind", "text"],
-            properties: { kind: { const: "markdown" }, text: { type: "string" } },
+            properties: { kind: { enum: ["markdown", "text"] }, text: { type: "string" } },
           },
           {
             type: "object",

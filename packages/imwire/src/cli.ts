@@ -1,3 +1,5 @@
+import { readFile } from "node:fs/promises";
+import type { ServeOptions } from "./server.js";
 import { onShutdownSignal } from "@imwire/core";
 import { loadAdaptersFromEnv, parseAdapterList, type AdapterName } from "./env.js";
 import { runHubCli } from "./hub/commands.js";
@@ -37,7 +39,7 @@ async function main(): Promise<void> {
   }
   if (cmd === "help" || cmd === "--help" || cmd === "-h") {
     console.error(`imwire hub|owner|agent|policy|audit ...   (a2h hub; run: imwire help)
-imwire serve --adapter NAME ... [--ws [port]] [--ws-host host] [--ws-token TOKEN] [--ws-allow-remote]
+imwire serve --adapter NAME ... [--config PATH] [--ws [port]] [--ws-host host] [--ws-token TOKEN] [--ws-allow-remote]
 
 Runs named IM adapters and speaks JSON-RPC 2.0 over stdio (newline-delimited).
 Adapters are NEVER inferred from leftover tokens — pass --adapter / IMWIRE_ADAPTERS.
@@ -52,6 +54,9 @@ See docs/protocol.md.`);
     return;
   }
 
+  const configPath = flagValue("--config");
+  const config: Pick<ServeOptions, "outboxBridge" | "dbPath" | "preferredChannels"> = configPath
+    ? JSON.parse(await readFile(configPath, "utf8")) : {};
   const enabled = collectAdapters();
   if (enabled.length === 0) {
     console.error("imwire serve: set IMWIRE_ADAPTERS=telegram,feishu or pass --adapter telegram (tokens alone are ignored).");
@@ -96,8 +101,8 @@ See docs/protocol.md.`);
   const { host } = serveStdio(adapters, process.stdin, process.stdout, () => {
     process.stderr.write("imwire serve: stdin closed, exiting\n");
     ac.abort();
-    process.exit(0);
-  });
+    process.exit(0); // serveStdio has already drained the bridge and closed its store.
+  }, { ...config, logger: stderrLogger });
 
   if (wsPort !== undefined) {
     const ws = await attachWebSocket(host, {

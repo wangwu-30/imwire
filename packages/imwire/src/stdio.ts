@@ -1,6 +1,6 @@
 import { createInterface } from "node:readline";
 import { MAX_RPC_BYTES, type JsonRpcMessage } from "./protocol.js";
-import { createServeHost, type ServeHost } from "./server.js";
+import { createServeHost, type ServeHost, type ServeOptions } from "./server.js";
 import type { Adapter } from "@imwire/core";
 
 export function serveStdio(
@@ -8,11 +8,12 @@ export function serveStdio(
   stdin = process.stdin,
   stdout = process.stdout,
   onClose?: () => void,
+  options: Omit<ServeOptions, "adapters" | "write"> = {},
 ): { host: ServeHost } {
   const write = (msg: JsonRpcMessage): void => {
     stdout.write(`${JSON.stringify(msg)}\n`);
   };
-  const host = createServeHost({ adapters, write });
+  const host = createServeHost({ ...options, adapters, write });
   const rl = createInterface({ input: stdin, crlfDelay: Infinity });
   rl.on("line", (line) => {
     if (line.length > MAX_RPC_BYTES) {
@@ -22,8 +23,7 @@ export function serveStdio(
     void host.handleLine(line, write);
   });
   rl.on("close", () => {
-    host.stop();
-    onClose?.();
+    void host.stop().then(() => onClose?.());
   });
   return { host };
 }

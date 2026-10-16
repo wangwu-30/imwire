@@ -1,6 +1,7 @@
 export type {
   ActionEvent,
   Adapter,
+  SendOptions,
   Block,
   Button,
   ButtonStyle,

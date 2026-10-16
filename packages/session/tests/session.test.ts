@@ -103,7 +103,7 @@ describe("topics and routing", () => {
     gw.close();
   });
 
-  it("replies on the triggering IM and sends proactive to the last surface", async () => {
+  it("replies on the triggering IM and sends proactive plain text in channel order", async () => {
     const driver = new ScriptedDriver(async (sink) => {
       sink.text("pong");
     });
@@ -115,16 +115,14 @@ describe("topics and routing", () => {
     expect(markdownCalls(fs).some((t) => t === "pong")).toBe(false);
 
     const personId = gw.store.findIdentity("telegram", "bot", "ada")!.personId;
-    await gw.sendProactive(personId, "async result");
-    expect(markdownCalls(tg).some((t) => t === "async result")).toBe(true);
+    expect(await gw.sendProactive(personId, "async result")).toMatchObject({ status: "delivered", surface: { platform: "telegram" } });
 
     await tg.ingest(cmd({ platform: "telegram", userId: "ada", name: "pair" }));
     const code = extractPairCode(markdownCalls(tg).join("\n")) ?? "";
     await fs.ingest(dm({ platform: "feishu", userId: "ou_ada", text: code }));
     await fs.ingest(dm({ platform: "feishu", userId: "ou_ada", text: "now here" }));
     await gw.waitForIdle();
-    await gw.sendProactive(personId, "follow-up");
-    expect(markdownCalls(fs).some((t) => t === "follow-up")).toBe(true);
+    expect(await gw.sendProactive(personId, "follow-up")).toMatchObject({ status: "delivered", surface: { platform: "telegram" } });
     gw.close();
   });
 });
