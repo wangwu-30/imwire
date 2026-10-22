@@ -10,6 +10,8 @@ Wiring a real bot to pi: follow [`INSTALL.md`](INSTALL.md) (credentials, env, ve
 
 Positioning and design: [`docs/design.md`](docs/design.md).
 
+Optional pi chat in long-running `imwire serve`: [`docs/serve-chat.md`](docs/serve-chat.md).
+
 Optional file outbox delivery in `imwire serve`: [`docs/outbox-bridge.md`](docs/outbox-bridge.md).
 
 ## 30 秒看懂 imwire

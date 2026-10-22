@@ -1,7 +1,7 @@
 import type { Adapter } from "@imwire/core";
 import { FeishuAdapter } from "@imwire/feishu";
 import { TelegramAdapter } from "@imwire/telegram";
-import { PiAgentDriver, createFakePiProvider } from "@imwire/agent-pi";
+import { chatPreset } from "../chat.js";
 import type { AgentDriver, OwnerAllowlistEntry, SessionStore } from "@imwire/session";
 
 type Env = Record<string, string | undefined>;
@@ -44,31 +44,9 @@ export function assistantPreset(env: Env = process.env): {
   if (telegramToken) describe.push("telegram adapter enabled");
   if (feishuId && feishuSecret) describe.push("feishu adapter enabled");
 
-  let driver: AgentDriver | undefined;
-  const usePi = get(env, "IMWIRE_USE_PI") === "1" || Boolean(get(env, "OPENAI_API_KEY") || get(env, "ANTHROPIC_API_KEY"));
-  if (get(env, "IMWIRE_CHAT") !== "off") {
-    if (usePi) {
-      const provider =
-        get(env, "IMWIRE_PI_PROVIDER") ??
-        (get(env, "ANTHROPIC_API_KEY") && !get(env, "OPENAI_API_KEY") ? "anthropic" : "openai");
-      driver = new PiAgentDriver({
-        usePi: true,
-        modelProvider: provider,
-        modelId: get(env, "IMWIRE_PI_MODEL"),
-        systemPrompt: get(env, "IMWIRE_SYSTEM_PROMPT"),
-      });
-      describe.push(`pi chat agent (${provider})`);
-    } else {
-      driver = new PiAgentDriver({
-        systemPrompt: get(env, "IMWIRE_SYSTEM_PROMPT"),
-        source: createFakePiProvider([
-          { type: "text", delta: "(offline demo) " },
-          { type: "text", delta: "I am the local fake provider. Set OPENAI_API_KEY or ANTHROPIC_API_KEY plus IMWIRE_USE_PI=1 for a real model." },
-        ]),
-      });
-      describe.push("pi chat agent (offline fake provider)");
-    }
-  }
+  const chat = chatPreset(env, { offlineFallback: true });
+  const driver = chat.driver;
+  describe.push(...chat.describe);
 
   return {
     allowlist: get(env, "IMWIRE_ALLOWLIST") ? parseAllowlist(get(env, "IMWIRE_ALLOWLIST")!) : [],
