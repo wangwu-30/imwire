@@ -2,6 +2,8 @@ import { readFile } from "node:fs/promises";
 import type { ServeOptions } from "./server.js";
 import { onShutdownSignal } from "@imwire/core";
 import { loadAdaptersFromEnv, parseAdapterList, type AdapterName } from "./env.js";
+import { chatPreset } from "./chat.js";
+import { parseAllowlist } from "./hub/preset.js";
 import { runHubCli } from "./hub/commands.js";
 import { stderrLogger } from "./logger.js";
 import { serveStdio } from "./stdio.js";
@@ -45,7 +47,8 @@ Runs named IM adapters and speaks JSON-RPC 2.0 over stdio (newline-delimited).
 Adapters are NEVER inferred from leftover tokens — pass --adapter / IMWIRE_ADAPTERS.
 --ws binds 127.0.0.1 (default port 8765). A token is required (IMWIRE_WS_TOKEN /
 --ws-token, or generated and printed to stderr). Browser Origin is rejected.
-See docs/protocol.md.`);
+Optional pi chat: IMWIRE_USE_PI=1 + model key (IMWIRE_CHAT=off disables).
+See docs/protocol.md and docs/serve-chat.md.`);
     return;
   }
   if (cmd !== "serve") {
@@ -98,11 +101,20 @@ See docs/protocol.md.`);
   const ac = new AbortController();
   onShutdownSignal(() => ac.abort(), { log: (msg) => process.stderr.write(`imwire serve: ${msg}\n`) });
 
+  const chat = chatPreset();
   const { host } = serveStdio(adapters, process.stdin, process.stdout, () => {
     process.stderr.write("imwire serve: stdin closed, exiting\n");
     ac.abort();
     process.exit(0); // serveStdio has already drained the bridge and closed its store.
-  }, { ...config, logger: stderrLogger });
+  }, {
+    outboxBridge: config.outboxBridge,
+    dbPath: config.dbPath,
+    preferredChannels: config.preferredChannels,
+    driver: chat.driver,
+    allowlist: parseAllowlist(process.env.IMWIRE_ALLOWLIST ?? ""),
+    logger: stderrLogger,
+  });
+  for (const description of chat.describe) process.stderr.write(`imwire serve: ${description}\n`);
 
   if (wsPort !== undefined) {
     const ws = await attachWebSocket(host, {

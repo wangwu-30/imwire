@@ -1,7 +1,7 @@
 import { mkdirSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { homedir } from "node:os";
-import { OutboxBridge, SessionGateway, type OutboxBridgeOptions } from "@imwire/session";
+import { OutboxBridge, SessionGateway, type AgentDriver, type OwnerAllowlistEntry, type OutboxBridgeOptions } from "@imwire/session";
 import { NoChatDriver } from "./hub/hub.js";
 import type { Adapter, ChatRef, Inbound, Logger } from "@imwire/core";
 import {
@@ -25,6 +25,9 @@ export type RpcReply = (msg: JsonRpcMessage) => void;
 
 export interface ServeOptions {
   adapters: Adapter[];
+  /** Optional inbound chat; omitted keeps serve broadcast-only. */
+  driver?: AgentDriver;
+  allowlist?: OwnerAllowlistEntry[];
   outboxBridge?: OutboxBridgeOptions;
   /** Existing person/identity database; defaults to IMWIRE_DB or ~/.imwire/hub.sqlite. */
   dbPath?: string;
@@ -51,20 +54,25 @@ interface ClientState {
 export function createServeHost(opts: ServeOptions): ServeHost {
   let gateway: SessionGateway | undefined;
   let bridge: OutboxBridge | undefined;
-  if (opts.outboxBridge?.enabled) {
-    if (!opts.outboxBridge.dir) throw new Error("outboxBridge.dir is required when enabled");
+  if (opts.driver || opts.outboxBridge?.enabled) {
+    if (opts.outboxBridge?.enabled && !opts.outboxBridge.dir) throw new Error("outboxBridge.dir is required when enabled");
     const dbPath = opts.dbPath ?? process.env.IMWIRE_DB ?? join(process.env.IMWIRE_HOME ?? join(homedir(), ".imwire"), "hub.sqlite");
     if (dbPath !== ":memory:") mkdirSync(dirname(dbPath), { recursive: true });
-    gateway = new SessionGateway({ dbPath, driver: new NoChatDriver(), logger: opts.logger,
+    gateway = new SessionGateway({ dbPath, driver: opts.driver ?? new NoChatDriver(), allowlist: opts.allowlist, logger: opts.logger,
       preferredChannels: opts.preferredChannels, bootExpiry: false, sweepIntervalMs: 0 });
-    try { bridge = new OutboxBridge(gateway, opts.outboxBridge, opts.logger); }
+    try {
+      if (opts.outboxBridge?.enabled) bridge = new OutboxBridge(gateway, opts.outboxBridge, opts.logger);
+    }
     catch (err) { gateway.close(); throw err; }
-    // Serve continues broadcasting inbound events to RPC clients; no chat driver is attached.
+    // Inbound is dispatched below, alongside the existing RPC broadcast.
     for (const adapter of opts.adapters) gateway.registerAdapter(adapter);
   }
+  const inbound = new Set<Promise<void>>();
   let stopping: Promise<void> | undefined;
   const stop = (): Promise<void> => stopping ??= (async () => {
     await bridge?.stop();
+    await Promise.all(inbound);
+    await gateway?.waitForIdle();
     gateway?.close();
     drafts.clear();
     clients.clear();
@@ -104,7 +112,16 @@ export function createServeHost(opts: ServeOptions): ServeHost {
 
   for (const adapter of adapters) {
     adapter.on(async (event: Inbound) => {
+      if (stopping) return;
       broadcastEvent(eventNote(event, adapter.platform, adapter.accountId));
+      if (opts.driver && gateway) {
+        const pending = gateway.handle(adapter, event).catch(() => {
+          opts.logger?.error("serve chat inbound failed", { type: event.type });
+        });
+        inbound.add(pending);
+        try { await pending; }
+        finally { inbound.delete(pending); }
+      }
     });
   }
 
