@@ -4,6 +4,8 @@ One adapter interface for Feishu, DingTalk, WeCom, Telegram, and Slack. Long-con
 
 L1 (`@imwire/core` + platform adapters) does not know about people or sessions and stays independently usable. L2 (`@imwire/session`) sits on top of the adapter interface. L3 (`@imwire/agent-pi`) is one `AgentDriver` implementation; ACP drivers can be added later.
 
+> **Maintenance status (2026-11-24).** imwire is now scoped to **L1: an IM wiring SDK** (`@imwire/core` + platform adapters). L1 is actively maintained and accepts hardening PRs. **L2 (`@imwire/session`), L3 (`@imwire/agent-pi`) and `imwire serve` (hub, a2h, outbox bridge) are frozen**: security and bug fixes only, no new features, no refactor. Conversation state, approvals and delivery belong to the work engine that consumes L1. Packages are not published to npm yet. See [`docs/design.md`](docs/design.md#scope-2026-11).
+
 Packages are **ESM-only** (Node 20+). The npm name `imwire` is the `imwire serve` CLI (JSON-RPC over stdio / WebSocket). Import the SDK as `@imwire/core`. A thin PyPI client (`imwire`) talks to that process.
 
 Wiring a real bot to pi: follow [`INSTALL.md`](INSTALL.md) (credentials, env, verify, errors).
@@ -116,6 +118,8 @@ Config is env vars only. Never commit tokens.
 
 `@imwire/core/testing` imports `vitest` at runtime; vitest is an optional peer dependency of `@imwire/core`.
 
+**Status:** maintained — `@imwire/core`, `@imwire/feishu`, `@imwire/telegram` (live-verified), `@imwire/dingtalk` / `@imwire/wecom` / `@imwire/slack` (fixture-only). Frozen — `@imwire/session`, `@imwire/agent-pi`, `imwire` CLI, the PyPI client and `@imwire/example-assistant`.
+
 ## Capability table
 
 | | Telegram | Feishu | DingTalk | WeCom | Slack |
@@ -143,6 +147,7 @@ Streaming drafts degrade automatically: card update when the platform can, other
 - **Week 1** — L1 core + Telegram + Feishu, contract tests against recorded fixtures.
 - **Week 2** — L2 session (`@imwire/session`) + L3 pi driver (`@imwire/agent-pi`). Pairing, one conversation per person, follow-the-user streaming and approvals. The IM layer does not import the session package.
 - **Week 3 (this PR)** — DingTalk Stream, WeCom 智能机器人 long connection, Slack Socket Mode, `imwire serve` (JSON-RPC stdio / WS), and the Python `imwire` client. Adapter tests are recorded fixtures cited against official docs; DingTalk / WeCom / Slack have **not** been verified against live platforms.
+- **2026-11-24** — Scope narrowed to L1; L2 / L3 / `imwire serve` frozen. Next L1 work is Feishu streaming hardening and npm packaging, listed in [`docs/design.md`](docs/design.md#scope-2026-11).
 
 ### Session commands and routing
 
@@ -160,6 +165,8 @@ Replies go to the IM that triggered the turn. Proactive messages go to the perso
 ## 中文
 
 imwire 是给 agent 用的独立 IM SDK：一套 Adapter 接口接飞书 / 钉钉 / 企微 / Telegram / Slack，默认长连接，不需要公网 IP。面向 agent 的能力（流式回复、审批按钮、配对）是一等公民。L2 `@imwire/session` 让一个人在所有 IM 上共享一段对话；IM 层不依赖它，可以单独引用。`/pair` 出 8 位码，在新 IM 发给 bot 即完成绑定。群聊单独成会话，不会并进个人对话。中途换 IM 时，原侧草稿会标「continued in …」，已生成的文字在新侧续上。和 OpenClaw 的差别见上文「30 秒看懂 imwire」：会话按人合并，而不是按 IM 强制拆开。把机器人接到 pi 的逐步说明在 [`INSTALL.md`](INSTALL.md)。
+
+**维护状态（2026-11-24）**：imwire 收窄为 **L1 IM 接线 SDK**（`@imwire/core` + 各平台适配器），L1 持续维护、欢迎加固 PR。**L2 `@imwire/session`、L3 `@imwire/agent-pi` 和 `imwire serve`（hub、a2h、outbox 桥）冻结**：只修安全问题和 bug，不加功能、不重构。会话状态、审批和投递归使用 L1 的工作引擎。包尚未发布到 npm。详见 [`docs/design.md`](docs/design.md#scope-2026-11)。
 
 核心包名是 `@imwire/core`。`imwire` 是 CLI（`imwire serve`，JSON-RPC，见 `docs/protocol.md`）；PyPI 上也有同名的薄客户端。包是 ESM-only。
 

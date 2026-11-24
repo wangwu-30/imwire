@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Scope
+
+- imwire is now maintained as L1 only (`@imwire/core` + platform adapters). `@imwire/session`, `@imwire/agent-pi` and `imwire serve` are frozen: security and bug fixes only. See [`docs/design.md`](docs/design.md#scope-2026-11), which also lists the known Feishu streaming gaps.
+
 ### Outbox delivery bridge
 
 - Added an opt-in `outboxBridge` to `imwire serve --config`: atomic file claiming,

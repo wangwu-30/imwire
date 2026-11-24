@@ -3,6 +3,8 @@
 > 2026-11-02（Asia/Shanghai）· 一页纸 · 只写设计，不改仓库代码  
 > 对照对象：[dsh-superagent-prototype](https://github.com/deepseek-ai/dsh-superagent-prototype)（Source→Trigger→Eval→Ticket/Mandate→Assignment→Executor；人不是域概念；跨 Source 身份映射被拒绝）  
 > imwire 定位：打通现有 IM；差异化是跨 IM 同一身份；非目标是又一个聊天 App / 又一个单仓 coding agent。
+>
+> **2026-11-24 更新**：L2 / L3 / `imwire serve` 已冻结（见 [`design.md`](design.md#scope-2026-11)）。§5 中的 P1（a2h 卡片字段 + MCP）和 P2（TaskDriver）不再推进；§2「L1 不做工作引擎」的边界继续有效。
 
 ## 0. 结论先行
 
